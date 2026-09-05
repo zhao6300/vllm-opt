@@ -1696,7 +1696,12 @@ def test_ngram_embedding_forward_compiles_across_two_different_token_counts(
 
     for num_tokens in (3, 5):
         ids = torch.zeros((1, num_tokens), dtype=torch.long)
-        out = compiled_forward(ids, dummy_qsl, dummy_ctx)
+        out = compiled_forward(
+            torch.empty((num_tokens, layer.embedding_dim)),
+            ids,
+            dummy_qsl,
+            dummy_ctx,
+        )
         expected = layer._mmap_staging[:num_tokens].flatten(-2)
         assert out.shape == (num_tokens, layer.ngram_heads * layer.head_dim)
         torch.testing.assert_close(out, expected)
@@ -1738,11 +1743,17 @@ class _PleDownstreamConsumer(nn.Module):
 
     def forward(
         self,
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
-        embedded = self.ple_layer(input_ids, query_start_loc, ngram_context)
+        embedded = self.ple_layer(
+            hidden_states,
+            input_ids,
+            query_start_loc,
+            ngram_context,
+        )
         num_tokens = embedded.shape[0]
         self.out[:num_tokens] = embedded.to(self.weight.dtype) @ self.weight
         return self.out[:num_tokens]
@@ -1825,6 +1836,7 @@ def _capture_ple_consumer_fullgraph(
         # ModelCudaGraphManager.capture()'s own create_forward_fn does.
         model_inputs = model_state.prepare_dummy_inputs(num_reqs, num_tokens)
         input_ids = input_ids_buf[:num_tokens]
+        hidden_states = torch.empty((num_tokens, 1), device=input_ids_buf.device)
 
         def forward_fn(cg_mode: CUDAGraphMode) -> None:
             with set_forward_context(
@@ -1835,6 +1847,7 @@ def _capture_ple_consumer_fullgraph(
                 batch_descriptor=None,
             ):
                 compiled_consumer(
+                    hidden_states,
                     input_ids,
                     model_inputs["query_start_loc"],
                     model_inputs["ngram_context"],
@@ -2408,7 +2421,9 @@ def test_forward_never_calls_gather_only_preparation_does(
     monkeypatch.setattr(layer.ngram_embedding, "gather_into", _raise)
 
     input_ids = torch.zeros((1, 3), dtype=torch.long)
-    out = layer.forward(input_ids, None, None)  # must not raise
+    out = layer.forward(
+        torch.empty((3, layer.embedding_dim)), input_ids, None, None
+    )  # must not raise
     assert out.shape == (3, layer.embedding_dim)
 
     with pytest.raises(AssertionError, match="forward must never call gather_into"):
@@ -2445,7 +2460,9 @@ def test_forward_without_prior_preparation_never_reproduces_real_rows(
     layer.initialize_mmap_staging(8, torch.device("cpu"))
 
     input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
-    out = layer.forward(input_ids, None, None)  # prepare_mmap_rows never called
+    out = layer.forward(
+        torch.empty((3, layer.embedding_dim)), input_ids, None, None
+    )  # prepare_mmap_rows never called
 
     assert torch.equal(out, torch.zeros_like(out))
 
@@ -4328,7 +4345,9 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
         raising=False,
     )
 
-    reference = stock.forward(input_ids, query_start_loc, ngram_context)
+    reference = stock.forward(
+        torch.empty((2, stock.embedding_dim)), input_ids, query_start_loc, ngram_context
+    )
     assert reference.dtype == torch.float8_e4m3fn
 
     # --- env-on: mmap placeholder backed by shards holding the SAME
@@ -4378,7 +4397,12 @@ def test_env_on_off_forward_equivalence_fp8_and_dequantized(
         actual_tokens=num_tokens,
         padded_tokens=num_tokens,
     )
-    got = mmap_module.forward(input_ids, query_start_loc, ngram_context)
+    got = mmap_module.forward(
+        torch.empty((2, mmap_module.embedding_dim)),
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
 
     assert torch.equal(got, reference)
 
@@ -4541,7 +4565,12 @@ def test_mmap_forward_allocates_an_fp8_output_buffer(
         actual_tokens=num_tokens,
         padded_tokens=num_tokens,
     )
-    out = module.forward(input_ids, query_start_loc, ngram_context)
+    out = module.forward(
+        torch.empty((2, module.embedding_dim)),
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
 
     assert out.dtype == torch.float8_e4m3fn
     assert out.shape == (2, 8)
@@ -6759,7 +6788,12 @@ def test_default_off_forward_never_calls_the_mmap_gather_op(
     query_start_loc = torch.tensor([0, 2], dtype=torch.long)
     ngram_context = torch.zeros((1, 4), dtype=torch.long)
 
-    output = module.forward(input_ids, query_start_loc, ngram_context)
+    output = module.forward(
+        torch.empty((2, module.embedding_dim)),
+        input_ids,
+        query_start_loc,
+        ngram_context,
+    )
 
     assert len(calls) == 1  # the stock embedding was called directly
     assert torch.equal(output, sentinel.flatten(-2))
