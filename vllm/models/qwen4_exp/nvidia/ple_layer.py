@@ -4,6 +4,7 @@
 
 import math
 from collections.abc import Iterable, Sequence
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -41,16 +42,13 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op, get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
@@ -58,9 +56,12 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
-from ..common.ple import copy_ple_embedding_shard_
+from ..common.ple import PLEVocabParallelEmbedding, copy_ple_embedding_shard_
+from . import ple_mmap
+from .ops.ple import ple_ngram_ids
 
 logger = init_logger(__name__)
+
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -305,6 +306,8 @@ def _get_ple_embedding_quant_method(
 ) -> QuantizeMethodBase | None:
     """Select a packed PLE embedding method for quantized checkpoint shards."""
 
+    if not prefix.endswith(".ple_embedding.ngram_embedding"):
+        return None
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         quant_algo = quant_config._resolve_quant_algo(prefix)
         if quant_algo == "FP8":
@@ -408,13 +411,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         config: Qwen4ExpTextConfig,
         embedding_dim: int,
         ple_dense_layer_id: int,
-        max_total_tokens: int,
-        max_num_reqs: int,
         prefix: str,
+        layer_name: str,
         quant_config: QuantizationConfig | None = None,
         params_dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
+        self.layer_name = layer_name
         self.embedding_dim = embedding_dim
         self.ngram_size = int(config.ngram_size)
         self.heads_per_ngram = int(config.heads_per_ngram)
@@ -471,32 +474,52 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((offset + divisor - 1) // divisor) * divisor
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim,
-            params_dtype=params_dtype,
-            padding_size=divisor,
-            prefix=f"{prefix}.ngram_embedding",
-            quant_method=_get_ple_embedding_quant_method(
-                quant_config,
-                f"{prefix}.ngram_embedding",
-                getattr(config, "ple_embedding_dtype", None),
-            ),
-        )
-        self.register_buffer(
-            "positions_buffer",
-            torch.arange(max_total_tokens, dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer(
-            "padded_buffer",
-            torch.full(
-                (max_num_reqs, max_total_tokens),
-                self.eos_token_id,
-                dtype=torch.int64,
-            ),
-            persistent=False,
-        )
+        self._mmap_staging: torch.Tensor | None = None
+        if envs.VLLM_PLE_CPU_OFFLOAD and not ple_mmap.enabled():
+            scheduler_config = get_current_vllm_config().scheduler_config
+            max_total_tokens = scheduler_config.max_num_batched_tokens
+            max_num_reqs = scheduler_config.max_num_seqs
+            self.register_buffer(
+                "positions_buffer",
+                torch.arange(max_total_tokens, dtype=torch.int64),
+                persistent=False,
+            )
+            self.register_buffer(
+                "padded_buffer",
+                torch.full(
+                    (max_num_reqs, max_total_tokens),
+                    self.eos_token_id,
+                    dtype=torch.int64,
+                ),
+                persistent=False,
+            )
+        if ple_mmap.enabled():
+            vllm_config = get_current_vllm_config()
+            ple_mmap.check_cudagraph_safety(vllm_config)
+            self.ngram_embedding = ple_mmap.MmapNgramEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+            )
+            discovered_dtype = ple_mmap.validate_shards_for(
+                vllm_config.model_config,
+                layer_name,
+                self.head_dim,
+            )
+            if discovered_dtype is not None:
+                self.ngram_embedding.torch_dtype = discovered_dtype
+        else:
+            self.ngram_embedding = PLEVocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim,
+                params_dtype=params_dtype,
+                padding_size=divisor,
+                prefix=f"{prefix}.ngram_embedding",
+                quant_method=_get_ple_embedding_quant_method(
+                    quant_config,
+                    f"{prefix}.ngram_embedding",
+                    getattr(config, "ple_embedding_dtype", None),
+                ),
+            )
 
     @staticmethod
     def _shift_precompute(
@@ -532,6 +555,182 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         shifted = tokens.gather(1, gather_indices)
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
+
+    def compute_ngram_ids(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        output: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute n-gram embedding indices for the current request layout."""
+        input_ids = input_ids.reshape(-1)
+        num_reqs = query_start_loc.numel() - 1
+        num_tokens = input_ids.shape[0]
+
+        if input_ids.is_cuda:
+            return ple_ngram_ids(
+                input_ids=input_ids,
+                query_start_loc=query_start_loc,
+                ngram_context=ngram_context,
+                layer_multipliers=self.layer_multipliers,
+                ngram_heads_vocab_sizes=self.ngram_heads_vocab_sizes,
+                ngram_heads_offsets=self.ngram_heads_offsets,
+                eos_token_id=self.eos_token_id,
+                heads_per_ngram=self.heads_per_ngram,
+                output=output,
+            )
+        input_ids = input_ids.long()
+        query_start_loc = query_start_loc.long()
+        positions = torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
+        packed = torch.full(
+            (num_reqs, num_tokens),
+            self.eos_token_id,
+            device=input_ids.device,
+            dtype=torch.int64,
+        )
+        request_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
+        request_indices.clamp_(max=num_reqs - 1)
+        columns = (positions - query_start_loc[request_indices]).clamp(
+            0, packed.shape[1] - 1
+        )
+        packed[request_indices, columns] = input_ids
+        ngram_context = ngram_context[:num_reqs].to(
+            device=input_ids.device, dtype=torch.long
+        )
+
+        context = torch.cat([ngram_context, packed], dim=-1)
+        positions_2d, position_in_segment = self._shift_precompute(
+            context, self.eos_token_id
+        )
+        shifted = [context]
+        for shift in range(1, self.ngram_size):
+            shifted.append(
+                self._shift_apply(
+                    context,
+                    positions_2d,
+                    position_in_segment,
+                    shift,
+                    self.eos_token_id,
+                )
+            )
+        adjusted_columns = columns + self.ngram_size - 1
+        id_blocks = []
+        for ngram in range(2, self.ngram_size + 1):
+            start = (ngram - 2) * self.heads_per_ngram
+            end = start + self.heads_per_ngram
+            mixed = shifted[0] * self.layer_multipliers[0]
+            for index in range(1, ngram):
+                mixed = torch.bitwise_xor(
+                    mixed, shifted[index] * self.layer_multipliers[index]
+                )
+            sizes = self.ngram_heads_vocab_sizes[start:end]
+            offsets = self.ngram_heads_offsets[start:end]
+            ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
+            id_blocks.append(ids[request_indices, adjusted_columns])
+        return torch.cat(id_blocks, dim=-1)
+
+    def _require_mmap_embedding(self) -> ple_mmap.MmapNgramEmbedding:
+        if not isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} is not using mmap staging"
+            )
+        return self.ngram_embedding
+
+    def _resolve_mmap_dtype(self) -> torch.dtype:
+        """Resolve this layer's PLE row dtype without allocating a buffer."""
+        embedding = self._require_mmap_embedding()
+        table = embedding.table
+        if table is not None:
+            return table.torch_dtype
+        if embedding.weights_streamed:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} streamed weights but never "
+                "attached a table before mmap staging was initialized"
+            )
+        return embedding.torch_dtype
+
+    def mmap_staging_nbytes(self, max_num_tokens: int) -> int:
+        """Bytes this layer's staging buffer would occupy at ``max_num_tokens``."""
+        dtype = self._resolve_mmap_dtype()
+        return max_num_tokens * self.ngram_heads * self.head_dim * get_dtype_size(dtype)
+
+    def initialize_mmap_staging(
+        self, max_num_tokens: int, device: torch.device
+    ) -> None:
+        """Allocate this layer's stable, non-persistent staged-row buffer."""
+        dtype = self._resolve_mmap_dtype()
+        self._mmap_staging = torch.zeros(
+            (max_num_tokens, self.ngram_heads, self.head_dim),
+            dtype=dtype,
+            device=device,
+        )
+
+    def prepare_mmap_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        actual_tokens: int,
+        padded_tokens: int,
+    ) -> None:
+        """Gather this layer's staged rows for the current real step."""
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        embedding = self._require_mmap_embedding()
+        if actual_tokens > 0:
+            ngram_ids = self.compute_ngram_ids(
+                input_ids, query_start_loc, ngram_context
+            )
+            embedding.gather_into(ngram_ids, self._mmap_staging[:actual_tokens])
+        if padded_tokens > actual_tokens:
+            self._mmap_staging[actual_tokens:padded_tokens].zero_()
+
+    def prepare_dummy_mmap_rows(self, padded_tokens: int) -> None:
+        """Zero this layer's staged rows for a dummy/capture step."""
+        if self._mmap_staging is None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} staging was never initialized"
+            )
+        self._mmap_staging[:padded_tokens].zero_()
+
+    def forward(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor | None,
+        ngram_context: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self._is_cpu_offloaded:
+            return super().forward(
+                hidden_states,
+                input_ids,
+                query_start_loc,
+                ngram_context,
+            )
+        if isinstance(self.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+            if self._mmap_staging is None:
+                raise RuntimeError(
+                    f"PLE mmap: input preparation did not initialize "
+                    f"{self.layer_name!r}; Model Runner V2 is required"
+                )
+            num_tokens = input_ids.reshape(-1).shape[0]
+            return self._mmap_staging[:num_tokens].flatten(-2)
+        if query_start_loc is None or ngram_context is None:
+            raise RuntimeError("PLE inputs were not prepared")
+        ngram_ids = input_ids.new_empty(
+            (input_ids.numel(), self.ngram_heads), dtype=torch.long
+        )
+        torch.ops.vllm.qwen4_exp_compute_ple_ngram_ids(
+            input_ids,
+            query_start_loc,
+            ngram_context,
+            ngram_ids,
+            self.layer_name,
+        )
+        return self.ngram_embedding(ngram_ids).flatten(-2)
 
     def _hash_shifted_tokens(self, shifted: list[torch.Tensor]) -> torch.Tensor:
         id_blocks = []
@@ -756,7 +955,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
     def get_offload_output_dim(self, default_dim: int) -> int:
         """Keep NVFP4 lookup rows packed while transferring them to the GPU."""
         quant_method = getattr(
-            getattr(self, "ngram_embedding", None), "quant_method", None
+            getattr(self, "ngram_embedding", None),
+            "quant_method",
+            None,
         )
         if quant_method is None:
             quant_method = self._offload_quant_method
@@ -790,9 +991,88 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 persistent=False,
             )
 
+    def _load_mmap_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Stream buffers and scales, retaining mmap rows only on disk."""
+        embedding = self.ngram_embedding
+        if embedding.table is not None:
+            raise RuntimeError(
+                f"PLE mmap: {self.layer_name!r} already has a table "
+                "attached from a previous load; calling load_weights again "
+                "on the same live module is unsupported — it would mix "
+                "this reload's rows with the already-attached checkpoint's "
+                "scale. Restart the seat to load different weights."
+            )
+
+        persistent_buffers = {
+            "layer_multipliers": self.layer_multipliers,
+            "ngram_heads_offsets": self.ngram_heads_offsets,
+            "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+        }
+        loaded: set[str] = set()
+        regular_weights: list[tuple[str, torch.Tensor]] = []
+        shard_prefix = "ngram_embedding.shard_"
+
+        for name, loaded_weight in weights:
+            leaf_name = name.rsplit(".", 1)[-1]
+            if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
+                continue
+            if name in persistent_buffers:
+                buffer = persistent_buffers[name]
+                if buffer.shape != loaded_weight.shape:
+                    raise ValueError(
+                        f"Shape mismatch for {name}: expected "
+                        f"{tuple(buffer.shape)}, got {tuple(loaded_weight.shape)}"
+                    )
+                buffer.copy_(loaded_weight.to(device=buffer.device, dtype=buffer.dtype))
+                loaded.add(name)
+                continue
+            if name == "ngram_embedding.weight_scale":
+                ple_mmap.set_weight_scale(
+                    embedding,
+                    loaded_weight,
+                    cast(torch.Tensor, self.layer_multipliers).device,
+                )
+                loaded.add(name)
+                continue
+            if name.startswith(shard_prefix) and name.endswith(".weight"):
+                shard_text = name[len(shard_prefix) : -len(".weight")]
+                if not shard_text.isdigit():
+                    regular_weights.append((name, loaded_weight))
+                    continue
+                shard_index = int(shard_text)
+                if shard_index >= self.split_ngram_parts:
+                    raise ValueError(
+                        f"PLE embedding shard index {shard_index} exceeds "
+                        f"split_ngram_parts={self.split_ngram_parts}"
+                    )
+                shard_size = (
+                    embedding.org_vocab_size + self.split_ngram_parts - 1
+                ) // self.split_ngram_parts
+                checkpoint_start = shard_index * shard_size
+                expected_rows = max(
+                    0,
+                    min(shard_size, embedding.org_vocab_size - checkpoint_start),
+                )
+                expected_shape = (expected_rows, embedding.embedding_dim)
+                if tuple(loaded_weight.shape) != expected_shape:
+                    raise ValueError(
+                        f"Shape mismatch for PLE embedding shard {shard_index}: "
+                        f"expected {expected_shape}, got "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                embedding.weights_streamed = True
+                loaded.add("ngram_embedding.weight")
+                continue
+            regular_weights.append((name, loaded_weight))
+
+        if regular_weights:
+            loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        return loaded
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
-
         # Prefix grouping may invoke this method repeatedly for one module.
         # Treat the global FP8 scale as incrementally loaded state.
         # GPU workers retain only dequantization metadata. The CPU process owns
@@ -846,6 +1126,10 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 for _ in weights:
                     pass
             return retained
+
+        embedding = self.ngram_embedding
+        if isinstance(embedding, ple_mmap.MmapNgramEmbedding):
+            return self._load_mmap_weights(weights)
 
         persistent_buffers = {
             "layer_multipliers": self.layer_multipliers,
@@ -1049,9 +1333,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 config,
                 int(config.ple_embed_dim),
                 self.ple_dense_layer_id,
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                vllm_config.scheduler_config.max_num_seqs,
                 f"{prefix}.ple_embedding",
+                prefix,
                 quant_config=quant_config,
                 params_dtype=model_config.dtype,
             )
@@ -1099,12 +1382,21 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def _get_ngram_embedding(self) -> nn.Module | None:
+        """Resolve the ngram table around mmap and offload wrappers."""
+        embedding = getattr(self, "ple_embedding", None)
+        if embedding is None:
+            return None
+        ngram_embedding = getattr(embedding, "ngram_embedding", None)
+        return embedding if ngram_embedding is None else ngram_embedding
+
     def _get_embedding_weight_scale(self) -> torch.Tensor | None:
-        embedding = getattr(self.ple_embedding, "ngram_embedding", None)
+        embedding = self._get_ngram_embedding()
         weight_scale = getattr(embedding, "weight_scale", None)
         if weight_scale is not None:
             return weight_scale
-        return getattr(self.ple_embedding, "_offload_weight_scale", None)
+        offload_embedding = getattr(self, "ple_embedding", None)
+        return getattr(offload_embedding, "_offload_weight_scale", None)
 
     def _dequantize_embeddings(
         self,
@@ -1112,14 +1404,22 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Dequantize PLE lookup output."""
-
+        if embeddings.dtype is not torch.uint8 and not is_fp8(embeddings):
+            # Unquantized tables carry no scale to apply.
+            return embeddings.to(output_dtype)
+        embedding = getattr(self, "ple_embedding", None)
+        ngram_embedding = getattr(embedding, "ngram_embedding", None)
+        if ngram_embedding is None:
+            ngram_embedding = embedding
         quant_method = getattr(
-            getattr(self.ple_embedding, "ngram_embedding", None),
+            ngram_embedding,
             "quant_method",
             None,
         )
         offload_quant_method = getattr(
-            self.ple_embedding, "_offload_quant_method", None
+            embedding,
+            "_offload_quant_method",
+            None,
         )
         if isinstance(offload_quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
             offload_scale_2 = getattr(
@@ -1142,18 +1442,18 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
             return dequantized.flatten(-2)
         if isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):
+            if ngram_embedding is None:
+                raise RuntimeError("NVFP4 PLE embedding has no ngram table")
             packed_rows = embeddings.unflatten(
                 -1,
-                (self.ple_embedding.ngram_heads, quant_method.packed_row_width),
+                (ngram_embedding.ngram_heads, quant_method.packed_row_width),
             )
             dequantized = quant_method.dequantize(
                 packed_rows,
-                self.ple_embedding.ngram_embedding.weight_scale_2,
+                ngram_embedding.weight_scale_2,
                 output_dtype,
             )
             return dequantized.flatten(-2)
-        if not is_fp8(embeddings):
-            return embeddings
         weight_scale = self._get_embedding_weight_scale()
         if weight_scale is None:
             raise RuntimeError("FP8 PLE embedding is missing its global scale")
@@ -1734,6 +2034,41 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         return gated_value.flatten(-2) + conv_output
 
 
+def qwen4_exp_compute_ple_ngram_ids(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Compute request-dependent PLE n-gram IDs outside piecewise graphs."""
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer.ple_embedding.compute_ngram_ids(
+        input_ids,
+        query_start_loc,
+        ngram_context,
+        output,
+    )
+
+
+def qwen4_exp_compute_ple_ngram_ids_fake(
+    input_ids: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ngram_context: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_compute_ple_ngram_ids",
+    op_func=qwen4_exp_compute_ple_ngram_ids,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_compute_ple_ngram_ids_fake,
+)
+
+
 def qwen4_exp_ple_short_conv(
     inputs: torch.Tensor,
     output: torch.Tensor,
@@ -1791,6 +2126,14 @@ def qwen4_exp_ple_embed_fake(
             (input_ids.shape[0], output_buffer.shape[-1]),
             device=hidden_states.device,
             dtype=output_buffer.dtype,
+        )
+    if not hasattr(embedding, "ngram_embedding"):
+        raise RuntimeError("PLE embedding was not initialized")
+    if isinstance(embedding.ngram_embedding, ple_mmap.MmapNgramEmbedding):
+        return torch.empty(
+            (input_ids.shape[0], embedding.embedding_dim),
+            device=hidden_states.device,
+            dtype=embedding._resolve_mmap_dtype(),
         )
     quant_method = embedding.ngram_embedding.quant_method
     if isinstance(quant_method, Qwen4ExpPLENVFp4EmbeddingMethod):

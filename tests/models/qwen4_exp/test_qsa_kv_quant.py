@@ -30,7 +30,7 @@ NUM_HEADS = 24
 NUM_KV_HEADS = 2
 HEAD_DIM = 256
 PAGE_SIZE = 64
-TOPK = 2051  # indexer budget 2048 + compress ratio 4 - 1
+TOPK = 2052  # packed selection width: indexer budget 2048 + compress tail
 NUM_REQ = 2
 SEQ_LEN = 4096
 # Query-row counts that exercise every tile profile of the wrapper
@@ -135,11 +135,20 @@ def _make_problem(dev, num_rows: int, seed: int = 0):
         NUM_REQ * pages_per_req, dtype=torch.int32, device=dev
     ).view(NUM_REQ, pages_per_req)
     token_to_req = torch.randint(0, NUM_REQ, (num_rows,), dtype=torch.int32, device=dev)
-    indices = torch.randint(0, SEQ_LEN, (num_rows, TOPK), dtype=torch.int32, device=dev)
+    indices = torch.empty((num_rows, TOPK), dtype=torch.int32, device=dev)
+    indices[:, :-1] = torch.randint(
+        0, SEQ_LEN, (num_rows, TOPK - 1), dtype=torch.int32, device=dev
+    )
     # Part of the selection is invalid (-1), as in operation when the indexer
     # fills less than the full width.
-    indices[:, TOPK // 2 :] = -1
+    indices[:, TOPK // 2 - 1 :] = -1
+    indices[:, -1] = TOPK - 1
     return num_blocks, q, block_table, token_to_req, indices
+
+
+def _make_attention_metadata(q: torch.Tensor) -> dict[str, object]:
+    """Return the decode metadata contract used by the packed selector."""
+    return dict(use_prefill_config=False)
 
 
 def _assert_kernel_matches(out_quant, ref_quant, out_bf16, ref_bf16) -> None:
@@ -161,7 +170,13 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
     one = torch.tensor(1.0, dtype=torch.float32, device=dev)
 
     out_bf16 = qsa_sparse_paged_attention(
-        q, k_cache, v_cache, indices, block_table, token_to_req
+        q,
+        k_cache,
+        v_cache,
+        indices,
+        block_table,
+        token_to_req,
+        **_make_attention_metadata(q),
     )
     out_bf16_scaled = qsa_sparse_paged_attention(
         q,
@@ -172,6 +187,7 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
         token_to_req,
         k_scale=one,
         v_scale=one,
+        **_make_attention_metadata(q),
     )
     # The bf16 branch must not change with the scale arguments present.
     assert torch.equal(out_bf16, out_bf16_scaled)
@@ -190,7 +206,15 @@ def test_qsa_fp8_kv_matches_dequantized_reference() -> None:
         token_to_req,
     )
     out_fp8 = qsa_sparse_paged_attention(
-        q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
+        q,
+        k_fp8,
+        v_fp8,
+        indices,
+        block_table,
+        token_to_req,
+        k_scale=one,
+        v_scale=one,
+        **_make_attention_metadata(q),
     )
     _assert_kernel_matches(out_fp8, ref_fp8, out_bf16, ref_bf16)
 
@@ -216,9 +240,18 @@ def test_qsa_fp8_kv_tile_profiles(num_rows: int) -> None:
         indices,
         block_table,
         token_to_req,
+        **_make_attention_metadata(q),
     )
     out_fp8 = qsa_sparse_paged_attention(
-        q, k_fp8, v_fp8, indices, block_table, token_to_req, k_scale=one, v_scale=one
+        q,
+        k_fp8,
+        v_fp8,
+        indices,
+        block_table,
+        token_to_req,
+        k_scale=one,
+        v_scale=one,
+        **_make_attention_metadata(q),
     )
     assert (out_fp8.double() - out_deq.double()).abs().max().item() < 5e-3
 
@@ -319,7 +352,13 @@ def test_qsa_nvfp4_kv_matches_dequantized_reference(num_rows: int) -> None:
     k_data, k_sf, v_data, v_sf = qsa_backend._nvfp4_cache_views(kv_cache, NUM_KV_HEADS)
 
     out_deq = qsa_sparse_paged_attention(
-        q, k_deq, v_deq, indices, block_table, token_to_req
+        q,
+        k_deq,
+        v_deq,
+        indices,
+        block_table,
+        token_to_req,
+        **_make_attention_metadata(q),
     )
     out_nvfp4 = qsa_sparse_paged_attention(
         q,
@@ -333,6 +372,7 @@ def test_qsa_nvfp4_kv_matches_dequantized_reference(num_rows: int) -> None:
         k_scale_cache=k_sf,
         v_scale_cache=v_sf,
         v_scale_swizzled=v_swizzled,
+        **_make_attention_metadata(q),
     )
     # Kernel against kernel on identical dequantized values: measures only the
     # nvfp4 read branch across all tile profiles.
@@ -342,7 +382,13 @@ def test_qsa_nvfp4_kv_matches_dequantized_reference(num_rows: int) -> None:
         kb = key.reshape(num_blocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM).contiguous()
         vb = value.reshape(num_blocks, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM).contiguous()
         out_bf16 = qsa_sparse_paged_attention(
-            q, kb, vb, indices, block_table, token_to_req
+            q,
+            kb,
+            vb,
+            indices,
+            block_table,
+            token_to_req,
+            **_make_attention_metadata(q),
         )
         ref_bf16 = _reference(q, kb, vb, indices, block_table, token_to_req)
         ref_nvfp4 = _reference(q, k_deq, v_deq, indices, block_table, token_to_req)

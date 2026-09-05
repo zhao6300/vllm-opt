@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.qwen4_exp.nvidia.ops.qsa import warmup_qsa_sparse_paged_attention
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
@@ -69,10 +70,6 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         max_num_batched_tokens=runner.max_num_tokens,
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
-
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        warmup_qsa_sparse_paged_attention,
-    )
 
     kv_cache = owner.kv_cache
     assert kv_cache.numel()

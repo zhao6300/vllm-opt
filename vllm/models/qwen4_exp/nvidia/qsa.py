@@ -334,10 +334,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
-        logical_positions: torch.Tensor,
-        seq_lens: torch.Tensor,
-        compress_ratio: int,
-        is_prefill: bool,
+        use_prefill_config: bool,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -396,10 +393,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             logical_indices,
             attn_metadata.block_table,
             token_to_req,
-            logical_positions[:num_tokens],
-            seq_lens,
-            compress_ratio,
-            is_prefill,
+            use_prefill_config,
             output[:num_tokens],
             # Per-layer scales as device buffers (1.0 from
             # set_default_quant_scales(register_buffer=True)): no host-to-device
@@ -567,7 +561,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "topk_indices_buffer",
             torch.empty(
                 max_tokens,
-                self.indexer.output_width,
+                self.indexer.packed_output_width,
                 dtype=torch.int32,
             ),
             persistent=False,
@@ -626,10 +620,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             positions,
             self.topk_indices_buffer[:num_tokens],
         )
-        if selected.shape != (
-            num_tokens,
-            self.indexer.output_width,
-        ):
+        if selected.shape != (num_tokens, self.indexer.packed_output_width):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         impl.do_kv_cache_update(
@@ -638,10 +629,6 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             value,
             self.kv_cache,
             main_metadata.slot_mapping,
-        )
-        compressed_metadata = cast(
-            QSAForwardMetadata,
-            metadata[self.indexer.compressed_key_cache.prefix],
         )
         impl.forward_qsa(
             self,
@@ -652,10 +639,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
-            logical_positions=compressed_metadata.logical_positions,
-            seq_lens=compressed_metadata.seq_lens,
-            compress_ratio=self.indexer.compress_ratio,
-            is_prefill=main_metadata.max_query_len > self._max_decode_query_len,
+            use_prefill_config=main_metadata.max_query_len > self._max_decode_query_len,
         )
 
     def forward(

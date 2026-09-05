@@ -162,7 +162,16 @@ def _expand_qsa_indices_reference(
     result = torch.cat((expanded, tail), dim=1)
     order = torch.arange(output_width, device=result.device).expand(rows, -1)
     sort_key = torch.where(result >= 0, order, order + output_width)
-    return result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(torch.int32)
+    sorted_indices = result.gather(1, torch.argsort(sort_key, dim=1, stable=True)).to(
+        torch.int32
+    )
+    return torch.cat(
+        (
+            sorted_indices,
+            (result >= 0).sum(dim=-1, dtype=torch.int32).unsqueeze(1),
+        ),
+        dim=1,
+    )
 
 
 def _qsa_select_paged_reference(
@@ -204,12 +213,15 @@ def _qsa_sparse_paged_attention_reference(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     softmax_scale: float,
+    valid_count: torch.Tensor | None = None,
 ) -> torch.Tensor:
     output = torch.zeros_like(q)
     repeats = q.shape[1] // k_cache.shape[2]
     page_size = k_cache.shape[1]
     for row in range(q.shape[0]):
         logical = logical_indices[row]
+        if valid_count is not None:
+            logical = logical[: valid_count[row].item()]
         logical = logical[logical >= 0].long()
         if not logical.numel():
             continue
@@ -798,7 +810,7 @@ def test_qsa_block_expansion_correctness() -> None:
         sequence_lengths.index_select(0, token_to_req.long()) // 4,
     ).to(torch.int32)
 
-    actual = torch.empty((2, 11), device="cuda", dtype=torch.int32)
+    actual = torch.empty((2, 12), device="cuda", dtype=torch.int32)
     qsa_indexer_ops.expand_qsa_block_indices(
         blocks,
         query_positions,
@@ -920,7 +932,7 @@ def test_qsa_sparse_paged_attention_correctness(
         sequence_lengths.index_select(0, token_to_req.long()) // indexer_compress_ratio,
     ).to(torch.int32)
     logical_indices = torch.empty(
-        (num_rows, selection_width), device="cuda", dtype=torch.int32
+        (num_rows, selection_width + 1), device="cuda", dtype=torch.int32
     )
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
@@ -930,7 +942,7 @@ def test_qsa_sparse_paged_attention_correctness(
         indexer_budget,
         logical_indices,
     )
-    assert logical_indices.shape == (num_rows, selection_width)
+    assert logical_indices.shape == (num_rows, selection_width + 1)
     scale = q.shape[-1] ** -0.5
 
     actual = qsa_ops.qsa_sparse_paged_attention(
@@ -940,16 +952,13 @@ def test_qsa_sparse_paged_attention_correctness(
         logical_indices,
         block_table,
         token_to_req,
-        logical_positions=query_positions,
-        seq_lens=sequence_lengths,
-        compress_ratio=indexer_compress_ratio,
-        is_prefill=is_prefill,
+        use_prefill_config=is_prefill,
     )
     expected = _qsa_sparse_paged_attention_reference(
         q,
         k_cache,
         v_cache,
-        logical_indices,
+        logical_indices[:, :-1],
         block_table,
         token_to_req,
         scale,
@@ -1021,7 +1030,7 @@ def test_qsa_split_selection_correctness(workspace_init, decode_query_len: int) 
         max_seq_len=sequence_lengths.max().item(),
     )
     actual = torch.empty(
-        (rows, token_topk + compress_ratio - 1), device="cuda", dtype=torch.int32
+        (rows, token_topk + compress_ratio), device="cuda", dtype=torch.int32
     )
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
@@ -1073,7 +1082,7 @@ def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> 
         block_indices=block_indices,
         max_seq_len=64,  # clamps to the page-table capacity
     )
-    selected = torch.empty((2, 2051), device="cuda", dtype=torch.int32)
+    selected = torch.empty((2, 2052), device="cuda", dtype=torch.int32)
     qsa_indexer_ops.expand_qsa_block_indices(
         block_indices,
         query_positions,
@@ -1085,8 +1094,10 @@ def test_qsa_selection_handles_no_complete_compressed_blocks(workspace_init) -> 
 
     assert selected[0, :2].tolist() == [0, 1]
     assert selected[1, :3].tolist() == [0, 1, 2]
-    assert torch.all(selected[0, 2:] == -1)
-    assert torch.all(selected[1, 3:] == -1)
+    assert torch.all(selected[0, 2:-1] == -1)
+    assert torch.all(selected[1, 3:-1] == -1)
+    assert selected[0, -1].item() == 2
+    assert selected[1, -1].item() == 3
 
 
 @requires_qsa_kernels

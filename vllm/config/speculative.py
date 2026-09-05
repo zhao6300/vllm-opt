@@ -1862,6 +1862,14 @@ class SpeculativeConfig:
         """Whether volatile trailing cache blocks should be discarded."""
         return self.use_eagle() and not self.disable_eagle_block_drop
 
+    def use_qwen4_exp_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "qwen4_exp_mtp"
+        )
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
