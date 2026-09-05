@@ -299,6 +299,8 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_PLE_CPU_OFFLOAD: bool = False
+    VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -325,6 +327,13 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_PLE_MMAP: bool = False
+    VLLM_PLE_MMAP_WORKERS: int = 32
+    VLLM_PLE_MMAP_CHUNK: int = 2048
+    VLLM_PLE_MMAP_PREWARM: bool = False
+    VLLM_PLE_MMAP_READAHEAD: int = 0
+    VLLM_PLE_MMAP_PINNED: bool = False
+    VLLM_PLE_MMAP_SERIAL: int = 0
     VLLM_ENABLE_HPC_OPS: bool = False
 
 
@@ -2069,6 +2078,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # Run n-gram PLE lookup in a dedicated CPU offload worker. The initial
+    # implementation supports ModelRunner V1 and single-node TP only.
+    "VLLM_PLE_CPU_OFFLOAD": lambda: (
+        os.getenv("VLLM_PLE_CPU_OFFLOAD", "False").lower() in ("true", "1")
+    ),
+    # Timeout for PLE weight loading and TP worker registration.
+    "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
+        os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2195,6 +2213,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Serve the Qwen4Exp PLE n-gram table from NVMe via mmap instead of
+    # keeping it GPU/host-resident. See vllm/models/qwen4_exp/nvidia/ple_mmap.py.
+    "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
+    # Gather thread-pool size for the PLE mmap path.
+    "VLLM_PLE_MMAP_WORKERS": lambda: int(os.getenv("VLLM_PLE_MMAP_WORKERS", "32")),
+    # Rows per PLE mmap gather task.
+    "VLLM_PLE_MMAP_CHUNK": lambda: int(os.getenv("VLLM_PLE_MMAP_CHUNK", "2048")),
+    # If set, stream the PLE table once at load to warm the page cache
+    # (bounded by available memory).
+    "VLLM_PLE_MMAP_PREWARM": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_PREWARM", "0"))),
+    # Max coalesced file ranges a PLE mmap gather may hand to
+    # posix_fadvise(WILLNEED) before copying; 0 disables the readahead
+    # pre-pass, and a gather needing more ranges than this skips it.
+    "VLLM_PLE_MMAP_READAHEAD": lambda: int(os.getenv("VLLM_PLE_MMAP_READAHEAD", "0")),
+    # Stage each PLE mmap gather through a per-call pinned host buffer before
+    # H2D, instead of copying from gather()'s pageable numpy array.
+    "VLLM_PLE_MMAP_PINNED": lambda: bool(int(os.getenv("VLLM_PLE_MMAP_PINNED", "0"))),
+    # Rows threshold at or under which a PLE mmap gather runs its tasks
+    # inline on the calling thread instead of through the worker pool; 0
+    # (default) disables this and always dispatches through the pool.
+    "VLLM_PLE_MMAP_SERIAL": lambda: int(os.getenv("VLLM_PLE_MMAP_SERIAL", "0")),
     # If set to 1, enable the HPC fused kernels (requires the hpc package
     # (.so) and an sm100/sm103 device). Covers:
     #   * the HY V4 iHC ops -- each of the eager HYV4HCPreLayer /
@@ -2373,6 +2412,15 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # PLE mmap runtime tuning: affects only the CPU/host body of a
+        # split-out op, never the compiled graph. VLLM_PLE_MMAP itself stays
+        # a factor since it changes which op the graph splits around.
+        "VLLM_PLE_MMAP_WORKERS",
+        "VLLM_PLE_MMAP_CHUNK",
+        "VLLM_PLE_MMAP_PREWARM",
+        "VLLM_PLE_MMAP_READAHEAD",
+        "VLLM_PLE_MMAP_PINNED",
+        "VLLM_PLE_MMAP_SERIAL",
     }
 
     from vllm.config.utils import normalize_value

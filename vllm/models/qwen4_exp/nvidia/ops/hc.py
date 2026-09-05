@@ -222,10 +222,10 @@ def _hc_combine_kernel(
 
     # Keeping HC as a broadcast dimension is faster here than four separate
     # residual load/store sequences.
+    block = block.to(tl.float32)[None, :]
     if inj_ptr is not None:
-        inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
-        block = block.to(tl.float32)[None, :] * inj[:, None]
-    out = res.to(tl.float32) + block.to(tl.float32)
+        block *= 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)[:, None]
+    out = res.to(tl.float32) + block
 
     if launch_pdl:
         tl.extra.cuda.gdc_launch_dependents()
@@ -293,9 +293,8 @@ def _hc_combine_norm_kernel(
     NUM_TILES: tl.constexpr = triton.cdiv(HC_DIM, BLOCK_SIZE)
     NUM_TILES_PAD: tl.constexpr = triton.next_power_of_2(NUM_TILES)
 
-    pid = tl.program_id(0)
-    row = pid // HC
-    stream = pid % HC
+    row = tl.program_id(0)
+    stream = tl.program_id(1)
     offs_hc = tl.arange(0, HC_PAD)
     mask_hc = offs_hc < HC
     tile_ids = tl.arange(0, NUM_TILES_PAD)
@@ -318,18 +317,20 @@ def _hc_combine_norm_kernel(
         block_ptr + row * stride_block + offs_inner,
         mask_inner,
         other=0.0,
-    )
+    ).to(tl.float32)
     if inj_ptr is not None:
         inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
-        block = block.to(tl.float32) * tl.sum(tl.where(offs_hc == stream, inj, 0.0))
+        block *= tl.sum(tl.where(offs_hc == stream, inj, 0.0))
     # Round the materialized combine result before normalization. This matches
     # the unfused combine -> RMSNorm boundary.
-    out = (res.to(tl.float32) + block.to(tl.float32)).to(out_ptr.dtype.element_ty)
+    out = (res.to(tl.float32) + block).to(out_ptr.dtype.element_ty)
     if inj_ptr is None:
         w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
     tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
 
     out = out.to(tl.float32)
+    # Keep the two-axis reduction: flattening the padded tile is ~40% slower
+    # at decode sizes.
     sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
     rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
 
@@ -370,7 +371,7 @@ def _hc_combine_norm(
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
-    _hc_combine_norm_kernel[(N * hc_count,)](
+    _hc_combine_norm_kernel[(N, hc_count)](
         block_output,
         residual,
         injection_logits,
