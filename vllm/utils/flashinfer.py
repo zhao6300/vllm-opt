@@ -255,6 +255,11 @@ flashinfer_trtllm_batch_decode_with_kv_cache_mla = _lazy_import_wrapper(
     "trtllm_batch_decode_with_kv_cache_mla",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_trtllm_batch_decode_sparse_mla_sm120 = _lazy_import_wrapper(
+    "flashinfer.mla._core",
+    "_trtllm_batch_decode_sparse_mla_v32_sm120",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
     "flashinfer.decode",
     "trtllm_batch_decode_sparse_mla_dsv4",
