@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 
 from vllm.logger import init_logger
+from vllm.models.qwen4_exp.nvidia.ops.qsa import warmup_qsa_sparse_paged_attention
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
@@ -17,8 +18,7 @@ logger = init_logger(__name__)
 
 
 def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
-    """Warm every reachable QSA specialization: indexer decode-query-length
-    profiles plus the sparse attention split-K/merge configs."""
+    """Warm every reachable QSA decode-query-length specialization."""
 
     qsa_module = sys.modules.get("vllm.models.qwen4_exp.nvidia.indexer_qsa")
     attn_module = sys.modules.get("vllm.models.qwen4_exp.nvidia.qsa")
@@ -71,10 +71,6 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     )
     logger.info("Warmed up Qwen4Exp QSA decode kernels: %s.", profiles)
 
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
-        warmup_qsa_sparse_paged_attention,
-    )
-
     kv_cache = owner.kv_cache
     assert kv_cache.numel()
     attention_profiles = warmup_qsa_sparse_paged_attention(
@@ -82,6 +78,8 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         block_table_for(owner.layer_name),
         num_query_heads=owner.num_heads,
         selection_width=indexer.output_width,
+        compress_ratio=indexer.compress_ratio,
+        cache_dtype=owner.kv_cache_dtype,
     )
     logger.info(
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
