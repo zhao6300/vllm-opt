@@ -60,7 +60,6 @@ from vllm.multimodal.encoder_budget import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
-from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -529,6 +528,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return get_kv_cache_spec(self.vllm_config)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self.cp_interleave = self.parallel_config.cp_kv_cache_interleave_size
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
@@ -551,26 +551,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 spec = spec.first_spec
             block_sizes.append(spec.block_size)
             slot_mapping_enabled.append(not isinstance(spec, CircularBufferSpec))
-            # When using DCP, each request's KV cache is sharded among different ranks.
-            # As a result, one block on the current rank covers `block_size * cp_size`
-            # tokens in the full, global (unsharded) sequence.
-            if isinstance(spec, CircularBufferSpec):
-                max_num_blocks = spec.max_num_blocks_per_req(
-                    self.vllm_config, block_table_max_model_len
-                )
-            else:
-                max_num_blocks = cdiv(
-                    block_table_max_model_len, spec.block_size * self.dcp_size
-                )
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
-            if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
-                max_num_blocks = get_block_table_width(
-                    max_num_blocks, spec.block_size, token_alignment=None
-                )
-            elif isinstance(spec, CircularBufferSpec):
+            # Let each cache type account for CP. Attention KV is DCP-sharded,
+            # while Mamba/GDN recurrent state is replicated across DCP ranks.
+            max_num_blocks = spec.max_num_blocks_per_req(
+                self.vllm_config, block_table_max_model_len
+            )
+            # Preserve each cache type's alignment requirements after applying
+            # its topology-aware block-table width.
+            if isinstance(spec, (MambaSpec, CircularBufferSpec)):
                 max_num_blocks = get_block_table_width(
                     max_num_blocks, spec.block_size, token_alignment=None
                 )
@@ -1651,14 +1639,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ec_connector_output,
             )
 
+        prepared_inputs = (
+            self.model_state.prepare_runtime_dummy_inputs(input_batch, self.req_states)
+            if dummy_run
+            else self.model_state.prepare_inputs(input_batch, self.req_states)
+        )
         model_inputs = {
             "input_ids": input_ids,
             "positions": input_batch.positions,
             "inputs_embeds": inputs_embeds,
             "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
+            # NOTE: Values returned by the prepared inputs override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **prepared_inputs,
         }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.

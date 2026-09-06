@@ -166,6 +166,8 @@ def test_initialize_kv_cache_does_not_dcp_shard_mamba_block_table(
         is_encoder_decoder=False,
         vllm_config=vllm_config,
         parallel_config=parallel_config,
+        cache_config=SimpleNamespace(enable_prefix_caching=True),
+        dcp_size=dcp_size,
     )
 
     class _CapturedWidths(Exception):
@@ -276,6 +278,9 @@ def test_execute_model_dummy_run_uses_prepare_runtime_dummy_inputs_not_prepare_i
     runner.input_buffers = None
     runner.uses_inputs_embeds = False
     runner.is_first_pp_rank = True
+    runner.supports_mm_inputs = False
+    runner.is_encoder_only = False
+    runner._ple_offload_connector = None
     runner.model_state = _RecordingModelState()
     runner.req_states = None
     runner.eplb = SimpleNamespace(prepare_forward=lambda *a, **kw: None)

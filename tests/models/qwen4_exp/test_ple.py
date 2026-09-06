@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import dataclass
+from itertools import accumulate
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,10 @@ from vllm.models.qwen4_exp.nvidia.ple_layer import (
     _dequant_nvfp4_codes,
     _get_ple_embedding_quant_method,
 )
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadata,
+)
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
@@ -1880,6 +1886,8 @@ def test_fused_conv_correctness(
     metadata, num_real_tokens = _make_conv_metadata(case, device)
     if case.state_index_stride > 1:
         assert metadata.state_indices_tensor.stride(0) == case.state_index_stride
+
+
 def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module = Qwen4ExpPLELayer.__new__(Qwen4ExpPLELayer)
     nn.Module.__init__(module)
