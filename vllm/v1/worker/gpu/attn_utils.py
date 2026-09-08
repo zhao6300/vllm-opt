@@ -3,6 +3,7 @@
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from math import prod
 from typing import Any, cast
 
 import torch
@@ -11,6 +12,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -243,6 +245,56 @@ def init_kv_cache(
         kv_cache_groups=kv_cache_config.kv_cache_groups,
     )
     return kv_caches
+
+
+def _reshape_attention_kv_cache(
+    kv_raw_tensor: torch.Tensor,
+    kv_cache_spec: AttentionSpec,
+    kv_cache_shape: tuple[int, ...],
+    kv_cache_stride_order: tuple[int, ...],
+    num_blocks: int,
+    packing: tuple[int, int] | None,
+) -> torch.Tensor:
+    permuted_kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+    inv_order = [
+        kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
+    ]
+    dtype = kv_cache_spec.dtype
+
+    if packing is not None:
+        offset, block_stride = packing
+        assert inv_order[0] == 0
+        page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+        kv_cache = (
+            kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
+            .view(dtype)
+            .view(permuted_kv_cache_shape)
+        )
+    else:
+        kv_cache = kv_raw_tensor.view(dtype).view(permuted_kv_cache_shape)
+
+    return kv_cache.permute(*inv_order)
+
+
+def _reshape_mamba_kv_cache(
+    kv_raw_tensor: torch.Tensor,
+    page_size_bytes: int,
+    num_blocks: int,
+    packing: tuple[int, int] | None,
+) -> torch.Tensor:
+    if packing is not None:
+        offset, block_stride = packing
+        assert offset + page_size_bytes <= block_stride
+        return torch.as_strided(
+            kv_raw_tensor,
+            size=(num_blocks, 1, 1, page_size_bytes),
+            stride=(block_stride, page_size_bytes, page_size_bytes, 1),
+            storage_offset=offset,
+        )
+
+    return kv_raw_tensor[: num_blocks * page_size_bytes].view(
+        num_blocks, 1, 1, page_size_bytes
+    )
 
 
 def build_slot_mappings_by_layer(

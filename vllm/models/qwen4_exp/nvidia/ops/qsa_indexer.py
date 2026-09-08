@@ -200,9 +200,6 @@ def _qsa_mqa_paged_prefill_kernel(
             other=0.0,
             eviction_policy="evict_first",
         )
-        # With an fp8 cache, SM90 lowers this dot to reduced-precision wgmma
-        # accumulation; SM100 tcgen05 accumulates in fp32. The SM90 error
-        # (~1e-4 relative) is far below the e4m3 quantization noise floor.
         scores = tl.dot(keys, query, out_dtype=tl.float32)
         scores = tl.reshape(scores, (BLOCK_N, TILE_R, NUM_HEADS_PADDED))
         score = tl.sum(tl.maximum(scores, 0.0), axis=2)
@@ -287,6 +284,13 @@ def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
     return 8
 
 
+def _decode_num_warps(cache_dtype: torch.dtype) -> int:
+    # fp8 halves the K-tile bytes; a single warp per program wins on SM103a
+    # (up to 1.2x at dql=4) and is neutral at dql=1, but slightly regresses
+    # bf16, so keep 2 warps for the bf16 cache.
+    return 1 if cache_dtype == torch.float8_e4m3fn else 2
+
+
 def _qsa_decode_warmup_profiles(
     max_dql: int,
     max_num_reqs: int,
@@ -368,8 +372,7 @@ def warmup_qsa_mqa_paged_decode(
             BLOCK_N=_DECODE_BLOCK_N,
             TILES_PER_PROG=tiles_per_program,
             STAGES=2,
-            # tuned on GB300
-            num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+            num_warps=_decode_num_warps(k_cache.dtype),
             grid=(
                 num_requests,
                 triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
@@ -397,11 +400,14 @@ def _prefill_logits(
     logits = torch.empty(
         (num_queries, logits_width), dtype=torch.float32, device=q.device
     )
-    # tuned on GB300
+    TILE_R = 64
+    # FP8 halves the K-tile bytes; smaller row tiles + deeper pipelining win
+    # there (measured on SM103a) but slightly regress bf16, so keep the bf16
+    # constants for the bf16 cache.
     if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
+        TILE_R, STAGES = 32, 3
     else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
+        TILE_R, STAGES = 64, 2
     BLOCK_N = 64
     K_TILES = 16
     grid = (
@@ -430,7 +436,7 @@ def _prefill_logits(
         BLOCK_N=BLOCK_N,
         K_TILES=K_TILES,
         STAGES=STAGES,
-        num_warps=num_warps,
+        num_warps=4,
     )
     return logits
 
@@ -559,8 +565,7 @@ def qsa_select_paged_decode(
         BLOCK_N=_DECODE_BLOCK_N,
         TILES_PER_PROG=tiles_per_program,
         STAGES=2,
-        # tuned on GB300
-        num_warps=1 if k_cache.dtype == torch.float8_e4m3fn else 2,
+        num_warps=_decode_num_warps(k_cache.dtype),
     )
     _topk(
         logits,
