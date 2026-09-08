@@ -164,7 +164,6 @@ def test_qwen4_exp_model_state_prepares_ngram_context() -> None:
             gpu=torch.tensor([[1, 2, 3, 4], [20, 21, 22, 23]], dtype=torch.int32)
         ),
     )
-    expected_query_start_loc = torch.tensor([0, 2, 3, 3], dtype=torch.int32)
     expected_context = torch.tensor(
         [[99, 99, 20], [1, 2, 3], [99, 99, 99]], dtype=torch.int32
     )
