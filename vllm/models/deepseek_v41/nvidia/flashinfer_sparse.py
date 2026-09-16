@@ -552,6 +552,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    use_fp4_extra_kv: bool = (
+        current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    )
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
@@ -864,6 +868,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
 
+        kv_cache_format = (
+            "fp8_dsv41_fp4_ca" if self.use_fp4_extra_kv else "fp8"
+        )
         q = self._prepare_query(q, output)
         swa_kv_paged = self._as_sparse_cache(swa_k_cache)
         if swa_only:
@@ -916,6 +923,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",
+                kv_cache_format=kv_cache_format,
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,

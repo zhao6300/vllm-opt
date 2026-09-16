@@ -6,6 +6,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import flashinfer_dsv41_fp4_quantize_append
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -248,6 +249,24 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 288:
+        roped_latent = torch.empty_like(latent)
+        _gptj_rotate_latent_kernel[(num_tokens,)](
+            latent,
+            positions,
+            cos_sin_cache,
+            roped_latent,
+            COS_STRIDE=cos_sin_cache.stride(0),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+            **launch_kwargs,
+        )
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent,
+            slot_mapping,
+            kv_cache,
+        )
+        return
     if kv_cache.dtype == torch.uint8:
         assert kv_cache.shape[-1] in (584, 528), (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
@@ -445,3 +464,28 @@ def _rope_plain_insert_kernel(
         tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
     else:
         tl.store(dst + d, row)
+
+
+@triton.jit
+def _gptj_rotate_latent_kernel(
+    latent,
+    positions,
+    cos_sin,
+    output,
+    COS_STRIDE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+):
+    t = tl.program_id(0)
+    position = tl.load(positions + t)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+    d = tl.arange(0, 512)
+    normed = tl.load(latent + t.to(tl.int64) * 512 + d).to(tl.float32)
+    even, odd = tl.split(tl.reshape(normed, (256, 2)))
+    pair = tl.arange(0, 256) - 224
+    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
+    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
+    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
+    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
+    rotated = tl.where(rotated != rotated, 0.0)
+    tl.store(output + t.to(tl.int64) * 512 + d, rotated.to(tl.bfloat16))

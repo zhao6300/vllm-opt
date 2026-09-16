@@ -6,6 +6,7 @@ DeepseekV4 MLA Attention Layer
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -158,6 +159,13 @@ def _resolve_dsv4_kv_cache_dtype(
     return kv_cache_dtype, torch.bfloat16
 
 
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41MLAAttentionSpec(MLAAttentionSpec):
+    @property
+    def use_fp4_extra_kv(self) -> bool:
+        return self.model_version == "deepseek_v41"
+
+
 def _compressed_cache_spec(
     vllm_config: VllmConfig,
     head_dim: int,
@@ -173,7 +181,7 @@ def _compressed_cache_spec(
         vllm_config.cache_config.block_size,
         64 * compress_ratio,
     )
-    return MLAAttentionSpec(
+    return DeepseekV41MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=head_dim,
@@ -208,6 +216,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # FlashInfer SM120 accepts a mixed-stream V4.1 decode where the SWA cache
+    # remains FP8 while the compressed cache uses the 288-byte V41_FP4 format.
+    use_fp4_extra_kv: bool = False
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -526,6 +537,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
+                use_fp4_cache=self.use_fp4_extra_kv,
             )
         # Prefix of the attention layer owning this layer's compressed KV
         # cache (self for kv sources).
@@ -994,6 +1006,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # to the decode kernel's TMA stride; plain bf16 / per-tensor fp8 rows
         # use natural element-size pages.
         uses_fp8_ds_mla_layout = self.kv_cache_dtype == "fp8_ds_mla"
+        uses_fp4_extra_cache = self.use_fp4_extra_kv
         # DeepSeek-V4.1 sparse-MLA pages are compressed states. Keep each page
         # wide enough to carry at least 64 kernel states, preserving any larger
         # configured page width.
@@ -1001,20 +1014,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             vllm_config.cache_config.block_size,
             64 * self.compress_ratio,
         )
-        return MLAAttentionSpec(
+        return DeepseekV41MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            dtype=torch.uint8 if uses_fp8_ds_mla_layout else self.kv_cache_torch_dtype,
+            dtype=(
+                torch.uint8
+                if uses_fp8_ds_mla_layout or uses_fp4_extra_cache
+                else self.kv_cache_torch_dtype
+            ),
             tokens_per_state=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=self.kv_page_alignment if uses_fp8_ds_mla_layout else 512,
-            model_version="deepseek_v4",
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            # Packed record width; head_size stays semantic (512).
-            state_content_bytes=(
-                self.kv_bytes_per_token if uses_fp8_ds_mla_layout else None
+            **(
+                {
+                    "model_version": "deepseek_v41",
+                    "state_content_bytes": 288,
+                }
+                if uses_fp4_extra_cache
+                else {
+                    "model_version": "deepseek_v4",
+                    "state_content_bytes": (
+                        self.kv_bytes_per_token if uses_fp8_ds_mla_layout else None
+                    ),
+                }
             ),
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
     def _compressed_kv_cache(self) -> torch.Tensor:
@@ -1062,7 +1087,7 @@ class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):
             vllm_config.cache_config.block_size,
             64 * self.compress_ratio,
         )
-        return MLAAttentionSpec(
+        return DeepseekV41MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
