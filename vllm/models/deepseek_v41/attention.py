@@ -1128,6 +1128,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             "fp8_ds_mla",
             "nvfp4_ds_mla",
         )
+        uses_fp4_extra_cache = self.use_fp4_extra_kv
         # DeepSeek-V4.1 sparse-MLA pages are compressed states. Keep each page
         # wide enough to carry at least 64 kernel states, preserving any larger
         # configured page width.
@@ -1249,6 +1250,7 @@ class DeepseekV4PipelineCache(nn.Module, AttentionLayerBase):
         cache_config = vllm_config.cache_config
         self.head_dim = config.head_dim
         self.compress_ratio = config.compress_ratios[source_layer]
+        self.use_fp4_extra_kv = attn_cls.use_fp4_extra_kv
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
             attn_cls.use_fp8_ds_mla_layout, cache_config.cache_dtype, cache_config
         )

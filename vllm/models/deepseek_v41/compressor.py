@@ -190,6 +190,7 @@ class DeepseekCompressor(nn.Module):
         rotate: bool = False,
         prefix: str = "",
         k_cache_prefix="",
+        use_fp4_cache: bool = False,
     ):
         super().__init__()
         if compress_ratio not in (1, 2):
@@ -204,6 +205,7 @@ class DeepseekCompressor(nn.Module):
         self.rotate = rotate
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
+        self.use_fp4_cache = use_fp4_cache
         # Ratio 1 pools single tokens, so the checkpoint carries no gate.
         self.has_gate = compress_ratio > 1
 
