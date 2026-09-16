@@ -183,6 +183,7 @@ def _compressed_cache_spec(
     compress_ratio: int,
     cache_dtype: str,
     cache_torch_dtype: torch.dtype,
+    use_fp4_extra_kv: bool = False,
 ) -> MLAAttentionSpec:
     uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
     # DeepSeek-V4.1 sparse-MLA pages are compressed states. Ratio-1 and
@@ -1275,6 +1276,7 @@ class DeepseekV4PipelineCache(nn.Module, AttentionLayerBase):
             self.compress_ratio,
             self.kv_cache_dtype,
             self.kv_cache_torch_dtype,
+            self.use_fp4_extra_kv,
         )
 
     def forward(self):
