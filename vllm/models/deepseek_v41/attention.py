@@ -121,9 +121,12 @@ def _fill_short_context_topk_indices(
 # UE8M0 scale per 32 dims, 512 data bytes + 16 scale bytes per token, pages
 # rounded to the kernel's 512 B TMA stride -- only in its SM100 sparse-decode
 # kernels. Every other arch keeps the V4 record: 448 fp8 NoPE + 64 bf16 RoPE
-# plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
 def _use_v41_mxfp8_kv_record() -> bool:
-    return current_platform.is_device_capability_family(100)
+    return (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    )
 
 
 def _resolve_dsv4_kv_cache_dtype(
