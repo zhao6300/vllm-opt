@@ -598,7 +598,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
-        self.use_fp4_kv = current_platform.is_device_capability_family(
+        self.use_fp4_extra_kv = current_platform.is_device_capability_family(
             120
         ) or current_platform.is_device_capability_family(121)
 
@@ -798,7 +798,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
-            kv_cache_format="fp8_dsv41_fp4_ca" if self.use_fp4_kv else "fp8",
+            kv_cache_format=(
+                "fp8_dsv41_fp4_ca" if self.use_fp4_extra_kv else "fp8"
+            ),
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
