@@ -914,9 +914,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_metadata.prefill_swa_indices is not None
         assert swa_metadata.prefill_swa_lens is not None
 
-        kv_cache_format = (
-            "fp8_dsv41_fp4_ca" if self.use_fp4_extra_kv else "fp8"
-        )
         q = self._prepare_query(q, output)
         swa_kv_paged = self._as_sparse_cache(swa_k_cache)
         if swa_only:
