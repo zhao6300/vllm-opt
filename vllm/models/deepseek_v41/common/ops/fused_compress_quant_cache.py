@@ -545,5 +545,5 @@ def _gptj_rotate_latent_kernel(
     c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
     s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
     rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
-    rotated = tl.where(rotated != rotated, 0.0)
+    rotated = tl.where(rotated != rotated, 0.0, rotated)
     tl.store(output + t.to(tl.int64) * 512 + d, rotated.to(tl.bfloat16))
