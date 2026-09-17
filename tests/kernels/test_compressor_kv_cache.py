@@ -80,10 +80,15 @@ def test_dspark_context_kv_matches_query_insert(
     # Only what _insert_context_kv actually reads: the record width comes off
     # the cache tensor, so no per-record width attribute is stubbed here.
     attn = SimpleNamespace(
+        head_dim=512,
+        n_local_heads=1,
+        padded_heads=8,
+        eps=1e-20,
         swa_cache_layer=SimpleNamespace(kv_cache=cache, block_size=block_size),
         kv_mxfp8=kv_mxfp8,
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin),
         _flashinfer_fp8_kv_scale=scale,
+        _flashinfer_fp8_q_scale_inv=scale,
     )
 
     def legacy_insert():
@@ -557,6 +562,7 @@ def test_v41_nvfp4_gather_matches_insert():
     num_tokens = 70
     num_blocks = 4
     page_bytes = math.ceil(block_size * 288 / 512) * 512
+    compress_ratio = 2
 
     positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
     latent = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
@@ -850,7 +856,7 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
         n_local_heads=1,
         head_dim=512,
         _wq_b_proj=lambda qr, scale: qr.clone(),
-        _prepare_q_and_insert_kv=lambda q, kv, pos, meta: q,
+        _fused_qnorm_rope_kv_insert=lambda q, kv, pos, meta: q,
         _sparse_indexer_and_attn=observe,
     )
 

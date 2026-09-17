@@ -247,7 +247,7 @@ def _insert_context_kv(
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
     dummy_q = torch.zeros(
-        (n_ctx, attn.head_dim),
+        (n_ctx, attn.n_local_heads, attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
