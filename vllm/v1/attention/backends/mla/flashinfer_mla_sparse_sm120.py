@@ -34,6 +34,12 @@ class FlashInferMLASparseSM120Impl(SparseMLACommonImpl[FlashInferMLASparseMetada
 
     is_sparse = True
     supports_dense_mha_prefill = False
+    # SM120 sparse MLA implements only the sparse-MQA path and has no
+    # masked-MHA prefill kernel. The prefill dispatcher in mla_attention reads
+    # ``self.impl.masked_mha_available`` unconditionally for any sparse impl, so
+    # it must exist here (the generic impl only sets it in __init__, which this
+    # subclass does not inherit) and be False to keep the masked-MHA branch off.
+    masked_mha_available = False
 
     def __init__(
         self,

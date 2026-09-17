@@ -5,6 +5,7 @@ from typing import Any, ClassVar, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.warmup.jit_warmup import (
@@ -69,6 +70,21 @@ def _layer_type_for(compress_ratio: int) -> str:
     )
 
 
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV4SWAReplaySpec(SlidingWindowMLASpec):
+    """SWA cache kept out of prefix caching; a hit replays the window instead.
+
+    Selected by ``VLLM_DEEPSEEK_V4_SWA_BOUNDED_REPLAY``. The cache stays paged
+    and windowed as usual; only the paged MLA group takes part in prefix
+    caching and KV connectors, and the scheduler recomputes the trailing
+    ``sliding_window`` tokens of every hit to rebuild this cache.
+    """
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
+
+
 class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def __init__(
         self,
@@ -116,7 +132,12 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             "fp8_ds_mla",
             "nvfp4_ds_mla",
         )
-        return SlidingWindowMLASpec(
+        spec_cls = (
+            DeepseekV4SWAReplaySpec
+            if envs.VLLM_DEEPSEEK_V4_SWA_BOUNDED_REPLAY
+            else SlidingWindowMLASpec
+        )
+        return spec_cls(
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
@@ -452,15 +473,13 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         assert hasattr(hf_config, "sliding_window")
         self.window_size = hf_config.sliding_window
 
-        # V4 vision variant: image spans (up to vision_max_n_token tokens) are
+        # Vision variant: image spans (up to vision_max_n_token tokens) are
         # visible bidirectionally, so prefill index rows widen from
-        # window_size to window_size + max_image_tokens. The V4 config sets
-        # mm_prefix_clamp_sliding_window exactly for these in-kernel-widened
-        # ranges; V4.1 image tokens use the plain causal window, and text-only
-        # models keep max_image_tokens == 0 everywhere.
+        # window_size to window_size + max_image_tokens. Text-only models keep
+        # max_image_tokens == 0 and take the original code paths everywhere.
         self.max_image_tokens = (
             getattr(hf_config, "vision_max_n_token", 0)
-            if getattr(hf_config, "mm_prefix_clamp_sliding_window", False)
+            if getattr(hf_config, "vision_n_layers", 0) > 0
             else 0
         )
         self.prefill_index_width = self.window_size + self.max_image_tokens

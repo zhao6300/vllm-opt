@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_DSA_SPARSE_MQA_LOGITS: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
@@ -164,6 +165,7 @@ if TYPE_CHECKING:
     V_SCALE_CONSTANT: int = 100
     VLLM_USE_RUST_FRONTEND: bool = False
     VLLM_USE_RUST_BENCH: bool = False
+    VLLM_DEEPSEEK_V4_SWA_BOUNDED_REPLAY: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
@@ -1079,6 +1081,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Use DeepGEMM's sparse MQA logits kernels for the DeepSeek V4.1
+    # two-level indexer: score only the candidate blocks instead of computing
+    # dense logits and masking them down. Requires an MXFP4 indexer cache,
+    # SM100-class GPUs, and DeepGEMM >= 2.8.
+    "VLLM_DSA_SPARSE_MQA_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_DSA_SPARSE_MQA_LOGITS", "0"))
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1404,6 +1413,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, use the packaged Rust client for `vllm bench serve`.
     "VLLM_USE_RUST_BENCH": lambda: bool(int(os.getenv("VLLM_USE_RUST_BENCH", "0"))),
+    # DeepSeek-V4 family: keep the sliding-window KV out of prefix caching and
+    # recompute the trailing window after a prefix-cache or KV-connector hit.
+    "VLLM_DEEPSEEK_V4_SWA_BOUNDED_REPLAY": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_SWA_BOUNDED_REPLAY", "0"))
+    ),
     # Path to the vllm-rs binary. Defaults to "auto" which discovers the
     # binary installed with the vllm package. Used when VLLM_USE_RUST_FRONTEND=1
     # or VLLM_USE_RUST_BENCH=1.

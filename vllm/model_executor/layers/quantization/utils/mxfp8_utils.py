@@ -192,6 +192,9 @@ def _mxfp8_e4m3_quantize_impl(
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
+    if x.numel() == 0:
+        return mxfp8_e4m3_quantize_fake(x, is_sf_swizzled_layout, alignment)
+
     if current_platform.has_device_capability(100) and has_flashinfer():
         from flashinfer import mxfp8_quantize as flashinfer_mxfp8_quantize
 

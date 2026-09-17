@@ -87,7 +87,16 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        # SM120 sparse-MLA pages are compressed states. Ratio-1 and ratio-2
+        # layers use token block sizes 64 and 128 respectively to get the same
+        # required 64-state page.
+        if (
+            current_platform.is_device_capability_family(90)
+            or current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [MultipleOf(64)]
+        return [128]
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
@@ -260,7 +269,6 @@ class FlashMLAMegaAttnBackend(DeepseekV4FlashMLABackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 10
-
     @classmethod
     def supports_combination(
         cls,

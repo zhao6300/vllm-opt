@@ -10,12 +10,56 @@ from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
 )
+from vllm.models.deepseek_v41 import nvidia
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseSM120Backend,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+
+class _FakeSm120Wrapper:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def run(self, **kwargs):
+        self.run_kwargs = kwargs
+
+
+def _install_sm120_wrapper(monkeypatch) -> None:
+    import flashinfer.mla._sparse_mla_sm120 as flashinfer_sm120
+
+    monkeypatch.setattr(
+        flashinfer_sm120,
+        "SparseMLASm120Wrapper",
+        _FakeSm120Wrapper,
+    )
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse,
+        "_sparse_mla_sm120_wrappers",
+        {},
+    )
+
+
+def _sm120_attention_tensors():
+    query = torch.zeros((48, 64, 512), dtype=torch.bfloat16)
+    output = torch.zeros_like(query)
+    swa_cache = torch.empty((8, 64, 528), dtype=torch.uint8)
+    extra_cache = torch.empty((8, 64, 1, 288), dtype=torch.uint8)
+    return query, swa_cache, extra_cache, output
+
+
+def _sm120_indices() -> torch.Tensor:
+    return torch.empty((48, 1152), dtype=torch.int32)
+
+
+def _sm120_lengths(num_tokens: int = 48) -> torch.Tensor:
+    return torch.empty((num_tokens,), dtype=torch.int32)
+
+
+def _sm120_extra_indices() -> torch.Tensor:
+    return torch.empty((48, 1, 1152), dtype=torch.int32)
 
 
 def _fake_vllm_config(model_type: str) -> SimpleNamespace:
@@ -39,6 +83,15 @@ def test_sm120_backend_uses_sparse_mqa_for_prefill() -> None:
 
     assert impl_cls.is_sparse
     assert not impl_cls.supports_dense_mha_prefill
+
+
+def test_sm120_backend_exposes_masked_mha_available_false() -> None:
+    # The prefill dispatcher reads ``impl.masked_mha_available`` for any sparse
+    # impl; SM120 has no masked-MHA prefill kernel, so the attribute must exist
+    # and be False rather than AttributeError at startup.
+    impl_cls = FlashInferMLASparseSM120Backend.get_impl_cls()
+
+    assert impl_cls.masked_mha_available is False
 
 
 def test_v32_glm_sm120_backend_accepts_glm_block_size(
@@ -92,3 +145,190 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+def test_sm120_dsv4_1_uses_explicit_fp8_precision_wrapper(monkeypatch) -> None:
+    class FakeWrapper:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def run(self, **kwargs):
+            self.run_kwargs = kwargs
+
+    import flashinfer.mla._sparse_mla_sm120 as flashinfer_sm120
+
+    monkeypatch.setattr(flashinfer_sm120, "SparseMLASm120Wrapper", FakeWrapper)
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse,
+        "_sparse_mla_sm120_wrappers",
+        {},
+    )
+
+    query = torch.zeros((48, 64, 512), dtype=torch.bfloat16)
+    output = query.clone()
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(
+        query=query,
+        swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8),
+        sparse_indices=torch.empty((48, 1152), dtype=torch.int32),
+        output=output,
+        sm_scale=1.0,
+        topk_length=torch.empty((48,), dtype=torch.int32),
+        attn_sink=None,
+        extra_kv_cache=torch.empty((8, 64, 1, 288), dtype=torch.uint8),
+        extra_sparse_indices=torch.empty((48, 1, 1152), dtype=torch.int32),
+        extra_sparse_topk_lens=torch.empty((48,), dtype=torch.int32),
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+    )
+    cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[query.device, True]
+
+    assert isinstance(cached, FakeWrapper)
+    assert cached.kwargs["kv_scale_format"] == "ue8m0_g32"
+    assert cached.kwargs["extra_kv_fp4"] is True
+    assert cached.kwargs["compute_precision"] == "fp8"
+
+
+def test_sm120_dsv4_1_isolate_flag_when_extra_cache_is_absent(
+    monkeypatch,
+) -> None:
+    import flashinfer.mla._sparse_mla_sm120 as flashinfer_sm120
+
+    monkeypatch.setattr(
+        flashinfer_sm120,
+        "SparseMLASm120Wrapper",
+        _FakeSm120Wrapper,
+    )
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse,
+        "_sparse_mla_sm120_wrappers",
+        {},
+    )
+
+    query = torch.zeros((48, 64, 512), dtype=torch.bfloat16)
+    output = query.clone()
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(
+        query=query,
+        swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8),
+        sparse_indices=torch.empty((48, 1152), dtype=torch.int32),
+        output=output,
+        sm_scale=1.0,
+        topk_length=torch.empty((48,), dtype=torch.int32),
+        attn_sink=None,
+        extra_kv_cache=None,
+        extra_sparse_indices=None,
+        extra_sparse_topk_lens=None,
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+    )
+    cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[query.device, False]
+
+    assert isinstance(cached, _FakeSm120Wrapper)
+    assert cached.kwargs["extra_kv_fp4"] is False
+    assert cached.run_kwargs["extra_kv_cache"] is None
+    assert cached.run_kwargs["extra_indices"] is None
+
+
+def test_sm120_dsv4_1_requires_extra_cache_for_fp4_extra_wrapper(
+    monkeypatch,
+) -> None:
+    _install_sm120_wrapper(monkeypatch)
+
+    query, swa_cache, extra_cache, output = _sm120_attention_tensors()
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(
+        query=query,
+        swa_kv_cache=swa_cache,
+        sparse_indices=_sm120_indices(),
+        output=output,
+        sm_scale=1.0,
+        topk_length=_sm120_lengths(),
+        attn_sink=None,
+        extra_kv_cache=None,
+        extra_sparse_indices=None,
+        extra_sparse_topk_lens=None,
+        extra_kv_fp4=False,
+        prefill_impl="auto",
+    )
+    assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
+        (query.device, False)
+    }
+
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(
+        query=query,
+        swa_kv_cache=swa_cache,
+        sparse_indices=_sm120_indices(),
+        output=output,
+        sm_scale=1.0,
+        topk_length=_sm120_lengths(),
+        attn_sink=None,
+        extra_kv_cache=extra_cache,
+        extra_sparse_indices=_sm120_extra_indices(),
+        extra_sparse_topk_lens=_sm120_lengths(num_tokens=48),
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+    )
+    assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
+        (query.device, False),
+        (query.device, True),
+    }
+    assert (
+        nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[query.device, True].kwargs[
+            "extra_kv_fp4"
+        ]
+        is True
+    )
+
+
+def test_sm120_dsv4_1_reuses_wrapper_for_same_extra_cache_mode(
+    monkeypatch,
+) -> None:
+    _install_sm120_wrapper(monkeypatch)
+
+    query, swa_cache, extra_cache, output = _sm120_attention_tensors()
+    args = dict(
+        query=query,
+        swa_kv_cache=swa_cache,
+        sparse_indices=_sm120_indices(),
+        output=output,
+        sm_scale=1.0,
+        topk_length=_sm120_lengths(),
+        attn_sink=None,
+        extra_kv_cache=extra_cache,
+        extra_sparse_indices=_sm120_extra_indices(),
+        extra_sparse_topk_lens=_sm120_lengths(),
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+    )
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(**args)
+    cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[query.device, True]
+    first = len(cached.run_kwargs)
+
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(**args)
+    assert cached.run_kwargs["q"] is args["query"]
+    assert cached.run_kwargs["extra_kv_cache"] is args["extra_kv_cache"]
+    assert len(cached.run_kwargs) == first
+
+
+def test_sm120_dsv4_1_forwards_prefill_impl_and_sink(monkeypatch) -> None:
+    _install_sm120_wrapper(monkeypatch)
+    query, swa_cache, extra_cache, output = _sm120_attention_tensors()
+    sink = torch.full((64,), 0.25, dtype=torch.float32)
+
+    nvidia.flashinfer_sparse._sparse_mla_sm120_paged_attention(
+        query=query,
+        swa_kv_cache=swa_cache,
+        sparse_indices=_sm120_indices(),
+        output=output,
+        sm_scale=0.25,
+        topk_length=_sm120_lengths(),
+        attn_sink=sink,
+        extra_kv_cache=extra_cache,
+        extra_sparse_indices=_sm120_extra_indices(),
+        extra_sparse_topk_lens=_sm120_lengths(),
+        extra_kv_fp4=True,
+        prefill_impl="swapab",
+    )
+    cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[query.device, True]
+
+    assert cached.run_kwargs["sm_scale"] == 0.25
+    assert cached.run_kwargs["attn_sink"] is sink
+    assert cached.run_kwargs["prefill_impl"] == "swapab"

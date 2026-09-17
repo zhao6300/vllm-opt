@@ -54,6 +54,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -1093,6 +1094,8 @@ class GPUModelRunner(
             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                 num_reqs
             )
+            if self.parallel_config.use_ubatching:
+                model_kwargs["lookback_query_start_loc"] = self.query_start_loc.gpu
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -3372,6 +3375,10 @@ class GPUModelRunner(
 
         return tuple(tasks)
 
+    @property
+    def pipeline_payload_keys(self) -> frozenset[str]:
+        return getattr(self.get_model(), "pipeline_payload_keys", frozenset())
+
     def sync_and_gather_intermediate_tensors(
         self,
         num_tokens: int,
@@ -3382,6 +3389,8 @@ class GPUModelRunner(
 
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        payload_keys = self.pipeline_payload_keys
+        payloads = {}
 
         # When sequence parallelism is enabled, the "residual" tensor is
         # sharded across TP ranks. All-gather it here because downstream
@@ -3389,6 +3398,10 @@ class GPUModelRunner(
         if sync_self:
             assert intermediate_tensors is not None
             for k, v in intermediate_tensors.items():
+                if k in payload_keys:
+                    # Eager model-owned state may have a block axis, not tokens.
+                    payloads[k] = v
+                    continue
                 is_scattered = k == "residual" and is_rs
                 if is_scattered:
                     local_len = num_tokens // tp
@@ -3399,7 +3412,7 @@ class GPUModelRunner(
                 )
 
         return IntermediateTensors(
-            {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
+            {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()} | payloads
         )
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
@@ -6170,6 +6183,7 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
+                get_forward_context().additional_kwargs["is_dummy_run"] = True
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,

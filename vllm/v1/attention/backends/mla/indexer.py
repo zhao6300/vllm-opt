@@ -260,7 +260,15 @@ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        # Support SM90 (Hopper), SM120/GB10, and SM121 (Blackwell variants).
+        # DeepGEMM pages must contain 64 compressed states.
+        if (
+            current_platform.is_device_capability_family(90)
+            or current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [MultipleOf(64)]
+        return [128]
 
 
 @dataclass(frozen=True)

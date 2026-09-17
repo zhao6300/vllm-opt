@@ -600,6 +600,10 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        warmup_hook = getattr(model, "warmup_multi_stream_cudagraph", None)
+        if callable(warmup_hook):
+            with torch.inference_mode():
+                warmup_hook()
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 

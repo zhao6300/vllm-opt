@@ -98,6 +98,12 @@ class EngramConfig:
                 "Engram embedding_across_dp is not supported with elastic EP yet."
             )
 
+        if self.embedding_across_dp and parallel_config.use_sequence_parallel_moe:
+            raise NotImplementedError(
+                "Engram embedding_across_dp is not supported with sequence "
+                "parallel yet."
+            )
+
     def verify_load_config(self, load_config: "LoadConfig") -> None:
         """Shared tables require a loader that invokes parameter weight callbacks."""
         if self.dp_shared_memory and load_config.load_format not in (

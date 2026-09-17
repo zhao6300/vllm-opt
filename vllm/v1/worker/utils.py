@@ -3,7 +3,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import product as iprod
 from typing import Any
 
@@ -481,7 +481,27 @@ def prepare_kernel_block_sizes(
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
-        if not kv_cache_spec.has_layer_views:
+        if (
+            isinstance(kv_cache_spec, MLAAttentionSpec)
+            and kv_cache_spec.has_layer_views
+            and isinstance(kv_cache_spec.tokens_per_state, int)
+        ):
+            # DeepSeek-V4.1's ratio-1 and ratio-2 caches both need pages of 64
+            # compressed states. Select the token-wide block size for each
+            # group's compression ratio, then expose it consistently to both
+            # the sparse-MLA and indexer metadata builders.
+            compress_ratio = kv_cache_spec.tokens_per_state
+            target_states = 64
+            selected_block_size = min(
+                kv_cache_spec.block_size, target_states * compress_ratio
+            )
+            kv_cache_spec = replace(
+                kv_cache_spec,
+                block_size=selected_block_size,
+                storage_block_size=selected_block_size,
+            )
+            kernel_block_sizes.append(selected_block_size)
+        elif not kv_cache_spec.has_layer_views:
             kernel_block_sizes.append(kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.
