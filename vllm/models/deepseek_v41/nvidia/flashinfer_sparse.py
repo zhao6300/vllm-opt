@@ -3,7 +3,6 @@
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
 import os
-
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -61,14 +60,17 @@ def _sparse_mla_sm120_paged_attention(
     """Run FlashInfer's SM120 sparse MLA wrapper in-place."""
     from flashinfer.mla._sparse_mla_sm120 import SparseMLASm120Wrapper
 
-    device_key = (query.device, extra_kv_fp4)
+    has_extra_kv_cache = extra_kv_cache is not None
+    extra_kv_flag = extra_kv_fp4 and has_extra_kv_cache
+    device_key = (query.device, extra_kv_flag)
     wrapper = _sparse_mla_sm120_wrappers.get(device_key)
     if wrapper is None:
         wrapper = SparseMLASm120Wrapper(
             d_v=query.shape[-1],
             kv_scale_format="ue8m0_g32",
             kv_cache_format="fp8",
-            extra_kv_fp4=extra_kv_fp4,
+            extra_kv_fp4=extra_kv_flag,
+            compute_precision="fp8",
             device=query.device,
         )
         _sparse_mla_sm120_wrappers[device_key] = wrapper
@@ -600,10 +602,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferMLASparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferBackend
     use_fp8_ds_mla_layout: ClassVar[bool] = True
-    use_fp4_extra_kv: bool = (
-        current_platform.is_device_capability_family(120)
-        or current_platform.is_device_capability_family(121)
-    )
+    use_fp4_extra_kv: bool = current_platform.is_device_capability_family(
+        120
+    ) or current_platform.is_device_capability_family(121)
 
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
