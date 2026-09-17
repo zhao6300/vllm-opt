@@ -268,6 +268,11 @@ flashinfer_dsv41_fp4_quantize_append = _lazy_import_wrapper(
     "dsv41_fp4_quantize_append_sparse_mla_cache",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_dsv41_fp4_quantize_pack = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp4_quantize_pack_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -1261,6 +1266,7 @@ __all__ = [
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
     "flashinfer_dsv41_fp4_quantize_append",
+    "flashinfer_dsv41_fp4_quantize_pack",
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "flashinfer_recurrent_kda",
     "flashinfer_fused_kda_decode",

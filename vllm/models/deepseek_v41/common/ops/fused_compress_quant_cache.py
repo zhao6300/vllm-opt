@@ -7,7 +7,10 @@ import torch
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.flashinfer import flashinfer_dsv41_fp4_quantize_append
+from vllm.utils.flashinfer import (
+    flashinfer_dsv41_fp4_quantize_append,
+    flashinfer_dsv41_fp4_quantize_pack,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -59,6 +62,7 @@ def fused_save_compress_norm(
         rms_norm_eps: RMSNorm epsilon.
         compress_ratio: Group size, either 1 or 2.
         latent_out: BF16 [tokens, 512], written only at valid group boundaries.
+
     """
     assert compress_ratio in (1, 2)
     assert kv_score.dtype == torch.float32
@@ -263,10 +267,12 @@ def rope_quant_insert(
             num_warps=4,
             **launch_kwargs,
         )
-        flashinfer_dsv41_fp4_quantize_append(
+        _insert_fp4_packed_or_append(
             roped_latent,
             slot_mapping,
             kv_cache,
+            positions,
+            compress_ratio,
         )
         return
     if kv_cache.dtype == torch.uint8:
@@ -316,6 +322,63 @@ def rope_quant_insert(
         num_warps=4,
         **launch_kwargs,
     )
+
+
+def _insert_fp4_packed_or_append(
+    roped_latent: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> None:
+    """Use page packing only for whole consecutive pages, otherwise append."""
+    if slot_mapping.dim() != 1 or compress_ratio != 1:
+        flashinfer_dsv41_fp4_quantize_append(roped_latent, slot_mapping, kv_cache)
+        return
+
+    page_tokens = kv_cache.shape[-2]
+    num_tokens = slot_mapping.numel()
+    append_rows: list[int] = []
+    token = 0
+    while token < num_tokens:
+        slot = slot_mapping[token].item()
+        run_end = token + page_tokens
+
+        if slot >= 0 and slot % page_tokens == 0:
+            while (
+                run_end < num_tokens
+                and slot_mapping[run_end].item()
+                == slot_mapping[token].item() + (run_end - token)
+            ):
+                run_end += page_tokens
+
+            if run_end <= num_tokens and torch.all(
+                (positions[token:run_end] + 1) % compress_ratio == 0
+            ):
+                page_ids = slot_mapping[token:run_end:page_tokens].div(
+                    page_tokens, rounding_mode="trunc"
+                ).to(torch.long)
+                packed = flashinfer_dsv41_fp4_quantize_pack(
+                    roped_latent[token:run_end].view(-1, page_tokens, 512),
+                    kv_layout="NHD",
+                )
+                kv_cache.index_copy_(
+                    0,
+                    page_ids,
+                    packed.reshape(-1, page_tokens, 288),
+                )
+                token = run_end
+                continue
+        append_rows.append(token)
+        token += 1
+
+    if append_rows:
+        append_rows_t = torch.tensor(append_rows, device=slot_mapping.device)
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent[append_rows_t],
+            slot_mapping[append_rows_t],
+            kv_cache,
+        )
 
 
 @triton.jit

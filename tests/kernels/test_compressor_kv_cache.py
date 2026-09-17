@@ -565,7 +565,7 @@ def test_v41_nvfp4_gather_matches_insert():
     backing = torch.zeros(num_blocks, page_bytes, dtype=torch.uint8, device=device)
     cache = backing.as_strided((num_blocks, block_size, 288), (page_bytes, 288, 1))
     slots = torch.arange(num_tokens, dtype=torch.int64, device=device)
-    rope_quant_insert(latent, positions, cos_sin, cache, slots, 1)
+    rope_quant_insert(latent, positions, cos_sin, cache, slots, compress_ratio)
 
     out = torch.zeros(1, num_tokens, 512, dtype=torch.bfloat16, device=device)
     dequantize_and_gather_k_cache(
@@ -665,6 +665,51 @@ def test_v41_rope_insert_plain_row(compress_ratio: int, store_fp8: bool):
         torch.testing.assert_close(
             actual[:, ~nope], expected[:, ~nope], rtol=0.008, atol=1e-6
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_v41_rope_insert_nvfp4_full_page_pack_matches_append(compress_ratio: int):
+    """Whole consecutive pages exercise FlashInfer's batched pack path."""
+    from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+        rope_quant_insert,
+    )
+
+    torch.manual_seed(37)
+    device = "cuda"
+    block_size = 64
+    num_tokens = 2 * block_size
+    page_bytes = math.ceil(block_size * 288 / 512) * 512
+
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    latent = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
+    angles = torch.randn(128, 32, device=device)
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    slots = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    backing = torch.full((2, page_bytes), 165, dtype=torch.uint8, device=device)
+    cache = backing.as_strided((2, block_size, 288), (page_bytes, 288, 1))
+
+    rope_quant_insert(latent, positions, cos_sin, cache, slots, compress_ratio)
+
+    for token, slot in enumerate(slots.tolist()):
+        if (positions[token].item() + 1) % compress_ratio != 0:
+            continue
+
+        page, row = divmod(slot, block_size)
+        scale_start = block_size * 256 + row * 32
+        got_scales = backing[page, scale_start : scale_start + 32]
+        decoded = _decode_nvfp4_row(
+            backing[page, row * 256 : (row + 1) * 256],
+            got_scales,
+        )
+        pos = positions[token].item()
+        expected = _rotate_rope_tail(
+            latent[token],
+            cos_sin[pos - pos % compress_ratio],
+        )
+        step = (expected.view(32, 16).abs().amax(-1)) / 6.0
+        step = step.clamp(2.0**-9, 448.0).repeat_interleave(16)
+        assert ((decoded - expected).abs() <= step * 1.05 + 0.01).all()
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Triton kernel")

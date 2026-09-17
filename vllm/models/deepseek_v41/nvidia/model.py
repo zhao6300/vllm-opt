@@ -17,6 +17,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -80,6 +81,8 @@ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.engram import EngramLayout, NgramHashState
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
+from ..common.pipeline_sharing import PipelineSharing
 from .engram import Engram, gather_engram_hashes
 from .ops.mega_mhc import mhc_shifted_post_pre
 
@@ -472,6 +475,31 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        pp_size = get_pp_group().world_size
+        stage_ranges = [
+            get_pp_indices(config.num_hidden_layers, rank, pp_size)
+            for rank in range(pp_size)
+        ]
+        self.sharing_dependencies = get_sharing_dependencies(config, stage_ranges)
+        additional_config = vllm_config.additional_config
+        sharing_enabled = isinstance(additional_config, dict) and additional_config.get(
+            "deepseek_v41_pp_sharing", False
+        )
+        self.pipeline_sharing: PipelineSharing | None = None
+        self.pipeline_payload_keys: frozenset[str] = frozenset()
+        if sharing_enabled:
+            assert isinstance(additional_config, dict)
+            self.pipeline_sharing = PipelineSharing(
+                vllm_config,
+                prefix,
+                get_pp_group().rank_in_group,
+                self.sharing_dependencies,
+                _select_dsv4_attn_cls(vllm_config),
+                additional_config.get("deepseek_v41_pp_share_max_bytes", 512 * 1024**2),
+            )
+            self.pipeline_payload_keys = self.pipeline_sharing.payload_keys
+        else:
+            validate_local_sharing(self.sharing_dependencies)
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
@@ -1132,6 +1160,7 @@ class DeepseekV41LLMForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
+        self.pipeline_payload_keys = self.model.pipeline_payload_keys
 
         self.set_moe_parameters()
 

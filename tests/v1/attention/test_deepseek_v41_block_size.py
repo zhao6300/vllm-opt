@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 from unittest import mock
 
 import pytest
@@ -226,6 +229,7 @@ def test_v41_indexer_cache_matches_compressed_state_page(
     cache.head_dim = _indexer_k_cache_head_dim(128, False)
     cache.compress_ratio = compress_ratio
     cache.dtype = torch.uint8
+    cache.sparse_logits = False
 
     spec = cache.get_kv_cache_spec(vllm_config)
 
