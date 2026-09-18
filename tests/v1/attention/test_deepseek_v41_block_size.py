@@ -157,6 +157,27 @@ def test_v41_compressed_cache_spec_uses_layout_bytes_per_token(
 
 
 @pytest.mark.parametrize(
+    ("cache_dtype", "kv_mxfp8", "expected"),
+    [
+        ("fp8_ds_mla", True, 528),
+        ("fp8_ds_mla", False, 584),
+        ("nvfp4_ds_mla", True, 288),
+        ("nvfp4_ds_mla", False, 288),
+    ],
+)
+def test_v41_swa_cache_bytes_per_token_follows_cache_dtype(
+    cache_dtype,
+    kv_mxfp8,
+    expected,
+):
+    from vllm.models.deepseek_v41.attention import (
+        _swa_bytes_per_token_for_cache_dtype,
+    )
+
+    assert _swa_bytes_per_token_for_cache_dtype(cache_dtype, kv_mxfp8) == expected
+
+
+@pytest.mark.parametrize(
     ("config_block_size", "compress_ratio", "expected"),
     [
         (32, 1, 64),

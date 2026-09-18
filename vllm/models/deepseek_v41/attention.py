@@ -215,6 +215,15 @@ def _compressed_cache_spec(
     )
 
 
+def _swa_bytes_per_token_for_cache_dtype(
+    cache_dtype: str,
+    kv_mxfp8: bool,
+) -> int:
+    if cache_dtype == "nvfp4_ds_mla":
+        return 288
+    return 528 if kv_mxfp8 else 584
+
+
 class DeepseekV4PipelineCache(nn.Module, AttentionLayerBase):
     """Weight-free replica registered under the original KV source's layer name."""
 
@@ -613,12 +622,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.packed_kv_cache_dtype,
         )
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
-        self.swa_bytes_per_token = 528 if self.kv_mxfp8 else 584
-        # nvfp4_ds_mla keeps the MXFP8 sliding-window record and stores the
-        # compressed cache as NVFP4 (256 B of e2m1 pairs + 32 e4m3 scales).
-        self.compressed_bytes_per_token = (
-            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+        self.swa_bytes_per_token = _swa_bytes_per_token_for_cache_dtype(
+            self.kv_cache_dtype,
+            self.kv_mxfp8,
         )
+        self.compressed_bytes_per_token = self.swa_bytes_per_token
         # One alignment for every page in the block: the block stride is their
         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
         # fp8 record, 256 for NVFP4).
