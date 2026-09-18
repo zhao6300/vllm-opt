@@ -332,10 +332,13 @@ def _insert_fp4_packed_or_append(
     compress_ratio: int,
 ) -> None:
     """Use page packing only for whole consecutive pages, otherwise append."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
     if (
         slot_mapping.dim() != 1
         or compress_ratio != 1
         or torch.cuda.is_current_stream_capturing()
+        or BreakableCUDAGraphCapture.is_active()
     ):
         flashinfer_dsv41_fp4_quantize_append(roped_latent, slot_mapping, kv_cache)
         return

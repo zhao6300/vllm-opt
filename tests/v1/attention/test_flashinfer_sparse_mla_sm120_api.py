@@ -165,10 +165,7 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
 
 def test_sm120_dsv4_auto_kv_cache_resolves_to_nvfp4() -> None:
-    assert (
-        DeepseekV4FlashInferSM120Attention.packed_kv_cache_dtype()
-        == "nvfp4_ds_mla"
-    )
+    assert DeepseekV4FlashInferSM120Attention.packed_kv_cache_dtype() == "nvfp4_ds_mla"
 
     cache_config = SimpleNamespace(cache_dtype="auto")
 
