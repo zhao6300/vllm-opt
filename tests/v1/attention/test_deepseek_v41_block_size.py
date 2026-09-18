@@ -124,6 +124,39 @@ def test_v41_other_architectures_keep_128_token_pages():
 
 
 @pytest.mark.parametrize(
+    ("cache_dtype", "state_content_bytes", "alignment"),
+    [
+        ("fp8_ds_mla", 528, 512),
+        ("nvfp4_ds_mla", 288, 512),
+    ],
+)
+def test_v41_compressed_cache_spec_uses_layout_bytes_per_token(
+    cache_dtype,
+    state_content_bytes,
+    alignment,
+):
+    from vllm.models.deepseek_v41.attention import _compressed_cache_spec
+
+    vllm_config = mock.Mock()
+    vllm_config.cache_config.block_size = 64
+    with mock.patch(
+        "vllm.models.deepseek_v41.attention.current_platform"
+    ) as mock_platform:
+        _sm12x_platform(mock_platform)
+        spec = _compressed_cache_spec(
+            vllm_config,
+            512,
+            1,
+            cache_dtype,
+            torch.uint8,
+        )
+
+    assert spec.dtype == torch.uint8
+    assert spec.state_content_bytes == state_content_bytes
+    assert spec.alignment == alignment
+
+
+@pytest.mark.parametrize(
     ("config_block_size", "compress_ratio", "expected"),
     [
         (32, 1, 64),
@@ -194,7 +227,7 @@ def test_v41_attention_cache_spec_sizes_state_page(
     attention.head_dim = 512
     attention.compress_ratio = compress_ratio
     attention.kv_mxfp8 = False
-    attention.kv_bytes_per_token = 584
+    attention.compressed_bytes_per_token = 584
     attention.kv_page_alignment = 576
 
     spec = attention.get_kv_cache_spec(vllm_config)

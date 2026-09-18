@@ -188,19 +188,30 @@ def _compressed_cache_spec(
     cache_torch_dtype: torch.dtype,
     use_fp4_extra_kv: bool = False,
 ) -> MLAAttentionSpec:
-    uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
+    uses_packed_ds_mla_layout = cache_dtype in (
+        "fp8_ds_mla",
+        "nvfp4_ds_mla",
+    )
+    if cache_dtype == "nvfp4_ds_mla":
+        state_content_bytes = 288
+    elif uses_packed_ds_mla_layout:
+        state_content_bytes = 528 if _use_v41_mxfp8_kv_record() else 584
+    else:
+        state_content_bytes = None
     block_size = max(vllm_config.cache_config.block_size, 64 * compress_ratio)
     return DeepseekV41MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=head_dim,
-        dtype=torch.uint8 if uses_fp8_ds_mla_layout else cache_torch_dtype,
+        dtype=torch.uint8 if uses_packed_ds_mla_layout else cache_torch_dtype,
         tokens_per_state=compress_ratio,
         cache_dtype_str=cache_dtype,
-        alignment=576 if uses_fp8_ds_mla_layout else 512,
+        alignment=576
+        if uses_packed_ds_mla_layout and not _use_v41_mxfp8_kv_record()
+        else 512,
         model_version="deepseek_v4",
         kv_quant_mode=get_kv_quant_mode(cache_dtype),
-        state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+        state_content_bytes=state_content_bytes,
     )
 
 
@@ -1161,7 +1172,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             model_version="deepseek_v4",
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             # Packed record width; head_size stays semantic (512).
-            state_content_bytes=584 if uses_fp8_ds_mla_layout else None,
+            state_content_bytes=self.compressed_bytes_per_token
+            if uses_fp8_ds_mla_layout
+            else None,
         )
 
     def _compressed_kv_cache(self) -> torch.Tensor:
