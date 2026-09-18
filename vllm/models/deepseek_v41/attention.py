@@ -624,7 +624,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_cache_dtype,
             self.kv_mxfp8,
         )
-        self.compressed_bytes_per_token = self.swa_bytes_per_token
+        # ``nvfp4_ds_mla`` stores the compressed cache in the 288-byte
+        # V4.1 FP4 record while the sliding-window record remains FP8.
+        self.compressed_bytes_per_token = (
+            288 if self.kv_cache_dtype == "nvfp4_ds_mla" else self.swa_bytes_per_token
+        )
         # One alignment for every page in the block: the block stride is their
         # sum, and 512 satisfies both TMA strides in play (512 for the V4.1
         # fp8 record, 256 for NVFP4).

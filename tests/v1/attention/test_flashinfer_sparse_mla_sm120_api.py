@@ -3,7 +3,9 @@
 """Behavior checks for FlashInfer SM120 sparse MLA backend selection."""
 
 from types import SimpleNamespace
+from unittest import mock
 
+import pytest
 import torch
 
 from vllm.config import set_current_vllm_config
@@ -11,6 +13,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
 )
 from vllm.models.deepseek_v41 import nvidia
+from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferMLASparseBackend,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
@@ -25,6 +30,16 @@ class _FakeSm120Wrapper:
 
     def run(self, **kwargs):
         self.run_kwargs = kwargs
+
+
+def _sm12x_platform(mock_platform):
+    mock_platform.is_device_capability_family.side_effect = lambda family: (
+        family
+        in (
+            120,
+            121,
+        )
+    )
 
 
 def _install_sm120_wrapper(monkeypatch) -> None:
@@ -145,6 +160,48 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "use_fp4_extra_kv", "expected_reasons"),
+    [
+        ("nvfp4_ds_mla", True, []),
+        (
+            "fp8_ds_mla",
+            False,
+            ["FLASHINFER_SM120 requires nvfp4_ds_mla for the FP4 compressed cache"],
+        ),
+        (
+            "fp8_ds_mla",
+            True,
+            ["FLASHINFER_SM120 requires nvfp4_ds_mla for the FP4 compressed cache"],
+        ),
+    ],
+)
+def test_sm120_dsv4_rejects_mismatched_fp4_extra_cache(
+    kv_cache_dtype,
+    use_fp4_extra_kv,
+    expected_reasons,
+) -> None:
+    with mock.patch(
+        "vllm.models.deepseek_v41.sparse_mla.current_platform"
+    ) as mock_platform:
+        _sm12x_platform(mock_platform)
+        invalid_reasons = DeepseekV4FlashInferMLASparseBackend.validate_configuration(
+            head_size=512,
+            dtype=torch.bfloat16,
+            kv_cache_dtype=kv_cache_dtype,
+            block_size=128,
+            use_mla=True,
+            has_sink=True,
+            use_sparse=True,
+            use_mm_prefix=False,
+            use_per_head_quant_scales=False,
+            device_capability=DeviceCapability(12, 0),
+            attn_type="decoder",
+        )
+
+    assert invalid_reasons == expected_reasons
 
 
 def test_sm120_dsv4_1_uses_explicit_fp8_precision_wrapper(monkeypatch) -> None:

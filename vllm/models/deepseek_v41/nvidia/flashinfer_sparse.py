@@ -156,6 +156,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
     ]
 
     @staticmethod
@@ -211,7 +212,12 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "nvfp4_ds_mla",
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -639,6 +645,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         super().__init__(vllm_config, *args, **kwargs)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
+        if (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ) and self.kv_cache_dtype != "nvfp4_ds_mla":
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires nvfp4_ds_mla "
+                "for the FP4 compressed cache"
+            )
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
         if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
             raise RuntimeError(
@@ -648,12 +662,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
-        self.use_fp4_extra_kv = (
-            self.kv_cache_dtype == "nvfp4_ds_mla"
-            and (
-                current_platform.is_device_capability_family(120)
-                or current_platform.is_device_capability_family(121)
-            )
+        self.use_fp4_extra_kv = self.kv_cache_dtype == "nvfp4_ds_mla" and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
         )
 
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(

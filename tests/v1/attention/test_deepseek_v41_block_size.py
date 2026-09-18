@@ -10,9 +10,12 @@ from vllm.v1.attention.backend import MultipleOf
 
 
 def _sm12x_platform(mock_platform):
-    mock_platform.is_device_capability_family.side_effect = lambda family: family in (
-        120,
-        121,
+    mock_platform.is_device_capability_family.side_effect = lambda family: (
+        family
+        in (
+            120,
+            121,
+        )
     )
 
 
@@ -21,10 +24,13 @@ def _sm90_platform(mock_platform):
 
 
 def _ds41_sparse_mock_platform(mock_platform):
-    mock_platform.is_device_capability_family.side_effect = lambda family: family in (
-        90,
-        120,
-        121,
+    mock_platform.is_device_capability_family.side_effect = lambda family: (
+        family
+        in (
+            90,
+            120,
+            121,
+        )
     )
 
 
@@ -212,6 +218,44 @@ def test_v41_compressed_cache_spec_sizes_state_page(
         _ds41_sparse_mock_platform(mock_platform)
         selected_block_size = min(spec.block_size, 64 * compress_ratio)
     assert spec.get_num_kernel_states(selected_block_size) == 64
+
+
+@pytest.mark.parametrize(
+    ("cache_dtype", "expected_compressed_bytes"),
+    [
+        ("fp8_ds_mla", 528),
+        ("nvfp4_ds_mla", 288),
+    ],
+)
+def test_v41_attention_cache_compressed_bytes_follows_dtype(
+    cache_dtype,
+    expected_compressed_bytes,
+):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+        DeepseekV4FlashInferSM120Attention,
+    )
+
+    attention = DeepseekV4FlashInferSM120Attention.__new__(
+        DeepseekV4FlashInferSM120Attention
+    )
+    attention.is_kv_source = True
+    attention.kv_cache_dtype = cache_dtype
+    attention.kv_cache_torch_dtype = torch.uint8
+    attention.head_dim = 512
+    attention.compress_ratio = 1
+    attention.swa_bytes_per_token = 528
+    attention.compressed_bytes_per_token = expected_compressed_bytes
+    attention.kv_page_alignment = 512
+
+    vllm_config = mock.Mock()
+    vllm_config.cache_config = SimpleNamespace(block_size=64)
+    vllm_config.model_config = mock.Mock()
+
+    spec = attention.get_kv_cache_spec(vllm_config)
+
+    assert spec.state_content_bytes == expected_compressed_bytes
 
 
 @pytest.mark.parametrize(

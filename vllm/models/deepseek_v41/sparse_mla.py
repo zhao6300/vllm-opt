@@ -83,6 +83,7 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
         "auto",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
+        "nvfp4_ds_mla",  # V4.1 fp8 SWA cache + NVFP4 compressed cache
     ]
 
     @staticmethod
@@ -132,6 +133,51 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major in [9, 10]
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
+        if kv_cache_dtype is None:
+            return True
+        return kv_cache_dtype in cls.supported_kv_cache_dtypes
+
+    @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability: DeviceCapability,
+        attn_type: str = "decoder",
+    ) -> list[str]:
+        reason = super().validate_configuration(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            use_per_head_quant_scales,
+            device_capability,
+            attn_type=attn_type,
+        )
+        if reason:
+            return reason
+        if kv_cache_dtype not in ("nvfp4_ds_mla", None) and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [
+                "FLASHINFER_SM120 requires nvfp4_ds_mla for the FP4 compressed cache"
+            ]
+        return []
 
 
 @dataclass
@@ -269,6 +315,7 @@ class FlashMLAMegaAttnBackend(DeepseekV4FlashMLABackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major == 10
+
     @classmethod
     def supports_combination(
         cls,
