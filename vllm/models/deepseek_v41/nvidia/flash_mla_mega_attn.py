@@ -190,8 +190,8 @@ class DeepseekV4MegaAttnAttention(DeepseekV4FlashMLAAttention):
     def accepts_unnormed_unroped_query(self) -> bool:
         return True
 
-    @property
-    def packed_kv_cache_dtype(self) -> CacheDType:
+    @classmethod
+    def packed_kv_cache_dtype(cls) -> CacheDType:
         # This kernel is the only one that reads an NVFP4 compressed cache, so
         # it is what an unspecific --kv-cache-dtype resolves to here.
         return "nvfp4_ds_mla"

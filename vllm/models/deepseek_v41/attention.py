@@ -238,7 +238,10 @@ class DeepseekV4PipelineCache(nn.Module, AttentionLayerBase):
         self.head_dim = config.head_dim
         self.compress_ratio = config.compress_ratios[source_layer]
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
-            attn_cls.use_fp8_ds_mla_layout, cache_config.cache_dtype, cache_config
+            attn_cls.use_fp8_ds_mla_layout,
+            cache_config.cache_dtype,
+            cache_config,
+            attn_cls.packed_kv_cache_dtype(),
         )
         self.backend_cls = attn_cls.backend_cls
         self.prefix = prefix
@@ -330,8 +333,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """
         return False
 
-    @property
-    def packed_kv_cache_dtype(self) -> CacheDType:
+    @classmethod
+    def packed_kv_cache_dtype(cls) -> CacheDType:
         """The packed KV record this layer's kernel prefers.
 
         What an unspecific ``--kv-cache-dtype`` (``auto`` / ``fp8``) resolves
@@ -617,7 +620,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self._uses_fp8_ds_mla_layout(),
             cache_config.cache_dtype,
             cache_config,
-            self.packed_kv_cache_dtype,
+            self.packed_kv_cache_dtype(),
         )
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
         self.swa_bytes_per_token = _swa_bytes_per_token_for_cache_dtype(

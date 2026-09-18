@@ -608,6 +608,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         120
     ) or current_platform.is_device_capability_family(121)
 
+    @classmethod
+    def packed_kv_cache_dtype(cls) -> CacheDType:
+        return "nvfp4_ds_mla"
+
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
         return _get_flashinfer_dsv4_workspace(device)

@@ -13,8 +13,10 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _required_sm120_sparse_topk,
 )
 from vllm.models.deepseek_v41 import nvidia
+from vllm.models.deepseek_v41.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
+    DeepseekV4FlashInferSM120Attention,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
@@ -160,6 +162,26 @@ def test_sm120_dsv4_required_topk_tracks_dspark_width() -> None:
 
     assert _required_sm120_sparse_topk(causal, 128) == 128
     assert _required_sm120_sparse_topk(dspark, 128) == 192
+
+
+def test_sm120_dsv4_auto_kv_cache_resolves_to_nvfp4() -> None:
+    assert (
+        DeepseekV4FlashInferSM120Attention.packed_kv_cache_dtype()
+        == "nvfp4_ds_mla"
+    )
+
+    cache_config = SimpleNamespace(cache_dtype="auto")
+
+    resolved, torch_dtype = _resolve_dsv4_kv_cache_dtype(
+        True,
+        cache_config.cache_dtype,
+        cache_config,
+        DeepseekV4FlashInferSM120Attention.packed_kv_cache_dtype(),
+    )
+
+    assert resolved == "nvfp4_ds_mla"
+    assert cache_config.cache_dtype == "nvfp4_ds_mla"
+    assert torch_dtype == torch.uint8
 
 
 @pytest.mark.parametrize(
