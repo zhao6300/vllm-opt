@@ -219,8 +219,6 @@ def _swa_bytes_per_token_for_cache_dtype(
     cache_dtype: str,
     kv_mxfp8: bool,
 ) -> int:
-    if cache_dtype == "nvfp4_ds_mla":
-        return 288
     return 528 if kv_mxfp8 else 584
 
 

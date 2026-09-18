@@ -161,8 +161,8 @@ def test_v41_compressed_cache_spec_uses_layout_bytes_per_token(
     [
         ("fp8_ds_mla", True, 528),
         ("fp8_ds_mla", False, 584),
-        ("nvfp4_ds_mla", True, 288),
-        ("nvfp4_ds_mla", False, 288),
+        ("nvfp4_ds_mla", True, 528),
+        ("nvfp4_ds_mla", False, 584),
     ],
 )
 def test_v41_swa_cache_bytes_per_token_follows_cache_dtype(
