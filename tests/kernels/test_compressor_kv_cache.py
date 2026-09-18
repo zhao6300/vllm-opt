@@ -718,6 +718,47 @@ def test_v41_rope_insert_nvfp4_full_page_pack_matches_append(compress_ratio: int
         assert ((decoded - expected).abs() <= step * 1.05 + 0.01).all()
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA graph only")
+def test_v41_rope_insert_nvfp4_accepts_cudagraph():
+    """CUDA graph capture takes the append path instead of slot-sync packing."""
+    from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+        rope_quant_insert,
+    )
+
+    torch.manual_seed(41)
+    block_size = 2
+    num_tokens = block_size
+    page_bytes = math.ceil(block_size * 288 / 512) * 512
+    positions = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    latent = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    angles = torch.randn(128, 32, device="cuda")
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1)
+    slots = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    backing = torch.full((1, page_bytes), 165, dtype=torch.uint8, device="cuda")
+    cache = backing.as_strided((1, block_size, 288), (page_bytes, 288, 1))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        rope_quant_insert(latent, positions, cos_sin, cache, slots, 1)
+    torch.cuda.current_stream().wait_stream(stream)
+    backing.fill_(165)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rope_quant_insert(latent, positions, cos_sin, cache, slots, 1)
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    for token, slot in enumerate(slots.tolist()):
+        row = backing[slot // block_size, (slot % block_size) * 256 :][:256]
+        scales = backing[
+            slot // block_size, block_size * 256 + (slot % block_size) * 32 :
+        ]
+        assert not torch.equal(row, torch.full_like(row, 165))
+        assert not torch.equal(scales, torch.full_like(scales, 165))
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Triton kernel")
 def test_v41_compressor_metadata_maps_tokens_to_their_ring():
     """The ring group's generic slot mapping is disabled (all PAD), so the

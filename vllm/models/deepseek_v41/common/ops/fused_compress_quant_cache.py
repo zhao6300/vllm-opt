@@ -332,7 +332,11 @@ def _insert_fp4_packed_or_append(
     compress_ratio: int,
 ) -> None:
     """Use page packing only for whole consecutive pages, otherwise append."""
-    if slot_mapping.dim() != 1 or compress_ratio != 1:
+    if (
+        slot_mapping.dim() != 1
+        or compress_ratio != 1
+        or torch.cuda.is_current_stream_capturing()
+    ):
         flashinfer_dsv41_fp4_quantize_append(roped_latent, slot_mapping, kv_cache)
         return
 
@@ -345,19 +349,19 @@ def _insert_fp4_packed_or_append(
         run_end = token + page_tokens
 
         if slot >= 0 and slot % page_tokens == 0:
-            while (
-                run_end < num_tokens
-                and slot_mapping[run_end].item()
-                == slot_mapping[token].item() + (run_end - token)
-            ):
+            while run_end < num_tokens and slot_mapping[run_end].item() == slot_mapping[
+                token
+            ].item() + (run_end - token):
                 run_end += page_tokens
 
             if run_end <= num_tokens and torch.all(
                 (positions[token:run_end] + 1) % compress_ratio == 0
             ):
-                page_ids = slot_mapping[token:run_end:page_tokens].div(
-                    page_tokens, rounding_mode="trunc"
-                ).to(torch.long)
+                page_ids = (
+                    slot_mapping[token:run_end:page_tokens]
+                    .div(page_tokens, rounding_mode="trunc")
+                    .to(torch.long)
+                )
                 packed = flashinfer_dsv41_fp4_quantize_pack(
                     roped_latent[token:run_end].view(-1, page_tokens, 512),
                     kv_layout="NHD",
@@ -527,9 +531,7 @@ def _rope_quant_insert_nvfp4_kernel(
     tiles = tl.reshape(rotated, (32, 16))
     amax = tl.max(tl.abs(tiles), 1)
     # 2**-9 is the smallest normal e4m3 magnitude; 448 the largest.
-    scale = tl.clamp(
-        tl.math.div_rn(amax, 6.0), 0.001953125, 448.0
-    ).to(tl.float8e4nv)
+    scale = tl.clamp(tl.math.div_rn(amax, 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
     # Round-to-nearest division: Triton's default div.full misplaces values
     # that land exactly on an e2m1 tie.
     scaled = tl.math.div_rn(tiles, tl.reshape(scale.to(tl.float32), (32, 1)))
