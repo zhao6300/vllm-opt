@@ -648,9 +648,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
-        self.use_fp4_extra_kv = current_platform.is_device_capability_family(
-            120
-        ) or current_platform.is_device_capability_family(121)
+        self.use_fp4_extra_kv = (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and (
+                current_platform.is_device_capability_family(120)
+                or current_platform.is_device_capability_family(121)
+            )
+        )
 
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
             self._o_proj_block_size

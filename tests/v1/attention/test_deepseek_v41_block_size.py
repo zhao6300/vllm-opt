@@ -249,6 +249,7 @@ def test_v41_attention_cache_spec_sizes_state_page(
     attention.compress_ratio = compress_ratio
     attention.kv_mxfp8 = False
     attention.compressed_bytes_per_token = 584
+    attention.use_fp4_extra_kv = False
     attention.kv_page_alignment = 576
 
     spec = attention.get_kv_cache_spec(vllm_config)
