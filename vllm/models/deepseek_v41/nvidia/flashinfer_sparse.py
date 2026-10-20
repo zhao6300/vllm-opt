@@ -658,13 +658,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "for the FP4 compressed cache"
             )
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
-        if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
+        if not has_flashinfer_sparse_mla_sm120_config(
+            self.padded_heads,
+            required_topk,
+            dsv41=True,
+        ):
             raise RuntimeError(
-                "FLASHINFER_MLA_SPARSE_DSV4 on SM120 requires a FlashInfer "
-                "DSV4 sparse MLA decode specialization for "
+                "FLASHINFER_MLA_SPARSE_DSV41 on SM120 requires a FlashInfer "
+                "DSv4.1 sparse MLA decode specialization for "
                 f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
-                "Install a FlashInfer build containing "
-                "flashinfer-ai/flashinfer#4380."
+                "Install a FlashInfer build containing the DSV4.1 SM120 "
+                "dispatch specialization."
             )
         self.use_fp4_extra_kv = self.kv_cache_dtype == "nvfp4_ds_mla" and (
             current_platform.is_device_capability_family(120)

@@ -136,16 +136,24 @@ def test_v32_glm_sm120_backend_accepts_glm_block_size(
 
 def test_sm120_dsv4_capability_checks_exact_dispatch_shape(monkeypatch) -> None:
     fake_module = SimpleNamespace(
-        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192)})
+        _DECODE_DSV4_DISPATCH=frozenset({(32, 128), (32, 192)}),
+        _DECODE_DSV4_1_DISPATCH=frozenset({(64, 256), (64, 384)}),
     )
     monkeypatch.setattr(fi_utils, "has_flashinfer_sparse_mla_sm120", lambda: True)
     monkeypatch.setattr(fi_utils, "_get_submodule", lambda _name: fake_module)
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
 
+    # Legacy DSV4 checks the legacy table only.
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128)
     assert fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 192)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(64, 256)
     assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 256)
-    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(16, 192)
+
+    # DSv4.1 checks its independent table only.
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(64, 256, dsv41=True)
+    assert fi_utils.has_flashinfer_sparse_mla_sm120_config(64, 384, dsv41=True)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(32, 128, dsv41=True)
+    assert not fi_utils.has_flashinfer_sparse_mla_sm120_config(64, 512, dsv41=True)
 
     fi_utils.has_flashinfer_sparse_mla_sm120_config.cache_clear()
 
