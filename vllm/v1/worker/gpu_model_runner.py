@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import (
     BatchDescriptor,
+    get_forward_context,
     set_forward_context,
 )
 from vllm.logger import init_logger
@@ -1062,6 +1063,8 @@ class GPUModelRunner(
             model_kwargs["lookback_token_ids"] = self._prepare_lookback_token_ids(
                 num_reqs
             )
+            if self.parallel_config.use_ubatching:
+                model_kwargs["lookback_query_start_loc"] = self.query_start_loc.gpu
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -3131,6 +3134,10 @@ class GPUModelRunner(
 
         return tuple(tasks)
 
+    @property
+    def pipeline_payload_keys(self) -> frozenset[str]:
+        return getattr(self.get_model(), "pipeline_payload_keys", frozenset())
+
     def sync_and_gather_intermediate_tensors(
         self,
         num_tokens: int,
@@ -3139,15 +3146,22 @@ class GPUModelRunner(
     ) -> IntermediateTensors:
         assert self.intermediate_tensors is not None
 
+        payload_keys = self.pipeline_payload_keys
+        payloads = {}
+
         if sync_self:
             assert intermediate_tensors is not None
             for k, v in intermediate_tensors.items():
+                if k in payload_keys:
+                    # Eager model-owned state may have a block axis, not tokens.
+                    payloads[k] = v
+                    continue
                 self.intermediate_tensors[k][:num_tokens].copy_(
                     v[:num_tokens], non_blocking=True
                 )
 
         return IntermediateTensors(
-            {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
+            {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()} | payloads
         )
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
@@ -5779,6 +5793,7 @@ class GPUModelRunner(
                     is_padding=is_padding,
                 ),
             ):
+                get_forward_context().additional_kwargs["is_dummy_run"] = True
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,

@@ -1337,10 +1337,17 @@ class Worker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
+        # Pipeline payloads are model-owned state with a block axis, not token
+        # slices; send them whole instead of letting the PP path split them.
+        all_gather_tensors = {
+            key: False
+            for key in getattr(self.model_runner, "pipeline_payload_keys", ())
+        }
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
                 )
             )
             assert tensor_dict is not None
@@ -1378,6 +1385,7 @@ class Worker(WorkerBase):
         handles = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
+            all_gather_tensors=all_gather_tensors,
         )
         self._pp_send_work = handles[1:]
 

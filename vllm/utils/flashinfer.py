@@ -333,6 +333,16 @@ flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
     "trtllm_batch_decode_sparse_mla_dsv4",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_dsv41_fp4_quantize_append = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp4_quantize_append_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_dsv41_fp4_quantize_pack = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp4_quantize_pack_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -485,18 +495,23 @@ def has_flashinfer_sparse_mla_sm120() -> bool:
 
 
 @functools.cache
-def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool:
-    """Return whether FlashInfer ships an SM120 DSV4 decode specialization.
+def has_flashinfer_sparse_mla_sm120_config(
+    num_q_heads: int,
+    top_k: int,
+    *,
+    dsv41: bool = False,
+) -> bool:
+    """Return whether FlashInfer has the requested SM120 DSV4 dispatch shape.
 
-    The public sparse MLA API predates some DSV4 shapes, so checking only that
-    the callable exists can select a package that later aborts or rejects a
-    valid vLLM configuration. Inspect FlashInfer's dispatch table until it
-    exposes a public capability query.
+    FlashInfer keeps independent dispatch tables for DSV4 and DSV4.1. The
+    latter is selected by the V4.1 mixed FP8/FP4 cache path, so checking the
+    legacy DSV4 table for that path can accept or reject the wrong shape.
     """
     if not has_flashinfer_sparse_mla_sm120():
         return False
     mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
-    dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
+    dispatch_name = "_DECODE_DSV4_1_DISPATCH" if dsv41 else "_DECODE_DSV4_DISPATCH"
+    dispatch = getattr(mod, dispatch_name, None) if mod else None
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
 
 
@@ -1291,6 +1306,8 @@ __all__ = [
     "trtllm_fp4_block_scale_moe",
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
+    "flashinfer_dsv41_fp4_quantize_append",
+    "flashinfer_dsv41_fp4_quantize_pack",
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "flashinfer_recurrent_kda",
     "flashinfer_fused_kda_decode",
