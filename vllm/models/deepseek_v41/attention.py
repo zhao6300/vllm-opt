@@ -189,9 +189,7 @@ def _resolve_dsv4_kv_cache_dtype(
 
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41MLAAttentionSpec(MLAAttentionSpec):
-    @property
-    def use_fp4_extra_kv(self) -> bool:
-        return self.model_version == "deepseek_v41"
+    """Type marker for DeepSeek-V4.1 compressed-KV cache specs."""
 
 
 def _compressed_cache_spec(

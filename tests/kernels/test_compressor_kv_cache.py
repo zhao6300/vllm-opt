@@ -722,8 +722,7 @@ def test_v41_rope_insert_nvfp4_record(compress_ratio: int):
         assert ((decoded - rotated).abs() <= step + 0.01).all()
         untouched[page, row * 288 : (row + 1) * 288] = record
     # Rows the kernel must not have touched, page padding included.
-    if compress_ratio == 1:
-        torch.testing.assert_close(cache_backing, untouched, rtol=0, atol=0)
+    torch.testing.assert_close(cache_backing, untouched, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")

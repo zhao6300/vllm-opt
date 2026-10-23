@@ -406,6 +406,13 @@ def _insert_fp4_packed_or_append(
     """Use page packing only for whole consecutive pages, otherwise append."""
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 
+    if compress_ratio != 1:
+        # Callers already mark non-boundary tokens as PAD; keep the writer
+        # correct on its own so a stray valid slot cannot publish a token that
+        # does not close a compression group.
+        slot_mapping = slot_mapping.masked_fill(
+            (positions + 1) % compress_ratio != 0, -1
+        )
     if (
         slot_mapping.dim() != 1
         or compress_ratio != 1
