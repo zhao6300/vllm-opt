@@ -232,6 +232,12 @@ class ParallelConfig:
     - "passthrough": No all2all at all: the MoE backend dispatches and combines
       itself (e.g. the FlashInfer MoE-EP megakernels). Bound automatically for
       such MoE backends; not selectable from the CLI."""
+    enable_sequence_parallel_moe: bool = False
+    """Allow model-selected sequence-parallel MoE with a single DP rank.
+
+    Model config hooks enable this before communication groups are created.
+    The model must shard its inputs and set FusedMoE's is_sequence_parallel.
+    """
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
@@ -781,7 +787,7 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            and (self.data_parallel_size > 1 or self.enable_sequence_parallel_moe)
         )
 
     @property

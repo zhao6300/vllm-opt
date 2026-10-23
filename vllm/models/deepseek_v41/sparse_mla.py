@@ -113,7 +113,16 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        # SM120 sparse-MLA pages are compressed states. Ratio-1 and ratio-2
+        # layers use token block sizes 64 and 128 respectively to get the same
+        # required 64-state page.
+        if (
+            current_platform.is_device_capability_family(90)
+            or current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [MultipleOf(64)]
+        return [128]
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
@@ -149,6 +158,61 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability.major in [9, 10]
+
+    @classmethod
+    def validate_configuration(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        use_per_head_quant_scales: bool,
+        device_capability: DeviceCapability,
+        attn_type: str,
+        has_sliding_window: bool = False,
+        use_non_causal: bool = False,
+        use_batch_invariant: bool = False,
+        use_kv_connector: bool = False,
+        use_pcp: bool = False,
+        use_adaptive_verification: bool = False,
+        use_dcp: bool = False,
+        use_rswa: bool = False,
+    ) -> list[str]:
+        reason = super().validate_configuration(
+            head_size,
+            dtype,
+            kv_cache_dtype,
+            block_size,
+            use_mla,
+            has_sink,
+            use_sparse,
+            use_mm_prefix,
+            use_per_head_quant_scales,
+            device_capability,
+            attn_type=attn_type,
+            has_sliding_window=has_sliding_window,
+            use_non_causal=use_non_causal,
+            use_batch_invariant=use_batch_invariant,
+            use_kv_connector=use_kv_connector,
+            use_pcp=use_pcp,
+            use_adaptive_verification=use_adaptive_verification,
+            use_dcp=use_dcp,
+            use_rswa=use_rswa,
+        )
+        if reason:
+            return reason
+        if kv_cache_dtype not in ("nvfp4_ds_mla", None) and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [
+                "FLASHINFER_SM120 requires nvfp4_ds_mla for the FP4 compressed cache"
+            ]
+        return []
 
 
 @dataclass

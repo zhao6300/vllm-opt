@@ -308,16 +308,18 @@ def test_indexer_shares_uncompressed_block_size_with_deepseek_v4_mla():
 
 
 def test_indexer_preserves_deepseek_v41_mla_block_size():
-    """V4.1 retains its smaller pages independently of V4's C4 indexer."""
-    block_size = DeepseekV41SparseMLABackend.get_supported_kernel_block_sizes()[0]
-    assert isinstance(block_size, int)
+    """V4.1 keeps its own pages independently of V4's C4 indexer.
+
+    Both backends declare their own kernel block sizes; pairing them must
+    keep the 128-token manager page the indexer needs.
+    """
     assert (
         select_common_block_size(
-            block_size,
+            128,
             # indexer backend has no impl class
             [DeepseekV41SparseMLABackend, DeepseekV41IndexerBackend],  # type: ignore[type-abstract]
         )
-        == block_size
+        == 128
     )
 
 
