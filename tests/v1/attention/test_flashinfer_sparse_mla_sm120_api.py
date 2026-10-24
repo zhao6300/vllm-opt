@@ -15,8 +15,11 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 from vllm.models.deepseek_v41 import nvidia
 from vllm.models.deepseek_v41.attention import _resolve_dsv4_kv_cache_dtype
 from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
+    _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
     DeepseekV4FlashInferMLASparseBackend,
     DeepseekV4FlashInferSM120Attention,
+    _flashinfer_dsv4_workspace_bytes,
+    _get_flashinfer_dsv4_workspace,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils import flashinfer as fi_utils
@@ -416,3 +419,184 @@ def test_sm120_dsv4_1_forwards_prefill_impl_and_sink(monkeypatch) -> None:
     assert cached.run_kwargs["sm_scale"] == 0.25
     assert cached.run_kwargs["attn_sink"] is sink
     assert cached.run_kwargs["prefill_impl"] == "swapab"
+
+
+def _dsv4_workspace_config(
+    *,
+    max_model_len: int,
+    index_topk: int = 512,
+    num_speculative_tokens: int | None = 7,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=max_model_len,
+            hf_config=SimpleNamespace(index_topk=index_topk),
+        ),
+        attention_config=SimpleNamespace(
+            use_non_causal=num_speculative_tokens is not None
+        ),
+        speculative_config=(
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        ),
+    )
+
+
+def test_sm120_c128a_workspace_covers_reporter_config() -> None:
+    # DeepSeek-V4-Flash-0731 at its native 1M context with DSpark k=7: the
+    # SM120 C128A decode plan spans the whole 8192-entry compressed buffer, so
+    # it needs far more than the old 128 MiB floor even for a few tokens.
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+        _flashinfer_dsv4_workspace_bytes,
+    )
+
+    computed = _flashinfer_dsv4_workspace_bytes(
+        _dsv4_workspace_config(max_model_len=1_048_576),
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=128,
+    )
+    assert computed == 551_616_512
+    assert computed > 128 * 1024 * 1024
+
+
+def test_sm120_dsv4_workspace_scales_with_compressed_width() -> None:
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+        _flashinfer_dsv4_workspace_bytes,
+    )
+
+    config = _dsv4_workspace_config(max_model_len=1_048_576)
+    c128a = _flashinfer_dsv4_workspace_bytes(
+        config, padded_heads=64, window_size=128, compress_ratio=128
+    )
+    c4a = _flashinfer_dsv4_workspace_bytes(
+        config, padded_heads=64, window_size=128, compress_ratio=4
+    )
+    swa_only = _flashinfer_dsv4_workspace_bytes(
+        config, padded_heads=64, window_size=128, compress_ratio=1
+    )
+    assert c128a > c4a > swa_only > 0
+
+    shorter = _flashinfer_dsv4_workspace_bytes(
+        _dsv4_workspace_config(max_model_len=131_072),
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=128,
+    )
+    assert shorter < c128a
+
+
+def test_sm120_dsv4_workspace_tracks_dspark_and_vision_widths() -> None:
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+        _flashinfer_dsv4_workspace_bytes,
+    )
+
+    causal_config = _dsv4_workspace_config(
+        max_model_len=1_048_576, num_speculative_tokens=None
+    )
+    causal = _flashinfer_dsv4_workspace_bytes(
+        causal_config,
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=4,
+    )
+    dspark = _flashinfer_dsv4_workspace_bytes(
+        _dsv4_workspace_config(max_model_len=1_048_576),
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=4,
+    )
+    vision = _flashinfer_dsv4_workspace_bytes(
+        causal_config,
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=4,
+        max_image_tokens=1024,
+    )
+    assert dspark > causal
+    assert vision > causal
+
+
+def test_dsv4_workspace_grows_but_never_shrinks() -> None:
+    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+        _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
+        _get_flashinfer_dsv4_workspace,
+    )
+
+    device = torch.device("cpu")
+    floor = _get_flashinfer_dsv4_workspace(device)
+    assert floor.numel() >= _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+
+    grown = _get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
+    assert grown.numel() == floor.numel() * 2
+
+    assert _get_flashinfer_dsv4_workspace(device) is grown
+
+
+def _dsv41_workspace_config(
+    *,
+    index_topk: int = 1024,
+    num_speculative_tokens: int | None = 7,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(index_topk=index_topk),
+        ),
+        attention_config=SimpleNamespace(
+            use_non_causal=num_speculative_tokens is not None
+        ),
+        speculative_config=(
+            None
+            if num_speculative_tokens is None
+            else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+        ),
+    )
+
+
+def test_sm120_dsv41_workspace_covers_shared_index_topk() -> None:
+    # Every compressed V4.1 layer gathers top-k over the shared index_topk-wide
+    # buffer, so the SM120 decode plan needs more than the 128 MiB floor.
+    computed = _flashinfer_dsv4_workspace_bytes(
+        _dsv41_workspace_config(index_topk=2048),
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=1,
+    )
+    assert computed == 147_390_464
+    assert computed > _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+
+
+def test_sm120_workspace_scales_with_dspark_and_index_topk() -> None:
+    causal = _dsv41_workspace_config(num_speculative_tokens=None)
+    swa_causal = _flashinfer_dsv4_workspace_bytes(
+        causal, padded_heads=64, window_size=128, compress_ratio=0
+    )
+    swa_dspark = _flashinfer_dsv4_workspace_bytes(
+        _dsv41_workspace_config(), padded_heads=64, window_size=128, compress_ratio=0
+    )
+    ratio1 = _flashinfer_dsv4_workspace_bytes(
+        _dsv41_workspace_config(), padded_heads=64, window_size=128, compress_ratio=1
+    )
+    ratio2 = _flashinfer_dsv4_workspace_bytes(
+        _dsv41_workspace_config(), padded_heads=64, window_size=128, compress_ratio=2
+    )
+    wide = _flashinfer_dsv4_workspace_bytes(
+        _dsv41_workspace_config(index_topk=2048),
+        padded_heads=64,
+        window_size=128,
+        compress_ratio=1,
+    )
+    assert swa_causal < swa_dspark < ratio1 < wide
+    assert ratio1 == ratio2
+
+
+def test_dsv41_workspace_grows_but_never_shrinks() -> None:
+    device = torch.device("cpu")
+    floor = _get_flashinfer_dsv4_workspace(device)
+    assert floor.numel() >= _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+
+    grown = _get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
+    assert grown.numel() == floor.numel() * 2
+
+    assert _get_flashinfer_dsv4_workspace(device) is grown

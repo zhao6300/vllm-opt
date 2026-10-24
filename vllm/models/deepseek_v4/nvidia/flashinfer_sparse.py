@@ -23,12 +23,14 @@ from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
     rope_quant_unsupported_reason,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
+    _C128A_TOPK_ALIGNMENT,
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
@@ -44,17 +46,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+# FlashInfer resolves its decode plan -- the only plan that carves scratch out
+# of the caller-owned workspace -- for at most this many rows; wider batches
+# resolve to a prefill plan whose scratch is allocated by the caller.
+_FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64
+# Decode-plan scratch is ``tokens * heads * chunk_capacity`` slots of bf16
+# partials (``value_dim`` wide) plus one fp32 LSE entry per slot. Both are
+# fixed for the DeepSeek V4 family.
+_FLASHINFER_DSV4_VALUE_DIM = 512
+_FLASHINFER_DSV4_DECODE_CHUNK_WIDTH = 64
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 
 
-def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
+def _get_flashinfer_dsv4_workspace(
+    device: torch.device, min_bytes: int = 0
+) -> torch.Tensor:
+    required = max(_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE, min_bytes)
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
-    if workspace is None:
-        workspace = torch.zeros(
-            _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
-            dtype=torch.uint8,
-            device=device,
-        )
+    if workspace is None or workspace.numel() < required:
+        workspace = torch.zeros(required, dtype=torch.uint8, device=device)
         _flashinfer_dsv4_workspace_by_device[device] = workspace
     return workspace
 
@@ -99,6 +109,47 @@ def _required_sm120_sparse_topk(vllm_config: VllmConfig, window_size: int) -> in
         window_size,
         speculative_config.num_speculative_tokens,
     )
+
+
+def _flashinfer_dsv4_workspace_bytes(
+    vllm_config: VllmConfig,
+    *,
+    padded_heads: int,
+    window_size: int,
+    compress_ratio: int,
+    max_image_tokens: int = 0,
+) -> int:
+    """Workspace FlashInfer's SM120 DSV4 decode plan needs for this layer.
+
+    The plan sizes its partial and LSE scratch from the widest dense index row it
+    resolves -- the SWA window plus the compressed top-k width -- times the
+    number of rows, heads and candidate chunks. On SM120 the C128A decode
+    indices span the whole pre-allocated compressed buffer instead of an
+    adaptive prefix, so a 1M-context model needs hundreds of MiB even for a
+    small decode batch.
+    """
+    topk = max(
+        _required_sm120_sparse_topk(vllm_config, window_size),
+        window_size + max_image_tokens,
+    )
+    if compress_ratio == 128:
+        max_model_len = vllm_config.model_config.max_model_len
+        extra_topk = (
+            cdiv(cdiv(max_model_len, compress_ratio), _C128A_TOPK_ALIGNMENT)
+            * _C128A_TOPK_ALIGNMENT
+        )
+    elif compress_ratio == 4:
+        extra_topk = int(getattr(vllm_config.model_config.hf_config, "index_topk", 0))
+    else:
+        extra_topk = 0
+    chunk_capacity = (
+        cdiv(topk, _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH)
+        + cdiv(extra_topk, _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH)
+    )
+    slots = _FLASHINFER_DSV4_DECODE_MAX_TOKENS * padded_heads * chunk_capacity
+    scratch = slots * (_FLASHINFER_DSV4_VALUE_DIM * 2 + 4)
+    metadata = _FLASHINFER_DSV4_DECODE_MAX_TOKENS * padded_heads * 4
+    return scratch + metadata
 
 
 class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
@@ -668,6 +719,18 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
             )
+        # The workspace is per device and shared by every layer, so size it here
+        # (outside CUDA graph capture) for the widest plan this layer can ask for.
+        _get_flashinfer_dsv4_workspace(
+            torch.device("cuda", torch.accelerator.current_device_index()),
+            _flashinfer_dsv4_workspace_bytes(
+                vllm_config,
+                padded_heads=self.padded_heads,
+                window_size=self.window_size,
+                compress_ratio=self.compress_ratio,
+                max_image_tokens=self.max_image_tokens,
+            ),
+        )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
@@ -951,8 +1014,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query_end = (
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
-            if query_start == query_end:
-                continue
 
             extra_sparse_indices_chunk = (
                 extra_sparse_indices[query_start:query_end]
