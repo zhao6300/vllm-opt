@@ -249,7 +249,8 @@ def test_deepseek_v4_prefill_chunk_planning_expands_for_short_sequences():
 
 
 @pytest.mark.skip_global_cleanup
-def test_flashinfer_sparse_prefill_skips_cudagraph_padding_chunks(monkeypatch):
+def test_flashinfer_sparse_prefill_dispatches_padding_chunks(monkeypatch):
+    """Padding-only chunks still reach the kernel, with zero rows."""
     from vllm.models.deepseek_v4.nvidia import flashinfer_sparse as flashinfer_mod
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
@@ -295,7 +296,7 @@ def test_flashinfer_sparse_prefill_skips_cudagraph_padding_chunks(monkeypatch):
         swa_metadata=swa_metadata,
     )
 
-    assert calls == [1]
+    assert calls == [1, 0]
 
 
 def test_flashinfer_sparse_indices_cache(monkeypatch):
