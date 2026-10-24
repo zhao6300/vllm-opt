@@ -191,6 +191,12 @@ def _resolve_dsv4_kv_cache_dtype(
 class DeepseekV41MLAAttentionSpec(MLAAttentionSpec):
     """Type marker for DeepSeek-V4.1 compressed-KV cache specs."""
 
+    kernel_block_states: ClassVar[int] = 64
+    """Compressed states a DSv4.1 kernel page must hold. The sparse-MLA and
+    indexer kernels both read 64-state pages, so the kernel block size is
+    ``kernel_block_states * tokens_per_state`` tokens (capped by the manager
+    block size)."""
+
 
 def _compressed_cache_spec(
     vllm_config: VllmConfig,

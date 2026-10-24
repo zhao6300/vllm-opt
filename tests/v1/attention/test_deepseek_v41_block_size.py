@@ -358,3 +358,76 @@ def test_mla_spec_num_states_matches_compressed_pages(
         tokens_per_state=tokens_per_state,
     )
     assert spec.num_states == expected
+
+
+def test_v41_prepare_kernel_block_sizes_uses_64_state_pages():
+    """Worker kernel pages hold 64 compressed states, not manager blocks.
+
+    The manager may use a larger page (here 256 tokens); ratio-1 and ratio-2
+    groups must still be split down to 64 and 128 token kernel pages. This
+    also guards against reintroducing the ``storage_block_size`` field that
+    main removed.
+    """
+    from vllm.models.deepseek_v41.attention import DeepseekV41MLAAttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker.utils import prepare_kernel_block_sizes
+
+    def compressed_spec(compress_ratio: int) -> DeepseekV41MLAAttentionSpec:
+        return DeepseekV41MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            cache_dtype_str="nvfp4_ds_mla",
+            alignment=512,
+            model_version="deepseek_v4",
+            state_content_bytes=288,
+        )
+
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["ratio1"], compressed_spec(1)),
+            KVCacheGroupSpec(["ratio2"], compressed_spec(2)),
+        ],
+    )
+
+    assert prepare_kernel_block_sizes(config, [[], []]) == [64, 128]
+
+
+def test_prepare_kernel_block_sizes_keeps_other_mla_backend_vote():
+    """Compressed MLA caches that are not DSv4.1 keep the backend vote.
+
+    GLM5Next's kpool indexer and other compressed MLA caches also set
+    ``tokens_per_state > 1``; only DSv4.1 pins the states in a kernel page.
+    """
+    from types import SimpleNamespace
+
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+    from vllm.v1.worker.utils import prepare_kernel_block_sizes
+
+    class AcceptAllBackend:
+        @staticmethod
+        def get_supported_kernel_block_sizes(kv_cache_spec=None):
+            return [MultipleOf(1)]
+
+        @staticmethod
+        def get_name() -> str:
+            return "ACCEPTALL"
+
+    spec = MLAAttentionSpec(
+        block_size=640,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        tokens_per_state=4,
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec, layer_names=[])],
+        kv_cache_tensors=[],
+    )
+    groups = [[SimpleNamespace(backend=AcceptAllBackend, kv_cache_spec=spec)]]
+
+    assert prepare_kernel_block_sizes(config, groups) == [640]
