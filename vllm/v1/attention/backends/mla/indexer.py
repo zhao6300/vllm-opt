@@ -91,11 +91,15 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
                 "aiter with VLLM_ROCM_USE_AITER=1."
             )
         return True
-    if use_fp4 and not current_platform.is_device_capability_family(100):
+    if use_fp4 and not (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    ):
         raise ValueError(
-            "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
-            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
-            "earlier architectures are not supported."
+            "indexer_kv_dtype='mxfp4' requires a Blackwell GPU whose DeepGEMM "
+            "build ships the MXFP4 MQA-logits kernels (sm_10x datacenter, "
+            "sm_120, or sm_121); earlier architectures are not supported."
         )
     return use_fp4
 

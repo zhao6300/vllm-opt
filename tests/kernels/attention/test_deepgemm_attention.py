@@ -5,7 +5,10 @@ import random
 import pytest
 import torch
 
-from vllm.model_executor.layers.sparse_attn_indexer import as_fp32_logits
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    as_fp32_logits,
+    kv_cache_as_quant_view,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     _ceil_to_ue8m0,
@@ -408,3 +411,182 @@ def test_deepgemm_paged_mqa_packed_manager_block_stride():
         for cache, table in zip((compact_pages, packed_pages), tables)
     ]
     torch.testing.assert_close(*logits, rtol=0, atol=0)
+
+
+# Nearest-value E2M1 codes, as `cvt.rn.satfinite.e2m1x2.f32` emits them.
+_MXFP4_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+# Midpoints between consecutive codes: a magnitude falls in the bucket whose
+# representative is nearest, ties rounding up.
+_MXFP4_MIDPOINTS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
+
+def quantize_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize the last dim of `x` to MXFP4, as the indexer kernels store it.
+
+    Two E2M1 values share a byte (low nibble first) and every 32 values share
+    one UE8M0 scale of ``2**(e - 127)`` where ``e`` is the ceil-log2 block
+    scale of the reference kernels.
+
+    Returns:
+        Packed values ``[..., dim // 2]`` uint8, scale bytes ``[..., dim // 32]``
+        uint8, and the dequantized values as float32 ``[..., dim]``.
+    """
+    assert x.shape[-1] % 32 == 0
+    blocks = x.float().view(*x.shape[:-1], x.shape[-1] // 32, 32)
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(6.0 * 2.0**-126)
+    exponent = torch.ceil(torch.log2(amax / 6.0))
+    scale = torch.exp2(exponent)
+    scaled = (blocks / scale).clamp(-6.0, 6.0)
+    code = torch.bucketize(
+        scaled.abs().contiguous(),
+        torch.tensor(_MXFP4_MIDPOINTS, device=x.device, dtype=torch.float32),
+    ).to(torch.uint8)
+    code |= (scaled < 0).to(torch.uint8) << 3
+    values = torch.tensor(_MXFP4_E2M1, device=x.device, dtype=torch.float32)
+    magnitude = values[(code & 7).long()]
+    dequant = magnitude * torch.where(code < 8, 1.0, -1.0) * scale
+    packed = (code[..., 1::2] << 4) | code[..., 0::2]
+    scales = (exponent + 127).to(torch.uint8).squeeze(-1)
+    return packed.flatten(-2), scales, dequant.flatten(-2)
+
+
+def mxfp4_indexer_kv_cache(
+    kv: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build an MXFP4 indexer K cache holding `kv` (`[tokens, head_dim]` bf16).
+
+    Each page stores its ``block_size`` packed value rows first and its
+    ``block_size`` four-byte UE8M0 scale rows after them, the layout both the
+    indexer's K-store kernel and DeepGEMM use.
+
+    Returns:
+        The uint8 cache ``[num_blocks, block_size, head_dim // 2 + 4]`` and the
+        dequantized keys ``[tokens, head_dim]`` float32.
+    """
+    num_tokens, head_dim = kv.shape
+    num_blocks = num_tokens // block_size
+    row_bytes = head_dim // 2
+    packed, scales, dequant = quantize_mxfp4(kv)
+    cache = torch.zeros(
+        num_blocks, block_size, row_bytes + 4, device=kv.device, dtype=torch.uint8
+    )
+    flat = cache.view(-1)
+    page_bytes = block_size * (row_bytes + 4)
+    for block in range(num_blocks):
+        base = block * page_bytes
+        rows = slice(block * block_size, (block + 1) * block_size)
+        flat[base : base + block_size * row_bytes] = packed[rows].reshape(-1)
+        scale_region = slice(base + block_size * row_bytes, base + page_bytes)
+        flat[scale_region] = scales[rows].reshape(-1)
+    return cache, dequant
+
+
+def _mxfp4_logits_supported() -> bool:
+    """Whether DeepGEMM ships the MXFP4 MQA-logits kernels for this GPU."""
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    )
+
+
+@pytest.mark.skipif(not _mxfp4_logits_supported(), reason="No MXFP4 logits kernel")
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_deepgemm_fp4_paged_mqa_logits(batch_size: int):
+    """MXFP4 indexer K cache through the paged decode logits kernel.
+
+    The cache is the 68 B/token page the indexer allocates, so a layout
+    mismatch between the K-store kernel and the logits kernel shows up here as
+    wrong scores rather than as a crash.
+    """
+    torch.manual_seed(0)
+    num_heads, head_dim, block_size = 32, 128, 64
+    context_len = 128
+    blocks_per_request = cdiv(context_len, block_size)
+    num_blocks = batch_size * blocks_per_request
+
+    q = torch.randn(
+        batch_size, 1, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv = torch.randn(
+        num_blocks * block_size, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    cache, kv_dequant = mxfp4_indexer_kv_cache(kv, block_size)
+    q_packed, q_scales, q_dequant = quantize_mxfp4(q)
+
+    weights = torch.randn(batch_size, num_heads, device="cuda", dtype=torch.float32)
+    if mqa_logits_use_mx_scales():
+        # SM100's kernel takes BF16 weights; sm_12x asserts FP32.
+        weights = weights.to(torch.bfloat16)
+    context_lens = torch.full(
+        (batch_size, 1), context_len, device="cuda", dtype=torch.int32
+    )
+    block_table = torch.arange(num_blocks, device="cuda", dtype=torch.int32).view(
+        batch_size, blocks_per_request
+    )
+    indices = (
+        torch.arange(batch_size, device="cuda", dtype=torch.int32)
+        if mqa_logits_use_mx_scales()
+        else None
+    )
+    schedule = get_paged_mqa_logits_metadata(
+        context_lens, block_size, get_num_sms(), indices=indices
+    )
+    logits = fp8_fp4_paged_mqa_logits(
+        (q_packed.view(torch.int8), q_scales.view(torch.int32).squeeze(-1)),
+        kv_cache_as_quant_view(cache, head_dim, True),
+        weights,
+        context_lens,
+        block_table,
+        schedule,
+        context_len,
+        indices=indices,
+    )
+    assert logits.shape == (batch_size, context_len)
+
+    keys = kv_dequant.view(batch_size, context_len, head_dim)
+    q_heads = q_dequant.view(batch_size, num_heads, head_dim)
+    scores = torch.einsum("bhd,bkd->bhk", q_heads, keys)
+    ref_logits = (scores.relu() * weights.float().unsqueeze(-1)).sum(dim=1)
+    assert calc_diff(logits.float(), ref_logits) < 1e-6
+
+
+@pytest.mark.skipif(not _mxfp4_logits_supported(), reason="No MXFP4 logits kernel")
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+def test_deepgemm_fp4_mqa_logits():
+    """MXFP4 prefill logits over each row's valid K span (non-paged kernel)."""
+    torch.manual_seed(0)
+    num_heads, head_dim = 32, 128
+    seq_len, seq_len_kv = 32, 128
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    if mqa_logits_use_mx_scales():
+        weights = weights.to(torch.bfloat16)
+
+    q_packed, q_scales, q_dequant = quantize_mxfp4(q)
+    kv_packed, kv_scales, kv_dequant = quantize_mxfp4(kv)
+    ks = torch.arange(seq_len, device="cuda", dtype=torch.int32)
+    ke = torch.full((seq_len,), seq_len_kv, device="cuda", dtype=torch.int32)
+    logits = fp8_fp4_mqa_logits(
+        (q_packed.view(torch.int8), q_scales.view(torch.int32).squeeze(-1)),
+        (
+            kv_packed.view(torch.int8),
+            kv_scales.view(torch.int32).squeeze(-1),
+        ),
+        weights,
+        ks,
+        ke,
+        seq_len_kv - seq_len + 1,
+    )
+    logits = as_fp32_logits(logits, ke - ks)
+
+    scores = torch.einsum("thd,kd->thk", q_dequant, kv_dequant)
+    ref = (scores.relu() * weights.float()[:, :, None]).sum(dim=1)
+    cols = ks[:, None] + torch.arange(logits.shape[1], device="cuda")[None, :]
+    valid = cols < ke[:, None]
+    ref = ref.gather(1, cols.clamp(max=seq_len_kv - 1).long())
+    logits = logits.masked_fill(~valid, 0)
+    ref = ref.masked_fill(~valid, 0)
+    assert calc_diff(logits, ref) < 1e-6

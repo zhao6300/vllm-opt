@@ -94,7 +94,10 @@ class AttentionConfig:
     """Data type for the sparse-attention indexer K cache. "auto" picks the
     model's default (bf16 for MiniMax M3, fp8 for the DeepSeek sparse
     indexer). Quantized formats (fp8, mxfp4, nvfp4) require indexer kernel
-    support in the backend."""
+    support in the backend. "mxfp4" halves the cache to 68 B per row and is
+    accepted on Blackwell GPUs whose DeepGEMM build ships the MXFP4
+    MQA-logits kernels (sm_10x, sm_120, sm_121), and on ROCm gfx950 with
+    aiter."""
 
     indexer_sparse_logits: bool = False
     """DeepSeek V4.1 two-level indexer: score only the candidate blocks with
