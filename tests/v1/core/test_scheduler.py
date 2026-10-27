@@ -6212,6 +6212,73 @@ def test_abort_request_finished_recving():
     assert not scheduler.finished_recving_kv_req_ids
 
 
+def test_abort_request_keeps_blocks_until_pending_send_finishes():
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    # Abort starts an async save, so the connector owns the blocks.
+    with patch.object(
+        scheduler.connector, "request_finished", return_value=(True, None)
+    ):
+        scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+    assert request.request_id in scheduler.requests
+    assert request.request_id in scheduler.pending_kv_send_req_ids
+
+    # The load finishes first; the pending save must still keep the request.
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id}
+            ),
+        ),
+    )
+    assert request.request_id in scheduler.requests
+    assert request.request_id in scheduler.pending_kv_send_req_ids
+
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_connector_output=KVConnectorOutput(
+                finished_sending={request.request_id}
+            ),
+        ),
+    )
+    assert request.request_id not in scheduler.requests
+    assert not scheduler.pending_kv_send_req_ids
+
+
+def test_finished_sending_after_recving_freed_request_is_ignored():
+    scheduler = create_scheduler(use_kv_connector=True)
+    request = create_requests(num_requests=1)[0]
+    scheduler.add_request(request)
+
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    scheduler.finish_requests((request.request_id,), RequestStatus.FINISHED_ABORTED)
+    assert request.request_id in scheduler.requests
+
+    # Both completions arrive in one step: recving frees the request, so the
+    # later send report must not trip the scheduler's bookkeeping.
+    scheduler.update_from_output(
+        scheduler.schedule(),
+        ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            kv_connector_output=KVConnectorOutput(
+                finished_recving={request.request_id},
+                finished_sending={request.request_id},
+            ),
+        ),
+    )
+    assert request.request_id not in scheduler.requests
+
+
 def test_delayed_kv_connector_free_keeps_scheduler_active():
     scheduler = create_scheduler(use_kv_connector=True)
     queued_request, request = create_requests(

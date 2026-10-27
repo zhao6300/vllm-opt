@@ -247,6 +247,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Finished requests whose blocks are held by the connector until an
+        # async send completes. They must survive an earlier recv completion.
+        self.pending_kv_send_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -2924,6 +2927,8 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if connector_delay_free_blocks:
+            self.pending_kv_send_req_ids.add(request_id)
         if not delay_free_blocks:
             self._free_blocks(request)
 
@@ -2931,6 +2936,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self.pending_kv_send_req_ids.discard(request.request_id)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -3410,18 +3416,29 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was already freed, e.g. by a duplicate report or
+                # because its send completed first.
+                logger.debug("Ignoring finished recv for unknown request %s", req_id)
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
                 assert RequestStatus.is_finished(req.status)
-                self._free_blocks(self.requests[req_id])
+                # Keep the blocks until the connector reports the pending send;
+                # freeing here would race the sender and leave its completion
+                # pointing at a removed request.
+                if req_id not in self.pending_kv_send_req_ids:
+                    self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.debug("Ignoring finished send for unknown request %s", req_id)
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,
