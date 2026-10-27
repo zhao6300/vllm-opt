@@ -600,3 +600,134 @@ def test_dsv41_workspace_grows_but_never_shrinks() -> None:
     assert grown.numel() == floor.numel() * 2
 
     assert _get_flashinfer_dsv4_workspace(device) is grown
+
+
+def _padded_swa_cache(
+    pages: int = 4,
+    page_rows: int = 32,
+    page_span: int = 36,
+    row_bytes: int = 528,
+) -> torch.Tensor:
+    """SWA cache with the interleaved V4.1 layout's per-page row padding."""
+    backing = torch.zeros(pages * page_span * row_bytes, dtype=torch.uint8)
+    return backing.as_strided(
+        (pages, page_rows, row_bytes), (page_span * row_bytes, row_bytes, 1)
+    )
+
+
+def _remap_reference(
+    indices: torch.Tensor, block_size: int, page_rows: int, page_span: int
+) -> torch.Tensor:
+    safe = indices.clamp(min=0).long()
+    pages_per_block = block_size // page_rows
+    page = (safe // block_size) * pages_per_block + (safe % block_size) // page_rows
+    rows = page * page_span + (safe % block_size) % page_rows
+    return torch.where(indices < 0, -1, rows).to(torch.int32)
+
+
+def test_storage_offset_indices_remap_padded_pages() -> None:
+    from vllm.models.deepseek_v41.common.ops import (
+        remap_flashinfer_sparse_indices,
+    )
+
+    compact = torch.tensor([[0, 31, 32, 63, -1]], dtype=torch.int32)
+    assert remap_flashinfer_sparse_indices(compact, 32, 32, 32) is compact
+
+    if not torch.cuda.is_available():
+        pytest.skip("the remap kernel is a CUDA kernel")
+    indices = torch.tensor(
+        [[0, 1, 31, 32, 33, 63, 64, 127, -1]], dtype=torch.int32, device="cuda"
+    )
+    remapped = remap_flashinfer_sparse_indices(indices, 32, 32, 36)
+    expected = _remap_reference(indices, 32, 32, 36)
+    assert torch.equal(remapped, expected)
+    assert remapped.tolist() == [[0, 1, 31, 36, 37, 67, 72, 139, -1]]
+
+    # [num_tokens, 1, width] metadata rows and blocks spanning several pages.
+    rows = indices[:, None, :]
+    assert torch.equal(
+        remap_flashinfer_sparse_indices(rows, 32, 32, 36), expected[:, None, :]
+    )
+    assert torch.equal(
+        remap_flashinfer_sparse_indices(indices, 128, 64, 72),
+        _remap_reference(indices, 128, 64, 72),
+    )
+
+
+def test_sm120_dsv41_remaps_sparse_indices_of_padded_swa_cache(monkeypatch) -> None:
+    """A padded page stores slot b*32+o at row b*36+o; FlashInfer's inline-scale
+    kernels read records as flat rows, so the SM120 path must hand them storage
+    offsets or attention reads the wrong KV (garbled, repeating output)."""
+    calls = []
+
+    def fake_remap(indices, block_size, page_rows, page_span, out=None):
+        calls.append((block_size, page_rows, page_span))
+        out.copy_(
+            _remap_reference(indices, block_size, page_rows, page_span).reshape(
+                out.shape
+            )
+        )
+        return out if out.shape == indices.shape else out.view(indices.shape)
+
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse, "remap_flashinfer_sparse_indices", fake_remap
+    )
+    captured = {}
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse,
+        "_sparse_mla_sm120_paged_attention",
+        lambda **kwargs: captured.update(kwargs),
+    )
+    monkeypatch.setattr(nvidia.flashinfer_sparse, "_storage_offset_index_scratch", {})
+
+    attn = DeepseekV4FlashInferSM120Attention.__new__(
+        DeepseekV4FlashInferSM120Attention
+    )
+    attn.kv_cache_torch_dtype = torch.bfloat16
+    attn.scale = 1.0
+    attn.attn_sink = None
+    attn.use_fp4_extra_kv = False
+    attn.max_num_batched_tokens = 8
+
+    slots = torch.tensor([[0, 31, 32, 33, -1], [64, 95, -1, -1, -1]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_decodes=2,
+        num_decode_tokens=2,
+        decode_swa_indices=slots[:, None, :],
+        decode_swa_lens=torch.tensor([4, 2], dtype=torch.int32),
+        block_size=32,
+    )
+    attn.swa_cache_layer = SimpleNamespace(kv_cache=_padded_swa_cache())
+    query = torch.zeros((2, 64, 512), dtype=torch.bfloat16)
+    output = torch.zeros_like(query)
+
+    attn._forward_decode(
+        q=query,
+        kv_cache=None,
+        swa_metadata=metadata,
+        attn_metadata=None,
+        swa_only=True,
+        output=output,
+    )
+
+    assert calls == [(32, 32, 36)]
+    # Same values as the reference, in the metadata's [tokens, 1, width] shape.
+    assert torch.equal(
+        captured["sparse_indices"], _remap_reference(slots, 32, 32, 36)[:, None, :]
+    )
+    # The remapped rows live in the CUDA-graph-safe scratch, not a fresh tensor.
+    assert captured["sparse_indices"].shape == (2, 1, 5)
+
+    # A compact page needs no remap and keeps the metadata's own buffer.
+    calls.clear()
+    attn.swa_cache_layer = SimpleNamespace(kv_cache=_padded_swa_cache(page_span=32))
+    attn._forward_decode(
+        q=query,
+        kv_cache=None,
+        swa_metadata=metadata,
+        attn_metadata=None,
+        swa_only=True,
+        output=output,
+    )
+    assert calls == []
+    assert captured["sparse_indices"].data_ptr() == slots.data_ptr()

@@ -5,6 +5,11 @@
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
+from vllm.models.deepseek_v41.common.ops.cache_utils import (
+    paged_cache_block_span,
+    paged_cache_page_rows,
+    paged_slots_to_cache_rows,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
@@ -413,6 +418,12 @@ def _insert_fp4_packed_or_append(
         slot_mapping = slot_mapping.masked_fill(
             (positions + 1) % compress_ratio != 0, -1
         )
+    # FlashInfer's writer addresses a record as a flat row of the whole cache,
+    # so padded pages need the slot rewritten to the row the token occupies.
+    page_tokens = paged_cache_page_rows(kv_cache)
+    append_slots = paged_slots_to_cache_rows(
+        slot_mapping, page_tokens, paged_cache_block_span(kv_cache)
+    )
     if (
         slot_mapping.dim() != 1
         or compress_ratio != 1
@@ -420,11 +431,10 @@ def _insert_fp4_packed_or_append(
         or BreakableCUDAGraphCapture.is_active()
     ):
         flashinfer_dsv41_fp4_quantize_append(
-            roped_latent, slot_mapping, kv_cache, inline_scale=True
+            roped_latent, append_slots, kv_cache, inline_scale=True
         )
         return
 
-    page_tokens = kv_cache.shape[-2]
     num_tokens = slot_mapping.numel()
     append_rows: list[int] = []
     token = 0
@@ -465,7 +475,7 @@ def _insert_fp4_packed_or_append(
         append_rows_t = torch.tensor(append_rows, device=slot_mapping.device)
         flashinfer_dsv41_fp4_quantize_append(
             roped_latent[append_rows_t],
-            slot_mapping[append_rows_t],
+            append_slots[append_rows_t],
             kv_cache,
             inline_scale=True,
         )

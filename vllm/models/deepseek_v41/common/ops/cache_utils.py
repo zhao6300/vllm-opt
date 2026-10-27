@@ -1348,6 +1348,53 @@ def build_flashinfer_mixed_sparse_indices(
     return sparse_indices, sparse_topk_lens
 
 
+def paged_cache_page_rows(cache: torch.Tensor) -> int:
+    """Records one paged block of ``cache`` holds, for the 2D/3D/HND/NHD forms."""
+    if cache.dim() == 4:
+        return cache.shape[2] if cache.shape[1] == 1 else cache.shape[1]
+    if cache.dim() == 3:
+        return cache.shape[1]
+    return 1
+
+
+def paged_cache_block_span(cache: torch.Tensor) -> int:
+    """Rows between consecutive paged blocks of ``cache``, padding included."""
+    token_stride = cache.stride(-2) if cache.dim() >= 3 else cache.shape[-1]
+    if token_stride <= 0 or cache.stride(0) % token_stride != 0:
+        raise NotImplementedError(
+            "FLASHINFER_MLA_SPARSE_DSV4 packed KV requires the per-block stride "
+            f"({cache.stride(0)}) to be a multiple of the per-token stride "
+            f"({token_stride}); this layout is not supported yet."
+        )
+    return cache.stride(0) // token_stride
+
+
+def paged_slots_to_cache_rows(
+    slots: torch.Tensor, page_rows: int, page_span: int
+) -> torch.Tensor:
+    """Map ``block * block_size + offset`` slots to rows of a padded cache.
+
+    FlashInfer's DSv4.1 readers address a record as a flat row of the whole
+    cache (``row * row_pitch``), while ``rope_quant_insert``'s Triton writers
+    walk the block stride. Padded pages therefore need the slot rewritten to
+    the row it actually occupies; dense pages map to themselves.
+
+    Args:
+        slots: int paged slot ids; negative entries stay negative.
+        page_rows: Records one physical page holds.
+        page_span: Rows between consecutive physical pages, padding included.
+
+    Returns:
+        ``slots`` itself when the pages are dense, else a new tensor.
+
+    """
+    if page_rows == page_span:
+        return slots
+    page = torch.div(slots, page_rows, rounding_mode="floor")
+    rows = torch.where(slots >= 0, page * page_span + slots - page * page_rows, slots)
+    return rows
+
+
 @triton.jit
 def _remap_flashinfer_index(values, block_size, block_span):
     # FlashInfer's DSv4 kernel indexes sparse KV by physical token stride, so
@@ -1358,6 +1405,95 @@ def _remap_flashinfer_index(values, block_size, block_span):
     values = (safe_values // block_size) * block_span
     values += safe_values % block_size
     return tl.where(is_valid, values, -1)
+
+
+@triton.jit
+def _remap_storage_offset_index_kernel(
+    src_ptr,
+    dst_ptr,
+    src_row_stride,
+    dst_row_stride,
+    width,
+    block_size,
+    page_rows,
+    page_span,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    values = tl.load(src_ptr + row * src_row_stride + cols, mask=mask, other=-1)
+    is_valid = values >= 0
+    safe_values = tl.where(is_valid, values, 0)
+    # Manager block -> physical page -> row of the whole cache.
+    pages_per_block = block_size // page_rows
+    page = (safe_values // block_size) * pages_per_block
+    page += (safe_values % block_size) // page_rows
+    offset = (safe_values % block_size) % page_rows
+    values = tl.where(is_valid, page * page_span + offset, -1)
+    tl.store(dst_ptr + row * dst_row_stride + cols, values, mask=mask)
+
+
+def remap_flashinfer_sparse_indices(
+    indices: torch.Tensor,
+    block_size: int,
+    page_rows: int,
+    page_span: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Rewrite logical paged slot ids as flat cache-row offsets.
+
+    FlashInfer's inline-scale DSv4.1 kernels address a record as
+    ``row * row_pitch`` over the whole cache, so a packed page that is padded
+    to whole rows (or that shares its block with other layers' pages) stores
+    slot ``block * block_size + off`` at row ``block * page_span + off``.
+
+    Args:
+        indices: int32 paged slot ids, ``[..., 1, width]`` or ``[..., width]``.
+        block_size: States a logical (manager) block addresses.
+        page_rows: Rows a physical cache page holds.
+        page_span: Rows between consecutive physical pages, padding included.
+        out: Destination of the remapped ids; allocated when omitted.
+
+    Returns:
+        ``indices`` itself when the page is dense and one page per block,
+        otherwise the remapped ids (``out`` when given). Negative entries stay
+        negative.
+
+    """
+    assert indices.dtype == torch.int32 and indices.stride(-1) == 1, (
+        f"sparse indices must be a contiguous-row int32 tensor, got "
+        f"{indices.dtype} with strides {tuple(indices.stride())}"
+    )
+    assert indices.dim() in (2, 3) and (indices.dim() == 2 or indices.shape[1] == 1), (
+        f"sparse indices must be [rows, width] or [rows, 1, width], got {indices.shape}"
+    )
+    assert block_size % page_rows == 0, (
+        f"a {block_size}-state block does not split into {page_rows}-row pages"
+    )
+    assert page_span >= page_rows, (
+        f"a {page_rows}-row page cannot span {page_span} rows"
+    )
+    if page_rows == block_size and page_span == block_size:
+        return indices
+    width = indices.shape[-1]
+    rows = indices.numel() // width
+    if out is None:
+        out = torch.empty_like(indices)
+    block = 1024
+    _remap_storage_offset_index_kernel[(rows, cdiv(width, block))](
+        indices,
+        out,
+        indices.stride(0),
+        out.stride(0),
+        width,
+        block_size,
+        page_rows,
+        page_span,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out if out.shape == indices.shape else out.view(indices.shape)
 
 
 @triton.jit(

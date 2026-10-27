@@ -15,6 +15,13 @@ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.common.ops import (
     build_flashinfer_mixed_sparse_indices,
     compute_global_topk_indices_and_lens,
+    remap_flashinfer_sparse_indices,
+)
+from vllm.models.deepseek_v41.common.ops import (
+    paged_cache_block_span as _packed_block_span,
+)
+from vllm.models.deepseek_v41.common.ops import (
+    paged_cache_page_rows as _paged_cache_page_rows,
 )
 from vllm.models.deepseek_v41.nvidia.ops.o_proj import (
     dsv41_o_proj,
@@ -115,19 +122,25 @@ def _get_flashinfer_dsv4_workspace(
     return workspace
 
 
-def _packed_block_span(pool: torch.Tensor) -> int:
-    """Per-block stride of ``pool`` in tokens (``stride(0)//stride(-2)``): ==
-    block_size for unpacked KV, larger when packed (#44577). Raises if not
-    token-aligned."""
-    block_stride = pool.stride(0)
-    token_stride = pool.stride(-2)
-    if block_stride % token_stride != 0:
-        raise NotImplementedError(
-            "FLASHINFER_MLA_SPARSE_DSV4 packed KV requires the per-block stride "
-            f"({block_stride}) to be a multiple of the per-token stride "
-            f"({token_stride}); this layout is not supported yet."
-        )
-    return block_stride // token_stride
+# Flat-row (storage-offset) sparse indices of a padded inline-scale cache. One
+# buffer per device, role and width — a dense row is required for prefill — and
+# resized only by rows, which keeps every captured graph's buffer in place.
+# The remap kernel and the attention kernel reading its output run back to back
+# on the step's stream, so layers can share a buffer.
+_storage_offset_index_scratch: dict[tuple[torch.device, str, int], torch.Tensor] = {}
+
+
+def _get_storage_offset_index_scratch(
+    device: torch.device, role: str, capacity_rows: int, width: int
+) -> torch.Tensor:
+    """Reusable index scratch, sized so captured graphs never see it move."""
+    key = (device, role, width)
+    scratch = _storage_offset_index_scratch.get(key)
+    rows = max(capacity_rows, scratch.shape[0] if scratch is not None else 0)
+    if scratch is None or scratch.shape[0] < rows:
+        scratch = torch.empty((rows, width), dtype=torch.int32, device=device)
+        _storage_offset_index_scratch[key] = scratch
+    return scratch
 
 
 # Sparse MLA h_q counts accepted natively (flashinfer>=0.6.14, #3545).
@@ -738,6 +751,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         super().__init__(vllm_config, *args, **kwargs)
         from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
 
+        # Upper bound on a step's tokens: the flat-row index scratch is sized
+        # once from it so a captured graph never outgrows its buffer.
+        self.max_num_batched_tokens = (
+            vllm_config.scheduler_config.max_num_batched_tokens
+        )
         if (
             current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability_family(121)
@@ -911,6 +929,40 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q = padded_query
         return q.contiguous()
 
+    def _storage_offset_indices(
+        self,
+        indices: torch.Tensor | None,
+        cache: torch.Tensor | None,
+        block_size: int,
+        role: str,
+        row_offset: int = 0,
+    ) -> torch.Tensor | None:
+        """Rewrite paged slot ids as flat cache rows for an inline-scale cache.
+
+        FlashInfer's DSv4.1 kernels address a record as ``row * row_pitch``, so
+        a page padded to whole rows (the interleaved V4.1 layout) or sharing its
+        block with another layer needs storage-offset indices. Compact pages map
+        ids to themselves and keep the metadata's buffer.
+        """
+        if indices is None or cache is None:
+            return indices
+        page_rows = _paged_cache_page_rows(cache)
+        page_span = _packed_block_span(cache)
+        if page_rows == block_size and page_span == block_size:
+            return indices
+        width = indices.shape[-1]
+        rows = indices.numel() // width
+        scratch = _get_storage_offset_index_scratch(
+            indices.device, role, self.max_num_batched_tokens, width
+        )
+        return remap_flashinfer_sparse_indices(
+            indices,
+            block_size,
+            page_rows,
+            page_span,
+            out=scratch[row_offset : row_offset + rows],
+        )
+
     def _forward_decode(
         self,
         q: torch.Tensor,
@@ -925,6 +977,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         extra_sparse_indices = None
         extra_sparse_lengths = None
+        compressed_block_size = 0
         if not swa_only:
             if attn_metadata is None:
                 raise RuntimeError(
@@ -940,12 +993,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 )
             # Local indices filled by the index-source layer's indexer.
             is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            block_size = attn_metadata.block_size // self.compress_ratio
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
             global_indices, extra_sparse_lengths = compute_global_topk_indices_and_lens(
                 self.topk_indices_buffer[:num_decode_tokens],
                 swa_metadata.token_to_req_indices,
                 attn_metadata.block_table[:num_decodes],
-                block_size,
+                compressed_block_size,
                 is_valid,
             )
             extra_sparse_indices = global_indices.view(num_decode_tokens, 1, -1)
@@ -961,6 +1014,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             raise RuntimeError(
                 "Compressed sparse MLA decode requires compressed sparse indices."
             )
+        swa_indices = self._storage_offset_indices(
+            swa_indices, swa_cache, swa_metadata.block_size, "swa"
+        )
+        extra_sparse_indices = self._storage_offset_indices(
+            extra_sparse_indices, extra_cache, compressed_block_size, "extra"
+        )
         _sparse_mla_sm120_paged_attention(
             query=q,
             swa_kv_cache=swa_cache,
@@ -998,6 +1057,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
         extra_sparse_indices: torch.Tensor | None = None
         extra_sparse_lengths: torch.Tensor | None = None
+        compressed_block_size = 0
         if not swa_only:
             if self.topk_indices_buffer is None:
                 raise RuntimeError(
@@ -1020,13 +1080,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             prefill_token_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
-            block_size = attn_metadata.block_size // self.compress_ratio
+            compressed_block_size = attn_metadata.block_size // self.compress_ratio
             extra_sparse_indices, extra_sparse_lengths = (
                 compute_global_topk_indices_and_lens(
                     local_topk_indices,
                     swa_metadata.token_to_req_indices[prefill_token_slice],
                     attn_metadata.block_table,
-                    block_size,
+                    compressed_block_size,
                     swa_metadata.is_valid_token[prefill_token_slice],
                 )
             )
@@ -1070,7 +1130,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             q_chunk = q[query_start:query_end]
-            swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
+            swa_indices_chunk = self._storage_offset_indices(
+                swa_metadata.prefill_swa_indices[query_start:query_end],
+                swa_kv_paged,
+                swa_metadata.block_size,
+                "swa",
+                row_offset=query_start,
+            )
+            extra_sparse_indices_chunk = self._storage_offset_indices(
+                extra_sparse_indices_chunk,
+                extra_kv_paged,
+                compressed_block_size,
+                "extra",
+                row_offset=query_start,
+            )
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(

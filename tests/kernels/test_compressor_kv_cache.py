@@ -3128,3 +3128,71 @@ def test_v41_indexer_forward_q(quant_tuple):
         "use_fp4": False,
         "weights_out_dtype": torch.float32,
     }
+
+
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_v41_fp4_insert_lands_on_padded_page_rows(compress_ratio: int) -> None:
+    """The V4.1 FP4 record is addressed as a flat row of the whole cache.
+
+    FlashInfer's writer takes a row index, so writing a packed page (``page_rows``
+    rows inside a ``page_span`` stride) at its dense row would land inside the
+    previous page and every reader would see the wrong latent. A padded cache
+    must therefore hold the same bytes a dense cache does.
+    """
+    from vllm.models.deepseek_v41.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache_triton,
+    )
+    from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import (
+        rope_quant_insert,
+    )
+
+    page_rows, page_span, row_bytes = 64, 286, 288
+    num_pages = 4
+    num_tokens = num_pages * page_rows
+    device = "cuda"
+    torch.manual_seed(0)
+
+    latent = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin = torch.zeros(num_tokens + 8, 64, dtype=torch.float32, device=device)
+    cos_sin[:, :32] = 1.0
+    slots = torch.arange(num_tokens, dtype=torch.int64, device=device)
+
+    dense = torch.zeros(
+        (num_pages, page_rows, row_bytes), dtype=torch.uint8, device=device
+    )
+    backing = torch.zeros(
+        num_pages * page_span * row_bytes, dtype=torch.uint8, device=device
+    )
+    padded = backing.as_strided(
+        (num_pages, page_rows, row_bytes), (page_span * row_bytes, row_bytes, 1)
+    )
+
+    rope_quant_insert(latent, positions, cos_sin, dense, slots, compress_ratio)
+    rope_quant_insert(latent, positions, cos_sin, padded, slots, compress_ratio)
+
+    expected_tokens = num_tokens // compress_ratio
+    block_table = torch.arange(num_pages, dtype=torch.int32, device=device).view(1, -1)
+    seq_lens = torch.tensor([expected_tokens], dtype=torch.int32, device=device)
+    outputs = []
+    for cache in (dense, padded):
+        out = torch.zeros(1, expected_tokens, 512, dtype=torch.bfloat16, device=device)
+        dequantize_and_gather_k_cache_triton(
+            out, cache, seq_lens, None, block_table, page_rows, offset=0
+        )
+        outputs.append(out)
+    torch.cuda.synchronize()
+
+    assert torch.equal(outputs[0], outputs[1])
+    assert outputs[0].abs().sum() > 0
+
+    # The reader addresses a record as a flat row of the whole cache, so page p
+    # must hold its written rows at p * page_span, not at p * page_rows.
+    written = backing.view(num_pages * page_span, row_bytes).count_nonzero(dim=1) > 0
+    expected = torch.zeros_like(written)
+    for token in range(num_tokens):
+        if (token + 1) % compress_ratio == 0:
+            page, entry = divmod(token, page_rows)
+            expected[page * page_span + entry] = True
+    torch.cuda.synchronize()
+    assert torch.equal(written.cpu(), expected.cpu())
