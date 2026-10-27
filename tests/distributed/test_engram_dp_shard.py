@@ -785,17 +785,29 @@ def test_engram_tables_too_large_for_shm_are_not_shared(monkeypatch, query_fails
     def query(*args, **kwargs):
         raise OSError("statvfs failed")
 
+    warnings: list[str] = []
+
+    def capture(msg, *args):
+        warnings.append(msg % args)
+
     monkeypatch.setattr(engram_ops, "get_engram_dp_size", lambda: 2)
     monkeypatch.setattr(
         engram_ops,
         "get_engram_dp_group",
         lambda: SimpleNamespace(rank_in_group=0, broadcast_object=broadcast),
     )
+    monkeypatch.setattr(engram_ops.logger, "warning_once", capture)
     if query_fails:
         monkeypatch.setattr(engram_ops, "check_shm_free_space", query)
     layout = SimpleNamespace(num_embeddings=(1 << 50,), head_dim=DIM)
     assert not engram_ops.can_share_engram_tables(layout)
     assert len(broadcasts) == 1 and broadcasts[0] is not None
+    # The fallback must state what it costs and how to unblock the shared pool,
+    # not just repeat that /dev/shm is too small.
+    assert len(warnings) == 1
+    assert "2 co-located DP replicas" in warnings[0]
+    assert "exchanges n-gram ids" in warnings[0]
+    assert "--shm-size=" in warnings[0] and "--ipc=host" in warnings[0]
 
 
 @pytest.mark.parametrize(

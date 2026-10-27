@@ -35,6 +35,7 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
 """
 
 import ctypes
+import math
 import mmap
 import os
 import sys
@@ -876,15 +877,18 @@ class DPSharedEngramStorage:
 
 def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
     """Whether co-located DP replicas exist and /dev/shm can hold the full tables."""
-    if get_engram_dp_size() == 1:
-        logger.warning_once(
-            "Engram DP replicas are not co-located on one node; "
-            "storing the offloaded tables per rank instead of sharing them."
-        )
-        return False
     num_bytes = sum(layout.num_embeddings) * (
         layout.head_dim + layout.head_dim // block_size
     )
+    if get_engram_dp_size() == 1:
+        logger.warning_once(
+            "Engram DP replicas are not co-located on one node, so the %.0f GiB "
+            "of offloaded heads cannot be shared: each replica pins only its own "
+            "head slice and exchanges n-gram ids with its peers every step. Run "
+            "one replica per node to share them.",
+            num_bytes / (1 << 30),
+        )
+        return False
     group = get_engram_dp_group()
     assert group is not None
     # Only the leader allocates, so every replica follows its check.
@@ -899,8 +903,19 @@ def can_share_engram_tables(layout: EngramLayout, block_size: int = 32) -> bool:
                 error = f"{type(exc).__name__}: {exc}"
     error = group.broadcast_object(error)
     if error is not None:
+        needed_gib = num_bytes / (1 << 30)
         logger.warning_once(
-            "Sharding the offloaded Engram tables across DP replicas: %s", error
+            "Engram heads are not shared by the %d co-located DP replicas (%s). "
+            "Each replica pins only its own head slice and exchanges n-gram ids "
+            "with its peers every step instead of reading one node-wide pool. "
+            "Give %s %d GiB free (docker --shm-size=%dg or --ipc=host) to share "
+            "the %.0f GiB of tables.",
+            get_engram_dp_size(),
+            error,
+            SHM_PATH,
+            math.ceil(needed_gib),
+            math.ceil(needed_gib) + 8,
+            needed_gib,
         )
     return error is None
 
