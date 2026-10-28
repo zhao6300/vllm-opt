@@ -5,6 +5,7 @@ import random
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.model_executor.layers.sparse_attn_indexer import (
     as_fp32_logits,
     kv_cache_as_quant_view,
@@ -430,6 +431,7 @@ def quantize_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.T
     Returns:
         Packed values ``[..., dim // 2]`` uint8, scale bytes ``[..., dim // 32]``
         uint8, and the dequantized values as float32 ``[..., dim]``.
+
     """
     assert x.shape[-1] % 32 == 0
     blocks = x.float().view(*x.shape[:-1], x.shape[-1] // 32, 32)
@@ -462,6 +464,7 @@ def mxfp4_indexer_kv_cache(
     Returns:
         The uint8 cache ``[num_blocks, block_size, head_dim // 2 + 4]`` and the
         dequantized keys ``[tokens, head_dim]`` float32.
+
     """
     num_tokens, head_dim = kv.shape
     num_blocks = num_tokens // block_size
@@ -590,3 +593,37 @@ def test_deepgemm_fp4_mqa_logits():
     logits = logits.masked_fill(~valid, 0)
     ref = ref.masked_fill(~valid, 0)
     assert calc_diff(logits, ref) < 1e-6
+
+
+@pytest.mark.skipif(not _mxfp4_logits_supported(), reason="No MXFP4 logits kernel")
+def test_fp4_indexer_k_gather_matches_page_layout():
+    """The prefill gather reads FP4 pages at the offsets the logits kernel does.
+
+    Both walk the page as packed value rows followed by scale rows, so a
+    mismatch still yields well-formed (but wrong) buffers here.
+    """
+    torch.manual_seed(0)
+    batch, seq_len, head_dim, block_size = 2, 128, 128, 64
+    num_tokens = batch * seq_len
+    blocks_per_request = cdiv(seq_len, block_size)
+    kv = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache, _ = mxfp4_indexer_kv_cache(kv, block_size)
+    block_table = torch.arange(cache.shape[0], device="cuda", dtype=torch.int32).view(
+        batch, blocks_per_request
+    )
+    cu_seq_lens = torch.arange(
+        0, num_tokens + 1, seq_len, device="cuda", dtype=torch.int32
+    )
+    packed, scales, _ = quantize_mxfp4(kv)
+    gathered_k = torch.zeros(
+        num_tokens, head_dim // 2, device="cuda", dtype=torch.uint8
+    )
+    gathered_scales = torch.zeros(
+        num_tokens, head_dim // 32, device="cuda", dtype=torch.uint8
+    )
+    ops.cp_gather_indexer_k_quant_cache(
+        cache, gathered_k, gathered_scales, block_table, cu_seq_lens
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(gathered_k, packed, rtol=0, atol=0)
+    torch.testing.assert_close(gathered_scales, scales, rtol=0, atol=0)

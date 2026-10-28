@@ -57,6 +57,20 @@ logger = init_logger(__name__)
 DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
 
 
+def _mxfp4_indexer_model(vllm_config: VllmConfig) -> bool:
+    """Whether this model writes its indexer K cache with an MXFP4 store.
+
+    Only DeepSeek-V4 and V4.1 fuse the K quantize into the store. Every other
+    DSA model inserts through the unfused FP8-only path, so an MXFP4 cache
+    would assert at the first step instead of failing here.
+    """
+    model_config = vllm_config.model_config
+    return model_config is not None and model_config.hf_config.model_type in (
+        "deepseek_v4",
+        "deepseek_v41",
+    )
+
+
 def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
     """Whether the DeepSeek sparse indexer should use the MXFP4 K cache."""
     kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
@@ -72,11 +86,7 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
 
         # Only DeepSeek-V4 and V4.1 are wired to the ROCm MXFP4 cache; other
         # DSA models would silently keep their FP8 one.
-        model_config = vllm_config.model_config
-        if model_config is None or model_config.hf_config.model_type not in (
-            "deepseek_v4",
-            "deepseek_v41",
-        ):
+        if not _mxfp4_indexer_model(vllm_config):
             raise ValueError(
                 "indexer_kv_dtype='mxfp4' on ROCm is only supported for "
                 "DeepSeek-V4 and DeepSeek-V4.1."
@@ -100,6 +110,12 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
             "indexer_kv_dtype='mxfp4' requires a Blackwell GPU whose DeepGEMM "
             "build ships the MXFP4 MQA-logits kernels (sm_10x datacenter, "
             "sm_120, or sm_121); earlier architectures are not supported."
+        )
+    if use_fp4 and not _mxfp4_indexer_model(vllm_config):
+        raise ValueError(
+            "indexer_kv_dtype='mxfp4' is only supported for DeepSeek-V4 and "
+            "DeepSeek-V4.1: their fused K store is the only one that writes "
+            "FP4 indexer pages."
         )
     return use_fp4
 
