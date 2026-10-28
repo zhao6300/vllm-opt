@@ -24,8 +24,73 @@ def _reject_image_placeholder(text: Any) -> None:
             "provide images as image content parts."
         )
 
+def _replace_image_placeholder(text: Any) -> Any:
+    if isinstance(text, str):
+        return text.replace(IMAGE_PLACEHOLDER, "[deepseek_image]")
+    return text
 
 def _normalize_messages(
+    messages: list[ChatCompletionMessageParam],
+) -> list[dict[str, Any]]:
+    # vLLM additions to the reference: Responses API part types, image_pil,
+    # and ValueError (400) instead of the reference's asserts.
+    def replace_image_placeholder(text: Any) -> Any:
+        if isinstance(text, str) and IMAGE_PLACEHOLDER in text:
+            return text.replace(IMAGE_PLACEHOLDER, "[deepseek_image]")
+        return text
+
+    result = [dict(message) for message in copy.deepcopy(messages)]
+    image_idx = 0
+
+    for message in result:
+        image_indices = message["_image_indices"] = []
+        role = message.get("role")
+
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise ValueError(f"Invalid role: {role}")
+
+        if "reasoning" in message:
+            message["reasoning"] = replace_image_placeholder(
+                message["reasoning"]
+            )
+            message["reasoning_content"] = message["reasoning"]
+        elif "reasoning_content" in message:
+            message["reasoning_content"] = replace_image_placeholder(
+                message["reasoning_content"]
+            )
+
+        content = message.get("content")
+
+        if isinstance(content, str):
+            message["content"] = replace_image_placeholder(content)
+
+        elif isinstance(content, list):
+            parts = []
+
+            for block in content:
+                part_type = block.get("type")
+
+                if part_type in ("text", "input_text", "output_text"):
+                    text = replace_image_placeholder(block.get("text", ""))
+                    parts.append(text)
+
+                elif part_type in ("image_url", "input_image", "image_pil"):
+                    parts.append(IMAGE_PLACEHOLDER)
+                    image_indices.append(image_idx)
+                    image_idx += 1
+
+                else:
+                    raise ValueError(
+                        "DeepSeek V4.1 supports text and image content only; "
+                        f"got {part_type!r}"
+                    )
+
+            message["content"] = "\n\n".join(parts)
+
+    return result
+
+
+def _normalize_messages2(
     messages: list[ChatCompletionMessageParam],
 ) -> list[dict[str, Any]]:
     # vLLM additions to the reference: Responses API part types, image_pil,
