@@ -107,3 +107,28 @@ def validate_local_sharing(dependencies: tuple[SharingDependency, ...]) -> None:
             f"{detail}. Keep each sharing group on one stage or explicitly enable "
             "the experimental deepseek_v41_pp_sharing eager path."
         )
+
+
+def get_aux_hidden_state_stages(
+    aux_layer_ids: tuple[int, ...], stage_ranges: list[tuple[int, int]]
+) -> dict[int, int]:
+    """Map each aux hidden state id to the pipeline stage that captures it.
+
+    V4.1 aux id ``L`` is layer ``L``'s attention input, i.e. the output of layer
+    ``L - 1``, so stage ``[start, end)`` captures the ids in ``(start, end]``.
+    Ids captured before the last stage reach the drafter via the PP payload.
+    """
+    num_layers = stage_ranges[-1][1]
+    stages: dict[int, int] = {}
+    for layer_id in aux_layer_ids:
+        if not 0 < layer_id <= num_layers:
+            raise ValueError(
+                f"DeepSeek V4.1 aux hidden state id {layer_id} must be in "
+                f"[1, {num_layers}]"
+            )
+        stages[layer_id] = next(
+            stage
+            for stage, (start, end) in enumerate(stage_ranges)
+            if start < layer_id <= end
+        )
+    return stages

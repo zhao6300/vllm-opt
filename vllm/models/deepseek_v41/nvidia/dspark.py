@@ -19,6 +19,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.kernel import NATIVE_MEGA_MOE_BACKENDS
+from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -63,6 +64,8 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+# The target input embedding in the original and HF-renamed checkpoint layouts.
+_TARGET_EMBED_WEIGHT_NAMES = frozenset({"embed.weight", "model.embed_tokens.weight"})
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -276,7 +279,8 @@ def _insert_context_kv(
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
-    # load_dspark_model always aliases the target's.
+    # load_dspark_model aliases the target's. __init__ sets has_own_embed_tokens
+    # per instance when the target embedding is on another PP stage.
     has_own_embed_tokens = False
     has_own_lm_head = False
     # Full-vocab draft: draft ids are target ids, no remapping needed.
@@ -285,6 +289,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
+        # The drafter runs on the last PP stage. Past the first stage the
+        # target has no input embedding to alias, so load the checkpoint's.
+        pp_group = get_pp_group()
+        self.has_own_embed_tokens = (
+            pp_group.world_size > 1 and not pp_group.is_first_rank
+        )
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
@@ -367,7 +377,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
 
         Non-mtp weights (embed/head/main layers) belong to the target model and
-        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
+        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target,
+        except that past the first PP stage ``embed_tokens`` loads from the
+        checkpoint (``has_own_embed_tokens``).
         """
         first_layer = self.model.layers[0]
         use_native_mega_moe = first_layer.ffn.use_native_mega_moe
@@ -407,6 +419,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         loaded_confidence_head = False
 
         for name, loaded_weight in weights:
+            if self.has_own_embed_tokens and name in _TARGET_EMBED_WEIGHT_NAMES:
+                param = params_dict["model.embed_tokens.weight"]
+                param.weight_loader(param, loaded_weight)
+                loaded_params.add("model.embed_tokens.weight")
+                continue
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue

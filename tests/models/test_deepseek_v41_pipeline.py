@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v41.common.pipeline import (
+    get_aux_hidden_state_stages,
     get_sharing_dependencies,
     validate_local_sharing,
 )
@@ -126,3 +127,32 @@ def test_candidate_source_must_publish_indices():
     config.candidate_source_layer_id = 21
     with pytest.raises(ValueError, match="candidate source must be an index source"):
         get_sharing_dependencies(config, [(0, 40)])
+
+
+PP2_RANGES = [(0, 20), (20, 40)]
+
+
+def test_dspark_target_layers_are_captured_on_the_last_pp2_stage():
+    # dspark_target_layer_ids=[37, 38, 39]: no PP relay needed.
+    assert get_aux_hidden_state_stages((37, 38, 39), PP2_RANGES) == {
+        37: 1,
+        38: 1,
+        39: 1,
+    }
+
+
+def test_stage_end_aux_belongs_to_the_stage_that_ends_there():
+    # Aux id 20 is layer 19's output, captured at stage 0's end and relayed;
+    # aux id 40 is the final layer output on the last stage.
+    assert get_aux_hidden_state_stages((2, 20, 21, 40), PP2_RANGES) == {
+        2: 0,
+        20: 0,
+        21: 1,
+        40: 1,
+    }
+
+
+@pytest.mark.parametrize("layer_id", [0, -1, 41])
+def test_aux_ids_outside_the_backbone_are_rejected(layer_id):
+    with pytest.raises(ValueError, match="aux hidden state id"):
+        get_aux_hidden_state_stages((layer_id,), PP2_RANGES)

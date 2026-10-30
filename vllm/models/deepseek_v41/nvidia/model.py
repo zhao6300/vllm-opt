@@ -109,7 +109,11 @@ from ..common.engram import (
     gather_engram_hashes,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
-from ..common.pipeline import get_sharing_dependencies, validate_local_sharing
+from ..common.pipeline import (
+    get_aux_hidden_state_stages,
+    get_sharing_dependencies,
+    validate_local_sharing,
+)
 from ..common.pipeline_sharing import PipelineSharing
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
@@ -700,6 +704,26 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # Aux hidden states (DSpark/EAGLE-3 target layers) captured on an upstream
+    # PP stage travel in the PP payload; the last stage prepends them to its own.
+    supports_aux_hidden_states_over_pp = True
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        if len(self.stage_ranges) > 1:
+            stages = get_aux_hidden_state_stages(
+                self.aux_hidden_state_layers, self.stage_ranges
+            )
+            last_stage = len(self.stage_ranges) - 1
+            relayed = [i for i, stage in stages.items() if stage != last_stage]
+            logger.info_once(
+                "DeepSeek V4.1 aux hidden states %s are captured on PP stages %s; "
+                "relayed to the last stage over PP: %s.",
+                list(stages),
+                list(stages.values()),
+                relayed or "none",
+            )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -711,6 +735,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for rank in range(pp_size)
         ]
         self.sharing_dependencies = get_sharing_dependencies(config, stage_ranges)
+        self.stage_ranges = stage_ranges
         additional_config = vllm_config.additional_config
         sharing_enabled = isinstance(additional_config, dict) and additional_config.get(
             "deepseek_v41_pp_sharing", False
@@ -1149,9 +1174,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         ] + late_aux
 
         if not get_pp_group().is_last_rank:
+            # Aux id L is layer L's attention input, i.e. layer L-1's output,
+            # so the stage owning layer L-1 captures it (the stage-end aux in
+            # _collapse). Middle stages relay upstream slots (PPHandler).
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                {
+                    "hidden_states": hidden_states,
+                    "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
+        aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            + aux_hidden_states
+        )
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -1319,6 +1355,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             reason = (
                 "the pipeline stage holding the last KV source layer must also "
                 "hold every layer after it"
+            )
+        elif cut > 0 and self.start_layer == cut:
+            # Replay starts mid-stream at the cut: it needs layer cut-1's
+            # unfinalized mHC state (residual/post/res mix), which the PP
+            # payload (hidden_states, pre_mix) does not carry.
+            reason = (
+                "the pipeline stage starts at the last KV source layer, so the "
+                "previous layer's mHC state is on another stage"
             )
         elif self.use_sequence_parallel or parallel_config.use_ubatching:
             reason = (

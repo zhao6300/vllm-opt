@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
     get_pcp_group,
     get_pp_group,
     get_tp_group,
+    get_world_group,
     resume_device_comms,
     suspend_device_comms,
 )
@@ -385,6 +386,47 @@ class Worker(WorkerBase):
         tp = get_tp_group().rank_in_group
         return f"dp{dp}:pp{pp}:pcp{pcp}:tp{tp}:"
 
+    def parallel_topology(self) -> dict[str, Any]:
+        """This worker's place in the DP/PP/TP/EP groups (global ranks)."""
+        from vllm.distributed import parallel_state
+
+        pp, tp = get_pp_group(), get_tp_group()
+        ep = parallel_state._EP  # Only created for MoE models.
+        try:
+            physical_gpu: int | str = current_platform.device_id_to_physical_device_id(
+                self.local_rank
+            )
+        except (IndexError, ValueError):
+            physical_gpu = "unknown"
+        return {
+            "global_rank": get_world_group().rank,
+            "dp_rank": self.parallel_config.data_parallel_rank,
+            "pp_rank": pp.rank_in_group,
+            "pp_ranks": list(pp.ranks),
+            "tp_rank": tp.rank_in_group,
+            "ep_rank": None if ep is None else ep.rank_in_group,
+            "ep_ranks": None if ep is None else list(ep.ranks),
+            "local_rank": self.local_rank,
+            "physical_gpu": physical_gpu,
+            "device": str(self.device),
+        }
+
+    def _log_parallel_topology(self) -> None:
+        topology = self.parallel_topology()
+        logger.info(
+            "Parallel topology: global_rank=%d dp_rank=%d pp_rank=%d pp_ranks=%s "
+            "tp_rank=%d ep_rank=%s ep_ranks=%s physical_gpu=%s device=%s",
+            topology["global_rank"],
+            topology["dp_rank"],
+            topology["pp_rank"],
+            topology["pp_ranks"],
+            topology["tp_rank"],
+            topology["ep_rank"],
+            topology["ep_ranks"],
+            topology["physical_gpu"],
+            topology["device"],
+        )
+
     def compute_weight_checksums(self) -> dict[str, str]:
         prefix = self._weight_checksum_prefix()
         digests = compute_tensor_digests(self.model_runner.get_model())
@@ -511,6 +553,7 @@ class Worker(WorkerBase):
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
+            self._log_parallel_topology()
             warn_if_flashinfer_kernels_missing()
 
             # Set random seed.
