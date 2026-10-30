@@ -21,6 +21,10 @@ class AsyncScheduler(Scheduler):
         self.decode_stagger = self.pp_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             self.decode_stagger = 1
+        # Keep the decode microbatches the same size (VLLM_PP_MICROBATCH_BALANCE).
+        self.balance_decode_microbatches = (
+            self.decode_stagger > 1 and envs.VLLM_PP_MICROBATCH_BALANCE
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -29,6 +33,7 @@ class AsyncScheduler(Scheduler):
         self._spec_token_placeholders = [
             -1
         ] * scheduler_output.num_spec_tokens_to_schedule
+        staggered: list[Request] = []
         for req_id in scheduler_output.num_scheduled_tokens:
             request = self.requests[req_id]
             if request.is_prefill_chunk:
@@ -55,6 +60,47 @@ class AsyncScheduler(Scheduler):
                 request.next_decode_eligible_step = (
                     self.current_step + self.decode_stagger
                 )
+                staggered.append(request)
+
+        if self.use_v2_model_runner and self.balance_decode_microbatches:
+            self._balance_decode_microbatches(staggered)
+
+    def _balance_decode_microbatches(self, scheduled: list[Request]) -> None:
+        """Move decodes from this step's microbatch to the smallest one.
+
+        With PP, a request decodes every ``decode_stagger`` steps, so the
+        decoding requests fall into ``decode_stagger`` microbatches by the step
+        they are next eligible in, and the stages work on them in turn. A burst
+        of requests that start decoding together stays in one microbatch, and
+        the other steps carry nearly nothing. This moves the lowest-priority
+        requests just scheduled (``scheduled``, in scheduling order) into the
+        smallest microbatch until the sizes differ by at most one.
+
+        A moved request waits extra steps once, never fewer than
+        ``decode_stagger``: the worker-side sampled-token ring hands its
+        tokens back ``decode_stagger`` steps later and keeps them, so a longer
+        gap stays valid.
+        """
+        stagger = self.decode_stagger
+        base = self.current_step + 1  # The next step's microbatch is bucket 0.
+        sizes = [0] * stagger
+        for request in self.running:
+            if request.is_prefill_chunk or request.is_finished():
+                continue
+            step = max(request.next_decode_eligible_step, base)
+            sizes[(step - base) % stagger] += 1
+        # Requests scheduled now are next eligible at current_step + stagger.
+        this_bucket = stagger - 1
+        movable = list(scheduled)
+        while movable:
+            target = min(range(stagger), key=lambda b: (sizes[b], b))
+            if sizes[this_bucket] - sizes[target] <= 1:
+                break
+            request = movable.pop()
+            # The first step of bucket `target` at least `stagger` steps away.
+            request.next_decode_eligible_step = base + target + stagger
+            sizes[this_bucket] -= 1
+            sizes[target] += 1
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False

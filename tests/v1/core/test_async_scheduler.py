@@ -810,3 +810,76 @@ def test_resumable_request_handoff():
 
     engine._process_oldest_step()
     assert len(request.output_token_ids) == 1
+
+
+def _decode_microbatch_sizes(balance: bool, num_requests: int, num_steps: int):
+    """Decode requests per step for a burst that starts decoding together,
+    with PP=2 microbatching on the V2 runner (pp_size + 1 batches in flight).
+    """
+    scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
+    scheduler.pp_size = 2
+    scheduler.use_pp = True
+    scheduler.decode_stagger = 2
+    scheduler.balance_decode_microbatches = balance
+    for request in create_requests(num_requests=num_requests, max_tokens=64):
+        scheduler.add_request(request)
+
+    in_flight: deque[SchedulerOutput] = deque()
+    sizes: list[int] = []
+    for _ in range(num_steps):
+        output = scheduler.schedule()
+        sizes.append(
+            sum(
+                1
+                for req_id in output.num_scheduled_tokens
+                if req_id not in {r.req_id for r in output.scheduled_new_reqs}
+            )
+        )
+        in_flight.append(output)
+        if len(in_flight) == 3:
+            done = in_flight.popleft()
+            scheduler.update_from_output(done, _make_model_runner_output(done))
+    return sizes
+
+
+def test_pp_decode_microbatches_stay_lopsided_without_balancing():
+    # All 8 prefill in step 1 and then decode every other step together.
+    sizes = _decode_microbatch_sizes(balance=False, num_requests=8, num_steps=9)
+    assert sizes[1:] == [0, 8, 0, 8, 0, 8, 0, 8]
+
+
+def test_pp_decode_microbatch_balancing_splits_a_burst():
+    sizes = _decode_microbatch_sizes(balance=True, num_requests=8, num_steps=9)
+    # Half of the burst is moved one step later, once; from then on every
+    # step carries one microbatch of 4.
+    assert sizes[1:] == [0, 4, 4, 4, 4, 4, 4, 4]
+
+
+def test_pp_decode_microbatch_balancing_keeps_the_pp_cadence():
+    """No request decodes again sooner than decode_stagger steps."""
+    scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
+    scheduler.pp_size = scheduler.decode_stagger = 2
+    scheduler.use_pp = True
+    scheduler.balance_decode_microbatches = True
+    for request in create_requests(num_requests=7, max_tokens=64):
+        scheduler.add_request(request)
+
+    last_step: dict[str, int] = {}
+    in_flight: deque[SchedulerOutput] = deque()
+    for step in range(1, 13):
+        output = scheduler.schedule()
+        new_ids = {r.req_id for r in output.scheduled_new_reqs}
+        for req_id in output.num_scheduled_tokens:
+            if req_id in new_ids:
+                continue
+            if req_id in last_step:
+                assert step - last_step[req_id] >= 2, (req_id, step)
+            last_step[req_id] = step
+        in_flight.append(output)
+        if len(in_flight) == 3:
+            done = in_flight.popleft()
+            scheduler.update_from_output(done, _make_model_runner_output(done))
+    counts = [0, 0]
+    for req_id, step in last_step.items():
+        counts[step % 2] += 1
+    assert sorted(counts) == [3, 4]

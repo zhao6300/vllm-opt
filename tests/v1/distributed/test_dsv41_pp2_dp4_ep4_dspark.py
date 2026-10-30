@@ -227,6 +227,28 @@ async def test_sm120_kv_cache_answers():
 
 
 @pytest.mark.asyncio
+async def test_pp_send_buffers_and_microbatch_balance_keep_outputs(monkeypatch):
+    """Phase 3/4 options change when sends wait and which step a request
+    decodes in, never what it computes: greedy outputs must match."""
+    max_tokens = 64
+    outputs = {}
+    for options in (False, True):
+        monkeypatch.setenv("VLLM_PP_SEND_BUFFERS", "2" if options else "0")
+        monkeypatch.setenv("VLLM_PP_MICROBATCH_BALANCE", "1" if options else "0")
+        monkeypatch.setenv("VLLM_PP_STEP_PROFILE_INTERVAL", "50" if options else "0")
+        with ExitStack() as after:
+            engine = AsyncLLM.from_engine_args(_engine_args())
+            after.callback(engine.shutdown)
+            # A burst, so balancing has a lopsided microbatch to split.
+            outputs[options] = await _generate_all(
+                engine, f"opts{int(options)}", max_tokens
+            )
+    for base, opt in zip(outputs[False], outputs[True]):
+        ratio = _token_match_ratio(base, opt)
+        assert ratio >= MIN_TOKEN_MATCH_RATIO, (ratio, base, opt)
+
+
+@pytest.mark.asyncio
 async def test_dspark_matches_target_only_greedy():
     max_tokens = 64
     outputs = {}

@@ -143,6 +143,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_step_profiler import pp_step_span
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -2279,7 +2280,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
-            with use_workspace_lane(self._draft_workspace_lane):
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                pp_step_span("draft"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

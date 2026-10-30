@@ -28,6 +28,14 @@ MOE_BACKEND=${MOE_BACKEND:-auto}
 # Indexer K cache: "auto" is FP8 for the DeepSeek indexer. mxfp4 is opt-in on
 # sm_12x (DeepGEMM >= 2.8.1) and still lacks long-context accuracy evals.
 INDEXER_KV_DTYPE=${INDEXER_KV_DTYPE:-auto}
+# Phase 3: PP send buffers on stage 0. 0 keeps the per-step send wait; 2
+# double-buffers the 19 -> 20 activations (2 x max_num_batched_tokens rows of
+# hidden_states + pre_mix on each stage-0 GPU).
+export VLLM_PP_SEND_BUFFERS=${PP_SEND_BUFFERS:-0}
+# Phase 4: keep the two decode microbatches (alternating steps) equal in size.
+export VLLM_PP_MICROBATCH_BALANCE=${PP_MICROBATCH_BALANCE:-0}
+# Phase 2: per-rank step timings every N steps (0 = off).
+export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-0}
 
 # The 40 layers split 20/20 by default; pin it so the cut stays on the
 # layer 20 KV/index/candidate source boundary.

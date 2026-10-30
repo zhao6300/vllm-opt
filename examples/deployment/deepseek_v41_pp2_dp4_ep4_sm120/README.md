@@ -111,16 +111,96 @@ attention, KV and DSpark settings and adds PP=2 and EP.
    - Checks answers that catch SM120 KV addressing errors, which full-length
      outputs alone would hide: `17 * 23 = 391`, plus needle recall in a short
      prompt and in a ~20k-token prompt that spans several prefill chunks.
-5. **Phase 2, measure:** `MODEL=... bash bench_matrix.sh` records TTFT, TPOT,
-   throughput and DSpark acceptance for EP4 with and without DSpark. Set
-   `PROFILE_DIR=/tmp/traces` to also capture per-rank torch traces. Read stage 0 /
-   stage 1 forward time, PP send/recv, EP all-to-all and DSpark draft time from those traces.
+5. **Phase 2, measure:** `MODEL=... bash bench_matrix.sh` (see below).
 
-Phases 3 (double-buffered PP sends) and 4 (multi-microbatch PP overlap) are
-not implemented. Start them only if the phase 2 traces show PP communication or stage
-idle time as the bottleneck. Today the worker waits for the previous step's PP
-sends at the start of the next step (`Worker.execute_model`), and DBO is
-rejected with PP and with speculative decoding (`vllm/config/vllm.py`).
+## Phase 2: measurement
+
+`bench_matrix.sh` runs these configurations, the plan's C, D and E:
+
+| Name | DSpark | `PP_SEND_BUFFERS` | `PP_MICROBATCH_BALANCE` |
+|---|---|---|---|
+| `C_ep1_dspark0` | off | 0 | 0 |
+| `D_ep1_dspark1` | on | 0 | 0 |
+| `E1_dspark1_sendbuf2` | on | 2 | 0 |
+| `E2_dspark1_balance` | on | 0 | 1 |
+| `E3_dspark1_sendbuf2_balance` | on | 2 | 1 |
+
+For each configuration, `vllm bench serve` runs at concurrency 1/8/32/64 with
+2k-token inputs, plus a 32k-token prefill run. Use `ONLY="D_ep1_dspark1 ..."`
+to run a subset. At the end, `summarize_results.py` prints:
+- a table of TTFT, p99 TTFT, TPOT, p99 TPOT, output and total tok/s, and
+  DSpark acceptance rate and length;
+- the last `PP step profile` line of every rank.
+
+**Step profile** (`VLLM_PP_STEP_PROFILE_INTERVAL=N`, on by default in the
+matrix). Every N steps each worker logs CUDA-event averages:
+`step` (GPU cadence), `execute` and `busy` (execute / step),
+`recv_wait`, `send_wait`, `sample` and `draft`.
+- A low `busy` on stage 1 with a high `recv_wait` means stage 0 starves it.
+- A high `send_wait` on stage 0 means stage 0 stalls on the 19 -> 20 send.
+- `draft` is the DSpark proposer on stage 1.
+
+The host never synchronizes; events are read once they complete.
+
+**Kernel breakdown.** With `PROFILE_DIR=/tmp/traces` the matrix also captures
+torch profiler traces, and `analyze_traces.py` splits each rank's GPU time
+into these categories:
+- PP P2P (NCCL SendRecv)
+- EP all-to-all (NCCL AllGather/ReduceScatter of `allgather_reducescatter`)
+- token/draft relay (NCCL Broadcast)
+- indexer, attention, MoE, mHC, GEMM
+
+It also reports the GPU busy fraction. This is how to get the EP all-to-all
+and P2P shares: under FULL CUDA graphs, Python-level hooks around them never run.
+
+## Phase 3: PP send buffers (`VLLM_PP_SEND_BUFFERS=N`, `PP_SEND_BUFFERS` in serve.sh)
+
+By default, stage 0 waits at the top of every step for its previous send of
+`hidden_states` + `pre_mix`. Its outputs are CUDA-graph static buffers, so the
+next replay would otherwise overwrite data that is still being sent. With N ≥ 1:
+- the worker (`vllm/v1/worker/gpu/pp_send_ring.py`) copies each step's payload
+  into one of N buffers, preallocated at `max_num_batched_tokens` rows before
+  memory profiling, so the KV cache budget accounts for them;
+- each buffer is sent from its own copy, and only reusing a buffer waits for
+  the send that last used it.
+
+Stage 0 can then run up to N steps ahead of stage 1's receives. The waits are
+`handle.wait()` on the NCCL work, which holds the GPU stream and never the CPU.
+The ring is skipped when experimental pipeline-sharing payloads are on.
+
+## Phase 4: multi-microbatch PP overlap
+
+The step-level pipeline was already in place, and this deployment uses it as
+is:
+- With the V2 runner and async scheduling, the engine keeps `pp_size + 1 = 3`
+  batches in flight (`max_concurrent_batches`, `EngineCore.step_with_batch_queue`).
+- The scheduler lets each request decode only every `pp_size` steps
+  (`AsyncScheduler.decode_stagger`), so consecutive steps carry disjoint
+  request sets: microbatch A and microbatch B.
+- Stage 0 runs B while stage 1 runs A.
+- Sampled tokens and DSpark drafts return to stage 0 through `PPHandler`'s
+  ring on a separate stream and communicator, `pp_size` steps later.
+- KV slots, DP token sync and EP all-to-all are per step, in the same step
+  order on every rank.
+
+What was missing is that the two microbatches stay as unequal as they started.
+A burst of requests that finish prefill in the same step all land in one
+microbatch, so every other step reaches the stages nearly empty and each stage
+idles about half the time. `VLLM_PP_MICROBATCH_BALANCE=1`
+(`PP_MICROBATCH_BALANCE` in serve.sh) fixes this:
+- after each schedule, it moves the lowest-priority decodes just scheduled into
+  the smaller microbatch, until the sizes differ by at most one;
+- a moved request waits one extra step once;
+- no request decodes sooner than `pp_size` steps after its last decode, which
+  is the gap the token ring requires.
+
+DBO is a different mechanism: it splits one step into two ubatches to overlap
+the EP all-to-all on one rank. It stays rejected with PP and with
+speculative decoding (`vllm/config/vllm.py`) and is not used here.
+
+Leave both options off for the first deployment, then compare D against
+E1, E2 and E3. `test_pp_send_buffers_and_microbatch_balance_keep_outputs`
+checks that enabling them keeps the greedy outputs.
 
 ## Code changes behind this deployment
 
@@ -136,3 +216,18 @@ rejected with PP and with speculative decoding (`vllm/config/vllm.py`).
   `parallel_topology()` method reachable through `collective_rpc`.
 - `vllm/models/deepseek_v41/common/pipeline.py`:
   `get_aux_hidden_state_stages()` maps each aux id to the stage that captures it.
+- `vllm/v1/worker/gpu/pp_step_profiler.py`: the phase 2 step profiler. The
+  worker and the V2 runner record spans for receive, execute, send, sample and
+  draft.
+- `vllm/v1/worker/gpu/pp_send_ring.py` and `Worker.execute_model`: the phase 3
+  send buffers.
+- `vllm/v1/core/sched/async_scheduler.py`: the phase 4 microbatch balancing.
+- `vllm/envs.py`: `VLLM_PP_STEP_PROFILE_INTERVAL`, `VLLM_PP_SEND_BUFFERS` and
+  `VLLM_PP_MICROBATCH_BALANCE`. All default to off and are left out of the
+  compile cache key.
+
+CPU unit tests (no GPU needed):
+`tests/v1/worker/test_pp_send_ring.py`, `tests/v1/worker/test_pp_step_profiler.py`,
+`tests/v1/worker/test_gpu_worker.py -k "pp_send or send_ring"`,
+`tests/v1/core/test_async_scheduler.py -k microbatch`,
+`tests/models/test_deepseek_v41_pipeline.py`.

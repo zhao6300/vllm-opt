@@ -114,6 +114,12 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
 from .gpu.cudagraph_utils import has_compiled_submodule
+from .gpu.pp_send_ring import PPSendRing
+from .gpu.pp_step_profiler import (
+    get_pp_step_profiler,
+    init_pp_step_profiler,
+    pp_step_span,
+)
 from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
@@ -195,6 +201,45 @@ class AsyncIntermediateTensors(IntermediateTensors):
         return object.__getattribute__(self, name)
 
 
+def _make_pp_send_ring(worker: "Worker") -> PPSendRing | None:
+    """Send buffers for a non-last PP rank's output (VLLM_PP_SEND_BUFFERS)."""
+    num_slots = envs.VLLM_PP_SEND_BUFFERS
+    if num_slots <= 0 or worker.parallel_config.pipeline_parallel_size == 1:
+        return None
+    if get_pp_group().is_last_rank:
+        return None
+    runner = worker.model_runner
+    if getattr(runner, "pipeline_payload_keys", ()):
+        # Pipeline-sharing payloads are model-owned block state, not
+        # token-major slices; keep the per-step wait for them.
+        logger.warning_once(
+            "VLLM_PP_SEND_BUFFERS is ignored with pipeline-sharing payloads."
+        )
+        return None
+    # The runner's own model object carries the aux-relay slots that
+    # reserve_aux_intermediate_tensor_slots patches in.
+    model = getattr(runner, "model", None) or runner.get_model()
+    max_num_tokens = runner.max_num_tokens
+    dtype = worker.model_config.dtype
+    device = worker.device
+
+    def make_buffers() -> dict[str, torch.Tensor]:
+        # The shapes the next rank receives into, aux relay slots included.
+        empty = model.make_empty_intermediate_tensors(
+            batch_size=max_num_tokens, dtype=dtype, device=device
+        )
+        return dict(empty.tensors)
+
+    ring = PPSendRing(num_slots, make_buffers)
+    logger.info(
+        "PP send ring: %d buffers of %.1f MiB on PP rank %d.",
+        num_slots,
+        ring.slot_nbytes / 2**20,
+        get_pp_group().rank_in_group,
+    )
+    return ring
+
+
 class Worker(WorkerBase):
     def __init__(
         self,
@@ -246,6 +291,9 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        # Send buffers for PP intermediate tensors (VLLM_PP_SEND_BUFFERS);
+        # built in load_model on non-last PP ranks, else sends wait per step.
+        self._pp_send_ring: PPSendRing | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -554,6 +602,11 @@ class Worker(WorkerBase):
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
             self._log_parallel_topology()
+            init_pp_step_profiler(
+                envs.VLLM_PP_STEP_PROFILE_INTERVAL,
+                f"pp_rank={get_pp_group().rank_in_group} "
+                f"dp_rank={self.parallel_config.data_parallel_rank}",
+            )
             warn_if_flashinfer_kernels_missing()
 
             # Set random seed.
@@ -642,6 +695,11 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+
+        # Allocated before memory profiling so the KV cache budget sees them.
+        self._pp_send_ring = (
+            _make_pp_send_ring(self) if envs.VLLM_PP_SEND_BUFFERS > 0 else None
+        )
 
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -1364,18 +1422,25 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with pp_step_span("sample"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     @with_gpu_sync_check
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        profiler = get_pp_step_profiler()
+        if profiler is not None and not torch.cuda.is_current_stream_capturing():
+            profiler.begin_step()
+
         # Wait for the previous step's sends so this forward pass cannot
-        # overwrite buffers they are still reading.
+        # overwrite buffers they are still reading. With a send ring the
+        # payload was copied out, and only slot reuse waits (see below).
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with pp_step_span("send_wait"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1399,8 +1464,13 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+            if profiler is not None:
+                # Time the receive on its own; the runner would otherwise
+                # wait lazily inside execute_model.
+                with pp_step_span("recv_wait"):
+                    intermediate_tensors.wait_for_comm()
 
-        with self.annotate_profile(scheduler_output):
+        with self.annotate_profile(scheduler_output), pp_step_span("execute"):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
@@ -1423,14 +1493,22 @@ class Worker(WorkerBase):
         )
 
         # Non-blocking send of the intermediate tensors. The metadata handle
-        # is reaped lazily by the GroupCoordinator; the device handles are
-        # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
-        self._pp_send_work = handles[1:]
+        # is reaped lazily by the GroupCoordinator.
+        def send(tensors: dict[str, Any]) -> list[Handle]:
+            return get_pp_group().isend_tensor_dict(
+                tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
+
+        if self._pp_send_ring is not None:
+            # The payload is copied into a ring slot, so the next forward may
+            # overwrite its own outputs at once; only reusing a slot waits.
+            with pp_step_span("send_wait"):
+                self._pp_send_ring.send(output.tensors, send)
+        else:
+            # The device handles are waited at the top of the next step.
+            self._pp_send_work = send(output.tensors)[1:]
 
         if self.use_v2_model_runner and self.model_runner.is_pooling_model:
             return self.model_runner.pool()  # type: ignore

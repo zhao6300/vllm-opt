@@ -63,6 +63,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
+    VLLM_PP_MICROBATCH_BALANCE: bool = False
+    VLLM_PP_SEND_BUFFERS: int = 0
+    VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
@@ -926,6 +929,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decide to disable it when they needed.
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(
         int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
+    ),
+    # V2 runner + PP + async scheduling: keep the decode microbatches (the
+    # requests decoded in alternating steps) the same size. A burst of requests
+    # that start decoding in one step otherwise stays in one microbatch, and
+    # every other step reaches the stages nearly empty.
+    "VLLM_PP_MICROBATCH_BALANCE": lambda: bool(
+        int(os.getenv("VLLM_PP_MICROBATCH_BALANCE", "0"))
+    ),
+    # Number of send buffers per non-last PP rank. 0 waits for the previous
+    # step's intermediate-tensor send before each forward (default). N >= 1
+    # copies each step's payload into one of N preallocated buffers and waits
+    # only for the send that last used that buffer, so a stage can run up to
+    # N steps ahead of its successor's receives.
+    "VLLM_PP_SEND_BUFFERS": lambda: int(os.getenv("VLLM_PP_SEND_BUFFERS", "0")),
+    # Log per-rank PP step timings (GPU time from CUDA events: step cadence,
+    # execute, receive and send waits, sampling, drafting) averaged over this
+    # many steps. 0 disables it.
+    "VLLM_PP_STEP_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_PP_STEP_PROFILE_INTERVAL", "0")
     ),
     # When True, GroupCoordinator constructs its CPU/device subgroups via
     # ``torch.distributed.split_group(backend=...)``
@@ -2370,6 +2392,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # PP scheduling, send buffering and step timing run outside the model.
+        "VLLM_PP_MICROBATCH_BALANCE",
+        "VLLM_PP_SEND_BUFFERS",
+        "VLLM_PP_STEP_PROFILE_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
