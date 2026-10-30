@@ -15,7 +15,21 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MODEL=${MODEL:?set MODEL}
 PORT=${PORT:-8000}
 RESULT_DIR=${RESULT_DIR:-$HERE/results/$(date +%Y%m%d-%H%M%S)}
-CONCURRENCIES=${CONCURRENCIES:-"1 8 32 64"}
+# Total concurrency across the 4 DP ranks. The sweep crosses the points where
+# behaviour is expected to change: ~80 (about 20 requests per rank, where the
+# SM120 FlashInfer decode plan's 64-row limit is passed with 6 tokens per
+# request) and ~680 (about 170 per rank, the default CUDA graph ceiling).
+CONCURRENCIES=${CONCURRENCIES:-"1 8 16 32 64 128 256 512 1024"}
+# Server limits for the sweep, so admission does not cap it first:
+# MAX_NUM_SEQS is per DP rank (x4 total). The capture size covers 1024 tokens
+# per microbatch (~170 requests with 6 tokens each).
+export MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
+export MAX_CUDAGRAPH_CAPTURE_SIZE=${MAX_CUDAGRAPH_CAPTURE_SIZE:-1024}
+# Requests per run: enough to reach steady state without hours at c=1024.
+PROMPTS_PER_CONCURRENCY=${PROMPTS_PER_CONCURRENCY:-4}
+MIN_PROMPTS=${MIN_PROMPTS:-32}
+# Passed to summarize_results.py: highest concurrency whose mean TPOT fits.
+TPOT_SLO_MS=${TPOT_SLO_MS:-50}
 INPUT_LEN=${INPUT_LEN:-2048}
 OUTPUT_LEN=${OUTPUT_LEN:-512}
 LONG_INPUT_LEN=${LONG_INPUT_LEN:-32768}
@@ -63,13 +77,18 @@ wait_ready() {
     return 1
 }
 
+num_prompts() {
+    local n=$(($1 * PROMPTS_PER_CONCURRENCY))
+    echo $((n > MIN_PROMPTS ? n : MIN_PROMPTS))
+}
+
 bench() {
     local name=$1 concurrency=$2 input_len=$3 extra=("${@:4}")
     vllm bench serve \
         --model "$MODEL" --port "$PORT" \
         --dataset-name random \
         --random-input-len "$input_len" --random-output-len "$OUTPUT_LEN" \
-        --num-prompts $((concurrency * 8)) --max-concurrency "$concurrency" \
+        --num-prompts "$(num_prompts "$concurrency")" --max-concurrency "$concurrency" \
         --ignore-eos \
         --percentile-metrics ttft,tpot,itl,e2el \
         --save-result --result-dir "$RESULT_DIR" \
@@ -102,7 +121,7 @@ for config in "${CONFIGS[@]}"; do
 done
 
 echo "Results in $RESULT_DIR"
-python "$HERE/summarize_results.py" "$RESULT_DIR" || true
+python "$HERE/summarize_results.py" "$RESULT_DIR" --tpot-slo-ms "$TPOT_SLO_MS" || true
 if [ -n "${PROFILE_DIR:-}" ]; then
     python "$HERE/analyze_traces.py" "$PROFILE_DIR" || true
 fi

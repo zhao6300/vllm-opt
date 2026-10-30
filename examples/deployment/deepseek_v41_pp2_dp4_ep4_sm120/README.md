@@ -132,6 +132,14 @@ to run a subset. At the end, `summarize_results.py` prints:
   DSpark acceptance rate and length;
 - the last `PP step profile` line of every rank.
 
+**Concurrency sweep.** `CONCURRENCIES` is the total concurrency across the 4 DP
+ranks. The default is `1 8 16 32 64 128 256 512 1024`. The matrix raises the
+server limits so that admission does not cap the sweep first:
+`MAX_NUM_SEQS=256` per rank (1024 total) and `MAX_CUDAGRAPH_CAPTURE_SIZE=1024`.
+With `TPOT_SLO_MS` (default 50), the summary reports per configuration the
+highest concurrency whose mean TPOT fits, plus the peak output throughput and
+the concurrency where it occurs.
+
 **Step profile** (`VLLM_PP_STEP_PROFILE_INTERVAL=N`, on by default in the
 matrix). Every N steps each worker logs CUDA-event averages:
 `step` (GPU cadence), `execute` and `busy` (execute / step),
@@ -152,6 +160,26 @@ into these categories:
 
 It also reports the GPU busy fraction. This is how to get the EP all-to-all
 and P2P shares: under FULL CUDA graphs, Python-level hooks around them never run.
+
+## Maximum concurrency
+
+`max_num_seqs` is per DP engine, so total concurrency is 4 × the per-rank
+value. Per DP rank, the limits are, in the order they usually bind:
+
+| Limit | Per DP rank | Source |
+|---|---|---|
+| TPOT target | measured: the knee of the sweep | each request decodes every 2 steps, so TPOT ≈ 2 × step time |
+| SM120 decode plan | about 20 requests (10 per microbatch × 6 tokens = 64 rows) | `_FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64`; wider steps use FlashInfer's prefill plan. A possible step change to look for in the sweep |
+| CUDA graph coverage | about 170 requests with the default 512-token ceiling | `min(max_num_seqs × 6 × 2, 512)` on non-datacenter Blackwell; larger decode steps run eager. Raise with `MAX_CUDAGRAPH_CAPTURE_SIZE` |
+| `MAX_NUM_SEQS` | 64 in `serve.sh`, 256 in the matrix | configuration |
+| KV cache | ~4000 at 8k context, ~350 at 128k, ~45 at 1M (estimate) | stage 0 holds ~630 B/token of compressed KV + indexer K (FP8) and ~2 MB of SWA per request; stage 1 ~420 B/token + ~2.3 MB |
+| Token budget | ~2700 (8192 × 2 microbatches / 6 tokens) | `max_num_batched_tokens` |
+
+The KV numbers assume ~30 GiB of KV per GPU; the startup log's
+`GPU KV cache size` and `Maximum concurrency for N tokens per request` lines
+are authoritative. Set `MAX_NUM_SEQS` to the sweep's TPOT-SLO concurrency
+divided by 4. If that lands above ~170 per rank, also raise
+`MAX_CUDAGRAPH_CAPTURE_SIZE` to cover `requests per microbatch × 6` tokens.
 
 ## Phase 3: PP send buffers (`VLLM_PP_SEND_BUFFERS=N`, `PP_SEND_BUFFERS` in serve.sh)
 

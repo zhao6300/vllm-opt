@@ -18,8 +18,15 @@ EP=${EP:-1}
 DSPARK=${DSPARK:-1}
 ASYNC=${ASYNC:-1}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+# Per DP rank: the server admits up to 4 x MAX_NUM_SEQS concurrent requests.
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+# Largest decode step (tokens) replayed as a CUDA graph; larger steps run
+# eager. vLLM's default on SM120 is min(MAX_NUM_SEQS x 6 x 2, 512): with five
+# DSpark drafts and two PP microbatches that covers ~85 requests per
+# microbatch (~170 per DP rank). Raise it for higher concurrency, at the cost
+# of graph memory and capture time. Empty keeps vLLM's default.
+MAX_CUDAGRAPH_CAPTURE_SIZE=${MAX_CUDAGRAPH_CAPTURE_SIZE:-}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
 # MXFP4 routed experts: "auto" resolves to DEEPGEMM_MXFP4 on SM120 when
 # DeepGEMM is installed. Set MOE_BACKEND=marlin if that kernel fails its
@@ -72,6 +79,9 @@ args=(
 )
 if [ "$EP" = 1 ]; then
     args+=(--enable-expert-parallel)
+fi
+if [ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; then
+    args+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")
 fi
 if [ "$DSPARK" = 1 ]; then
     # dspark_block_size=5, target layers 37/38/39, 128 draft experts (top 3)
