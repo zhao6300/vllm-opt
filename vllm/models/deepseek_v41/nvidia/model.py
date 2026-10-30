@@ -112,6 +112,7 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 from ..common.pipeline import (
     get_aux_hidden_state_stages,
     get_sharing_dependencies,
+    stage_entry_mhc_state,
     validate_local_sharing,
 )
 from ..common.pipeline_sharing import PipelineSharing
@@ -1131,19 +1132,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             pre_mix = intermediate_tensors["pre_mix"]
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        if self.decoder_replay_start == self.start_layer:
+            # A later PP stage that starts at the last KV source replays from its
+            # first layer. The PP payload is the previous layer's posted stream;
+            # turn it into the unfinalized state the replay layers expect.
+            assert not get_pp_group().is_first_rank
+            assert isinstance(hidden_states, torch.Tensor) and pre_mix is not None
+            hidden_states, residual, post_mix, res_mix = stage_entry_mhc_state(
+                hidden_states, pre_mix
+            )
+        else:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -1257,7 +1268,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     residual,
                     engram_hashes,
                     engram_mask,
-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    # A stage's first layer would capture its input, which the
+                    # previous stage already captured at its end and relays.
+                    capture_previous_aux=idx in self.aux_hidden_state_layers
+                    and (idx > self.start_layer or self.start_layer == 0),
                     mega_gate_metadata=mega_gate_metadata,
                 )
             )
@@ -1355,14 +1369,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             reason = (
                 "the pipeline stage holding the last KV source layer must also "
                 "hold every layer after it"
-            )
-        elif cut > 0 and self.start_layer == cut:
-            # Replay starts mid-stream at the cut: it needs layer cut-1's
-            # unfinalized mHC state (residual/post/res mix), which the PP
-            # payload (hidden_states, pre_mix) does not carry.
-            reason = (
-                "the pipeline stage starts at the last KV source layer, so the "
-                "previous layer's mHC state is on another stage"
             )
         elif self.use_sequence_parallel or parallel_config.use_ubatching:
             reason = (

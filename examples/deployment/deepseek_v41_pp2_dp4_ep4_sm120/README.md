@@ -66,6 +66,29 @@ the input of layer `L`, i.e. the output of layer `L-1`. Stage 1 runs DSpark
 locally and nothing is relayed. The startup log confirms this:
 `aux hidden states [37, 38, 39] are captured on PP stages [1, 1, 1]; relayed ... none`.
 
+## Stage 1 in prefill: only the last window past layer 20
+
+Both stages run every step's tokens: prefill chunks and decodes alike pass
+layers 0-19 on stage 0, then layers 20-39 on stage 1. In DeepSeek V4.1,
+though, layer 20 is the last KV source. Layers 21-39 own no compressed KV,
+only a 128-token SWA cache, and their indexers read layer 20's K. Decoder
+SWA bounded replay uses this:
+- layer 20 writes its KV for every token;
+- layer 20's rest and layers 21-39 then run on each request's last
+  `sliding_window` tokens only.
+
+On a single stage, replay starts at layer 20 from layer 19's unfinalized mHC
+state. Stage 1 receives the already-posted stream (`hidden_states`) plus
+`pre_mix` instead. `stage_entry_mhc_state` turns that into an equivalent
+state: `residual = hidden_states`, `res_mix = I`, `post_mix = 0`, `x = 0`.
+Its post is exactly the received stream, so layer 20's KV write and forward
+see the same input as without PP.
+
+The trimmed batch runs in eager steps on stage 1, which includes large prefill
+chunks beyond the CUDA graph sizes. The replay CUDA graphs that let PIECEWISE
+steps trim are built on the first PP rank only, because their static inputs
+need token ids. Smaller mixed steps on stage 1 run the full batch.
+
 ## Memory (rough, per GPU; measure on the real host)
 
 | Stage | Routed experts (MXFP4, /4 by EP) + scales | Attention/dense (replicated per DP rank) | Embedding / head | DSpark |
@@ -264,9 +287,8 @@ checks that enabling them keeps the greedy outputs.
 - `vllm/models/deepseek_v41/nvidia/model.py`: V4.1 now declares
   `supports_aux_hidden_states_over_pp`. Without it the V2 runner refuses
   DSpark with PP. Non-last stages send their aux states in the PP payload,
-  and the last stage prepends them. Decoder SWA bounded replay is turned off on a stage
-  that starts exactly at the last KV source layer (layer 20 here), because it
-  needs mHC state from the previous stage.
+  and the last stage prepends them. Stage 1 keeps decoder SWA bounded replay
+  (see "Stage 1 in prefill" below).
 - `vllm/models/deepseek_v41/nvidia/dspark.py`: past the first PP stage the
   target has no input embedding to share, so DSpark loads `embed.weight` itself.
 - `vllm/v1/worker/gpu_worker.py`: per-worker `Parallel topology` log and a

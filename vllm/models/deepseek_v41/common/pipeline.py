@@ -132,3 +132,30 @@ def get_aux_hidden_state_stages(
             if start < layer_id <= end
         )
     return stages
+
+
+def stage_entry_mhc_state(hidden_states, pre_mix):
+    """A previous-layer mHC state whose post is exactly ``hidden_states``.
+
+    A later PP stage receives the stream after layer ``start - 1``'s post
+    (``hidden_states`` [T, hc, hidden]) plus its ``pre_mix``, not the layer's
+    unfinalized output. The post is ``res_mix^T @ residual + post_mix * x``,
+    so ``residual = hidden_states``, ``res_mix = I``, ``post_mix = 0`` and
+    ``x = 0`` reproduce it exactly. With that state the stage's first layer can
+    run the code paths that expect a predecessor (decoder SWA bounded replay
+    and its ``write_kv``) as if the previous layer were local.
+
+    Returns ``(x, residual, post_mix, res_mix)``; ``pre_mix`` is passed through
+    unchanged by the caller.
+    """
+    import torch
+
+    num_tokens, hc_mult, hidden_size = hidden_states.shape
+    x = hidden_states.new_zeros(num_tokens, hidden_size)
+    post_mix = pre_mix.new_zeros(num_tokens, hc_mult, 1)
+    res_mix = (
+        torch.eye(hc_mult, dtype=pre_mix.dtype, device=pre_mix.device)
+        .expand(num_tokens, hc_mult, hc_mult)
+        .contiguous()
+    )
+    return x, hidden_states, post_mix, res_mix

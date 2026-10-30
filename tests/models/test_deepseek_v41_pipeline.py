@@ -9,6 +9,7 @@ import torch
 from vllm.models.deepseek_v41.common.pipeline import (
     get_aux_hidden_state_stages,
     get_sharing_dependencies,
+    stage_entry_mhc_state,
     validate_local_sharing,
 )
 from vllm.platforms import current_platform
@@ -156,3 +157,28 @@ def test_stage_end_aux_belongs_to_the_stage_that_ends_there():
 def test_aux_ids_outside_the_backbone_are_rejected(layer_id):
     with pytest.raises(ValueError, match="aux hidden state id"):
         get_aux_hidden_state_stages((layer_id,), PP2_RANGES)
+
+
+def _mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
+    # tests/kernels/mhc/test_mhc_kernels.py::mhc_post_ref
+    term2 = torch.bmm(comb_res_mix.mT, residual.float())
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+def test_stage_entry_state_posts_back_to_the_received_stream(num_tokens):
+    """The state a later PP stage starts replay from must post to exactly the
+    stream the previous stage sent, so its first layer's KV write and forward
+    see the same input as without PP."""
+    hc_mult, hidden = 4, 64
+    received = torch.randn(num_tokens, hc_mult, hidden).bfloat16()
+    pre_mix = torch.rand(num_tokens, hc_mult)
+
+    x, residual, post_mix, res_mix = stage_entry_mhc_state(received, pre_mix)
+
+    assert x.shape == (num_tokens, hidden) and x.dtype == received.dtype
+    assert post_mix.shape == (num_tokens, hc_mult, 1)
+    assert res_mix.shape == (num_tokens, hc_mult, hc_mult) and res_mix.is_contiguous()
+    assert post_mix.dtype == res_mix.dtype == torch.float32
+    assert residual is received
+    assert torch.equal(_mhc_post_ref(x, residual, post_mix, res_mix), received)
