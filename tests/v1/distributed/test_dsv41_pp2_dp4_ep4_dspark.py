@@ -37,6 +37,8 @@ PROMPTS = [
 # Different PP/EP layouts reduce in a different order, so greedy outputs may
 # drift after a few tokens; require most tokens to match, not all.
 MIN_TOKEN_MATCH_RATIO = float(os.environ.get("DSV41_MIN_TOKEN_MATCH_RATIO", "0.9"))
+MAX_MODEL_LEN = 32768
+MAX_NUM_BATCHED_TOKENS = 8192
 
 
 def _skip_reason() -> str | None:
@@ -75,12 +77,16 @@ def _engine_args(
         data_parallel_backend="mp",
         enable_expert_parallel=True,
         enable_dbo=False,
+        # The SM120 settings serve.sh uses.
         attention_backend="FLASHINFER_MLA_SPARSE_DSV41",
-        kv_cache_dtype="fp8",
+        kv_cache_dtype="nvfp4_ds_mla",
+        block_size=64,
+        all2all_backend="allgather_reducescatter",
+        language_model_only=True,
         speculative_config=dict(DSPARK_CONFIG) if speculative else None,
         async_scheduling=async_scheduling,
-        max_model_len=8192,
-        max_num_batched_tokens=8192,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         max_num_seqs=32,
         gpu_memory_utilization=0.92,
     )
@@ -171,16 +177,53 @@ async def test_topology_and_dspark_generation(async_scheduling: bool):
         assert _token_match_ratio(single, again) >= MIN_TOKEN_MATCH_RATIO
 
 
+async def _generate_text(
+    engine: AsyncLLM, request_id: str, prompt: str, max_tokens: int
+) -> str:
+    sampling_params = SamplingParams(
+        max_tokens=max_tokens, temperature=0.0, output_kind=RequestOutputKind.FINAL_ONLY
+    )
+    text = ""
+    async for out in engine.generate(
+        request_id=request_id, prompt=prompt, sampling_params=sampling_params
+    ):
+        text = out.outputs[0].text
+    return text
+
+
+def _needle_prompt(num_filler_lines: int, code: str) -> str:
+    filler = [
+        f"Line {i}: the warehouse inventory lists {i * 7 % 97} crates of item {i}."
+        for i in range(num_filler_lines)
+    ]
+    filler.insert(num_filler_lines // 3, f"The secret access code is {code}.")
+    return "\n".join(filler) + "\nQuestion: What is the secret access code?\nAnswer:"
+
+
 @pytest.mark.asyncio
-async def test_long_prompt_prefill():
-    # ~6k-token prompt: exercises the PP activation transfer for a large T
-    # and the long-context KV/indexer path.
-    prompt = " ".join(f"item{i}" for i in range(3000))
+async def test_sm120_kv_cache_answers():
+    """Answer checks for SM120 KV addressing, which token counts cannot catch.
+
+    A wrong SM120 sparse-KV row mapping still yields full-length outputs, but
+    the model misses arithmetic, loses recalled facts and drifts into repeated
+    text. The long needle prompt is several prefill chunks
+    (max_num_batched_tokens) over many 64-token pages: it exercises chunked
+    prefill, the compressed caches and indexer top-k, and the 19 -> 20 PP
+    transfer at large T.
+    """
     with ExitStack() as after:
         engine = AsyncLLM.from_engine_args(_engine_args())
         after.callback(engine.shutdown)
-        tokens = await _generate(engine, "long", prompt, max_tokens=16)
-        assert len(tokens) == 16
+
+        arithmetic = await _generate_text(engine, "arith", "17 * 23 =", 8)
+        assert "391" in arithmetic, arithmetic
+
+        for i, lines in enumerate((40, 900)):  # short, then ~20k tokens
+            code = f"{48213 + i * 1111}"
+            answer = await _generate_text(
+                engine, f"needle-{i}", _needle_prompt(lines, code), 16
+            )
+            assert code in answer, (lines, answer)
 
 
 @pytest.mark.asyncio

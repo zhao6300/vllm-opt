@@ -21,6 +21,13 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
+# MXFP4 routed experts: "auto" resolves to DEEPGEMM_MXFP4 on SM120 when
+# DeepGEMM is installed. Set MOE_BACKEND=marlin if that kernel fails its
+# SM120 test (tests/kernels/moe/test_deepgemm.py::test_deepgemm_fp4_vs_triton).
+MOE_BACKEND=${MOE_BACKEND:-auto}
+# Indexer K cache: "auto" is FP8 for the DeepSeek indexer. mxfp4 is opt-in on
+# sm_12x (DeepGEMM >= 2.8.1) and still lacks long-context accuracy evals.
+INDEXER_KV_DTYPE=${INDEXER_KV_DTYPE:-auto}
 
 # The 40 layers split 20/20 by default; pin it so the cut stays on the
 # layer 20 KV/index/candidate source boundary.
@@ -32,9 +39,19 @@ args=(
     --tensor-parallel-size 1
     --data-parallel-size 4
     --data-parallel-backend mp
-    # SM120 FlashInfer sparse MLA requires an FP8/FP4 KV cache.
-    --attention-config '{"backend":"FLASHINFER_MLA_SPARSE_DSV41"}'
-    --kv-cache-dtype fp8
+    # SM120 picks DeepseekV4FlashInferSM120Attention, which accepts only
+    # nvfp4_ds_mla: FP8 (MXFP8 record) sliding-window cache + NVFP4 compressed
+    # cache. "fp8" aliases to it; "fp8_ds_mla" and "auto"/bf16 are rejected.
+    --attention-config "{\"backend\":\"FLASHINFER_MLA_SPARSE_DSV41\",\"indexer_kv_dtype\":\"$INDEXER_KV_DTYPE\"}"
+    --kv-cache-dtype nvfp4_ds_mla
+    # SM120 kernel pages hold 64 compressed states: 64-token blocks give
+    # ratio-1 layers 64-token and ratio-2 layers 128-token pages. This is the
+    # block size the SM120 FP4 KV path was validated with.
+    --block-size 64
+    # NCCL all-gather/reduce-scatter dispatch: works over PCIe. DeepEP, MoRI,
+    # NIXL-EP and the FlashInfer NVLink backends need NVLink/NVSHMEM/RDMA.
+    --all2all-backend allgather_reducescatter
+    --kernel-config "{\"moe_backend\":\"$MOE_BACKEND\"}"
     # Engram tables stay in pinned host memory, one copy shared by the
     # four DP replicas of stage 0 (layers 1 and 14).
     --engram-config '{"cpu_offload":true}'
