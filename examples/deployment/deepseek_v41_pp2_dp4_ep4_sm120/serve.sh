@@ -44,6 +44,27 @@ export VLLM_PP_MICROBATCH_BALANCE=${PP_MICROBATCH_BALANCE:-0}
 # Phase 2: per-rank step timings every N steps (0 = off).
 export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-0}
 
+# GPU placement. DP rank d gets visible GPUs [2d, 2d+1] (stage 0, stage 1),
+# so with the default order 0..7 the EP groups are {0,2,4,6} and {1,3,5,7}:
+# on a two-socket host each spans both NUMA nodes, and the EP all-to-all of
+# every MoE layer crosses the socket link. GPU_ORDER=auto (default) puts each
+# stage's EP group on one NUMA node / the closest PCIe paths (gpu_order.py);
+# only the per-step PP hand-off crosses. An explicit CUDA_VISIBLE_DEVICES or
+# GPU_ORDER=default keeps the order as is.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+GPU_ORDER=${GPU_ORDER:-auto}
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [ "$GPU_ORDER" = auto ]; then
+    CUDA_VISIBLE_DEVICES=$(python "$HERE/gpu_order.py" --pp 2 --dp 4)
+    export CUDA_VISIBLE_DEVICES
+    echo "GPU order (stage 0 = 1st of each pair): CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+fi
+# Pin each worker's CPU threads and host memory to its GPU's NUMA node
+# (numactl). Stage 0's workers then also first-touch the shared Engram host
+# tables on their own node. With --membind those tables (~200 GiB) must fit
+# in that node's free memory; set NUMA_BIND=0 if they do not.
+NUMA_BIND=${NUMA_BIND:-1}
+
 # The 40 layers split 20/20 by default; pin it so the cut stays on the
 # layer 20 KV/index/candidate source boundary.
 export VLLM_PP_LAYER_PARTITION=${VLLM_PP_LAYER_PARTITION:-20,20}
@@ -79,6 +100,9 @@ args=(
 )
 if [ "$EP" = 1 ]; then
     args+=(--enable-expert-parallel)
+fi
+if [ "$NUMA_BIND" = 1 ]; then
+    args+=(--numa-bind)
 fi
 if [ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; then
     args+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")

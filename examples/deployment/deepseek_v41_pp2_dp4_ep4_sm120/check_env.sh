@@ -14,8 +14,20 @@ NUM_GPUS=${NUM_GPUS:-8}
 MIN_SHM_GIB=${MIN_SHM_GIB:-200}
 status=0
 
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 echo "== GPU topology (PCIe/NVLink paths between the 8 GPUs) =="
 nvidia-smi topo -m || status=1
+
+echo
+echo "== PP stage / EP group placement (serve.sh GPU_ORDER=auto) =="
+# Lower intra-group cost is better; an EP group spanning NUMA nodes pays the
+# socket link on every MoE layer's all-to-all.
+"$PYTHON" "$HERE/gpu_order.py" --pp 2 --dp 4 --explain || status=1
+command -v numactl >/dev/null || {
+    echo "  numactl not found: serve.sh's --numa-bind (NUMA_BIND=1) needs it"
+    status=1
+}
 
 echo
 echo "== CUDA devices, compute capability, memory =="
@@ -43,22 +55,31 @@ sys.exit(0 if ok else 1)
 EOF
 
 echo
-echo "== Peer-to-peer access between stage-0 and stage-1 GPUs =="
-"$PYTHON" - <<'EOF' || status=1
+echo "== Peer-to-peer access within EP groups and PP pairs (chosen order) =="
+ORDER=${CUDA_VISIBLE_DEVICES:-$("$PYTHON" "$HERE/gpu_order.py" --pp 2 --dp 4)}
+# Probe with every GPU visible in PCI order, so CUDA index == physical id.
+env -u CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    "$PYTHON" - "$ORDER" <<'EOF' || status=1
+import sys
+
 import torch
 
-n = torch.cuda.device_count()
-# Global rank r = dp * 2 + pp sits on GPU r: PP pairs are (0,1), (2,3), ...
-# and each EP group is {0,2,4,6} or {1,3,5,7}.
-pairs = [(2 * d, 2 * d + 1) for d in range(n // 2)]
-for a, b in pairs:
-    print(f"  PP pair GPU{a}<->GPU{b}: p2p={torch.cuda.can_device_access_peer(a, b)}")
+# Physical GPU ids in visible order; DP rank d's PP chain is entries
+# [2d, 2d+1], and each stage's EP group is every other entry.
+order = [int(x) for x in sys.argv[1].split(",")]
+
+
+def p2p(a: int, b: int) -> bool:
+    return torch.cuda.can_device_access_peer(a, b)
+
+
+for d in range(len(order) // 2):
+    a, b = order[2 * d], order[2 * d + 1]
+    print(f"  DP {d} PP pair GPU{a}->GPU{b}: p2p={p2p(a, b)}")
 for stage in (0, 1):
-    group = list(range(stage, n, 2))
-    p2p = all(
-        torch.cuda.can_device_access_peer(a, b) for a in group for b in group if a != b
-    )
-    print(f"  EP group stage {stage} GPUs {group}: all-pairs p2p={p2p}")
+    group = order[stage::2]
+    ok = all(p2p(a, b) for a in group for b in group if a != b)
+    print(f"  stage {stage} EP group GPUs {group}: all-pairs p2p={ok}")
 EOF
 
 echo

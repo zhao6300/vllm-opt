@@ -11,19 +11,48 @@ pipeline_parallel_size=2, tensor_parallel_size=1, data_parallel_size=4,
 enable_expert_parallel=true, VLLM_PP_LAYER_PARTITION=20,20
 ```
 
-vLLM orders ranks as `DP x PP x TP`, so global rank `r = 2 * dp + pp` runs on
-GPU `r` on a single node:
+vLLM orders ranks as `DP x PP x TP`, so global rank `r = 2 * dp + pp`, and DP
+rank `d` gets visible GPUs `[2d, 2d+1]` (stage 0, stage 1). Each stage's four
+ranks form both its DP group and its EP group:
 
-| | GPUs (global ranks) | Layers | EP group |
+| | Global ranks | Layers | DP / EP group |
 |---|---|---|---|
 | Stage 0 | 0, 2, 4, 6 | 0-19 (+ embedding, Engram layers 1 and 14) | {0, 2, 4, 6} |
 | Stage 1 | 1, 3, 5, 7 | 20-39 (+ norm, LM head, DSpark) | {1, 3, 5, 7} |
 
-The PP chains are (0,1), (2,3), (4,5) and (6,7), one per DP rank. Each
-EP all-to-all stays inside one stage. Every worker logs a line like this at startup:
+The PP chains are (0,1), (2,3), (4,5) and (6,7), one per DP rank. Each EP
+all-to-all stays inside one stage.
+
+**Physical placement.** With the default `CUDA_VISIBLE_DEVICES=0..7`, the
+global ranks map to the same physical GPUs, so the EP groups are physical
+{0,2,4,6} and {1,3,5,7}. On a two-socket PCIe host (GPUs 0-3 on NUMA 0, 4-7 on
+NUMA 1) each EP group then spans both sockets. The all-to-all of every MoE
+layer crosses the socket link, while the PP hand-off, which is far lighter
+(one `hidden_states` + `pre_mix` per step), stays local. That is backwards.
+
+`serve.sh` therefore sets `GPU_ORDER=auto` by default. It runs `gpu_order.py`,
+which reads `nvidia-smi topo -m` and the GPUs' sysfs NUMA nodes, chooses the
+split with the cheapest links inside each EP group, and exports the
+interleaved order. On a 4+4 two-socket host:
 
 ```
-Parallel topology: global_rank=3 dp_rank=1 pp_rank=1 pp_ranks=[2, 3] tp_rank=0 ep_rank=1 ep_ranks=[1, 3, 5, 7] physical_gpu=3 device=cuda:3
+CUDA_VISIBLE_DEVICES=0,4,1,5,2,6,3,7   # stage 0 = physical 0-3 (NUMA 0), stage 1 = 4-7 (NUMA 1)
+```
+
+With that order, EP stays inside a socket and only the PP hand-off crosses it.
+On a host whose NUMA split is already by parity, the chosen order stays 0..7.
+`check_env.sh` prints both layouts with their link costs (`--explain`).
+`serve.sh` also passes `--numa-bind` (`NUMA_BIND=1`), which pins every worker's
+CPU threads and host memory to its GPU's node. Stage 0's workers, which hold
+the shared Engram host tables (~200 GiB), then place them on stage 0's node.
+That node needs the free memory; set `NUMA_BIND=0` if it does not have it. An
+explicit `CUDA_VISIBLE_DEVICES` or `GPU_ORDER=default` overrides the
+automatic order.
+
+Every worker logs its placement at startup, e.g. with the order above:
+
+```
+Parallel topology: global_rank=1 dp_rank=0 pp_rank=1 pp_ranks=[0, 1] tp_rank=0 ep_rank=0 ep_ranks=[1, 3, 5, 7] physical_gpu=4 device=cuda:0
 ```
 
 The split at layer 20 matches the source-sharing boundary
