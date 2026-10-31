@@ -18,9 +18,17 @@ class AsyncScheduler(Scheduler):
         self._spec_token_placeholders: list[int] = [-1] * self.num_spec_tokens
         self.pp_size = self.parallel_config.pipeline_parallel_size
         # Only XPU can disable PP decode microbatching via VLLM_XPU_PP_MICROBATCH.
-        self.decode_stagger = self.pp_size
+        self.decode_stagger = self.vllm_config.pp_num_microbatches
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             self.decode_stagger = 1
+        if self.decode_stagger > self.pp_size:
+            logger.info_once(
+                "PP decode microbatches: %d (pipeline_parallel_size=%d); each "
+                "request decodes every %d steps.",
+                self.decode_stagger,
+                self.pp_size,
+                self.decode_stagger,
+            )
         # Keep the decode microbatches the same size (VLLM_PP_MICROBATCH_BALANCE).
         self.balance_decode_microbatches = (
             self.decode_stagger > 1 and envs.VLLM_PP_MICROBATCH_BALANCE

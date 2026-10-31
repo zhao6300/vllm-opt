@@ -14,6 +14,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pp_step_profiler import pp_step_span
 
 
 @dataclass
@@ -55,7 +56,7 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
 class PPHandler:
     """Runs the PP sampled-token broadcast/recv on a side stream so the
     default stream isn't gated by the matching peer call. Step T's recv is
-    consumed at step T+pp_size via `get_prev_sampled_outputs`.
+    consumed at step T+ring_depth via `get_prev_sampled_outputs`.
 
     Uses a dedicated NCCL communicator (sibling of the PP `device_group`)
     for the broadcast so it does not serialize on the wire with the
@@ -63,8 +64,17 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        ring_depth: int | None = None,
     ):
+        """Args:
+        ring_depth: Steps between a step's sampled-token receive and its
+            consumption, which must equal the scheduler's decode stagger.
+            Defaults to the PP world size.
+        """
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
@@ -78,7 +88,8 @@ class PPHandler:
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
         # None means no postprocess is pending for that step (broadcast skipped).
         # Only XPU can disable microbatching via VLLM_XPU_PP_MICROBATCH.
-        ring_depth = get_pp_group().world_size
+        if ring_depth is None:
+            ring_depth = get_pp_group().world_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             ring_depth = 1
         self.queue: deque[PendingRecv | None] = (
@@ -149,7 +160,8 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
+        with pp_step_span("token_wait"):
+            self.main_stream.wait_event(slot.event)
         if slot.draft_tokens is not None and draft_tokens_to_update is not None:
             draft_tokens = slot.draft_tokens
             draft_idx_mapping = slot.idx_mapping

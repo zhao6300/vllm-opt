@@ -39,7 +39,13 @@ INDEXER_KV_DTYPE=${INDEXER_KV_DTYPE:-auto}
 # double-buffers the 19 -> 20 activations (2 x max_num_batched_tokens rows of
 # hidden_states + pre_mix on each stage-0 GPU).
 export VLLM_PP_SEND_BUFFERS=${PP_SEND_BUFFERS:-0}
-# Phase 4: keep the two decode microbatches (alternating steps) equal in size.
+# Phase 4: decode microbatches M (default = PP size, 2). Each request decodes
+# every M steps and M + 1 batches are in flight. 3 fills a pipeline whose
+# round trip through the stages exceeds one microbatch step (see
+# token_wait / recv_wait in the step profile); TPOT grows with M. Set PP_SEND_BUFFERS
+# to M with it.
+export VLLM_PP_NUM_MICROBATCHES=${PP_NUM_MICROBATCHES:-0}
+# Phase 4: keep the decode microbatches equal in size.
 export VLLM_PP_MICROBATCH_BALANCE=${PP_MICROBATCH_BALANCE:-0}
 # Phase 2: per-rank step timings every N steps (0 = off).
 export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-0}

@@ -227,14 +227,23 @@ async def test_sm120_kv_cache_answers():
 
 
 @pytest.mark.asyncio
-async def test_pp_send_buffers_and_microbatch_balance_keep_outputs(monkeypatch):
-    """Phase 3/4 options change when sends wait and which step a request
-    decodes in, never what it computes: greedy outputs must match."""
+@pytest.mark.parametrize("microbatches", [2, 3])
+async def test_pp_options_keep_outputs(monkeypatch, microbatches: int):
+    """Send buffers, microbatch balancing and more decode microbatches change
+    when sends wait and which step a request decodes in, never what it
+    computes. With three microbatches a draft reaches stage 0 three steps after
+    it is made, so a step mismatch between the scheduler and the workers would
+    pair requests with another request's tokens and show here."""
     max_tokens = 64
     outputs = {}
     for options in (False, True):
-        monkeypatch.setenv("VLLM_PP_SEND_BUFFERS", "2" if options else "0")
+        monkeypatch.setenv(
+            "VLLM_PP_SEND_BUFFERS", str(microbatches) if options else "0"
+        )
         monkeypatch.setenv("VLLM_PP_MICROBATCH_BALANCE", "1" if options else "0")
+        monkeypatch.setenv(
+            "VLLM_PP_NUM_MICROBATCHES", str(microbatches) if options else "0"
+        )
         monkeypatch.setenv("VLLM_PP_STEP_PROFILE_INTERVAL", "50" if options else "0")
         with ExitStack() as after:
             engine = AsyncLLM.from_engine_args(_engine_args())

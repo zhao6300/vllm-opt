@@ -109,6 +109,36 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
 )
 
 
+def resolve_pp_num_microbatches(
+    pp_size: int, requested: int, *, overlapped: bool
+) -> int:
+    """Number of decode microbatches M for pipeline parallelism.
+
+    A request decodes once every M steps, the sampled-token ring is M deep and
+    the engine keeps M + 1 batches in flight. M must be at least ``pp_size``
+    to fill the pipeline; a larger M only helps when the round trip through
+    the stages is longer than M - 1 steps. Only the V2 runner with async
+    scheduling staggers decodes, so M is ``pp_size`` anywhere else.
+
+    Args:
+        pp_size: pipeline_parallel_size.
+        requested: VLLM_PP_NUM_MICROBATCHES; 0 selects ``pp_size``.
+        overlapped: whether decodes are staggered (V2 runner + async).
+
+    Raises:
+        ValueError: If ``requested`` is below ``pp_size``.
+
+    """
+    if pp_size <= 1 or requested <= 0:
+        return pp_size
+    if requested < pp_size:
+        raise ValueError(
+            f"VLLM_PP_NUM_MICROBATCHES={requested} is below "
+            f"pipeline_parallel_size={pp_size}; the pipeline would not fill."
+        )
+    return requested if overlapped else pp_size
+
+
 @lru_cache
 def default_breakable_cudagraph_architectures() -> frozenset[str]:
     """Architectures defaulting to breakable CUDA graphs on this platform."""
@@ -585,13 +615,24 @@ class VllmConfig:
         return bool(mm_config and mm_config.mm_encoder_only)
 
     @property
+    def pp_num_microbatches(self) -> int:
+        """Decode microbatches the V2 async pipeline rotates through."""
+        return resolve_pp_num_microbatches(
+            self.parallel_config.pipeline_parallel_size,
+            envs.VLLM_PP_NUM_MICROBATCHES,
+            overlapped=bool(
+                self.scheduler_config.async_scheduling and self.use_v2_model_runner
+            ),
+        )
+
+    @property
     def max_concurrent_batches(self) -> int:
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size
         if self.scheduler_config.async_scheduling:
             if self.use_v2_model_runner:
-                return pp_size + 1
+                return self.pp_num_microbatches + 1
             # V1 Model Runner does not fully support async scheduling with PP.
             if pp_size <= 1:
                 return 2

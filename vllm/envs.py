@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
+    VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: bool = False
     VLLM_PP_SEND_BUFFERS: int = 0
     VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
@@ -930,6 +931,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(
         int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
     ),
+    # V2 runner + PP + async scheduling: decode microbatches M. Each request
+    # decodes every M steps, the sampled-token ring is M deep and M + 1 batches
+    # are in flight. 0 (default) is pipeline_parallel_size; larger values fill
+    # a pipeline whose round trip through the stages exceeds one microbatch
+    # step, at the cost of M x step time per token and smaller microbatches.
+    # Read by the scheduler and every worker: set it for the whole server.
+    "VLLM_PP_NUM_MICROBATCHES": lambda: int(os.getenv("VLLM_PP_NUM_MICROBATCHES", "0")),
     # V2 runner + PP + async scheduling: keep the decode microbatches (the
     # requests decoded in alternating steps) the same size. A burst of requests
     # that start decoding in one step otherwise stays in one microbatch, and
@@ -2393,6 +2401,7 @@ def compile_factors() -> dict[str, object]:
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
         # PP scheduling, send buffering and step timing run outside the model.
+        "VLLM_PP_NUM_MICROBATCHES",
         "VLLM_PP_MICROBATCH_BALANCE",
         "VLLM_PP_SEND_BUFFERS",
         "VLLM_PP_STEP_PROFILE_INTERVAL",

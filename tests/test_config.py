@@ -4374,3 +4374,28 @@ def test_hybrid_layer_counts_sparse_attention_as_attention(
             )
             == len(layer_types) - expected_attention
         )
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "requested", "overlapped", "expected"),
+    [
+        (2, 0, True, 2),  # Default: one microbatch per stage.
+        (2, 3, True, 3),
+        (3, 3, True, 3),
+        (2, 3, False, 2),  # Only V2 + async staggers decodes.
+        (1, 3, True, 1),  # No PP: nothing to rotate through.
+        (1, 0, False, 1),
+    ],
+)
+def test_pp_num_microbatches(pp_size, requested, overlapped, expected):
+    assert (
+        vllm_config_module.resolve_pp_num_microbatches(
+            pp_size, requested, overlapped=overlapped
+        )
+        == expected
+    )
+
+
+def test_pp_num_microbatches_below_pp_size_is_rejected():
+    with pytest.raises(ValueError, match="below pipeline_parallel_size=3"):
+        vllm_config_module.resolve_pp_num_microbatches(3, 2, overlapped=True)

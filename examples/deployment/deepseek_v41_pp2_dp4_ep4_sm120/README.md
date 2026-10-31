@@ -169,13 +169,14 @@ attention, KV and DSpark settings and adds PP=2 and EP.
 
 `bench_matrix.sh` runs these configurations, the plan's C, D and E:
 
-| Name | DSpark | `PP_SEND_BUFFERS` | `PP_MICROBATCH_BALANCE` |
-|---|---|---|---|
-| `C_ep1_dspark0` | off | 0 | 0 |
-| `D_ep1_dspark1` | on | 0 | 0 |
-| `E1_dspark1_sendbuf2` | on | 2 | 0 |
-| `E2_dspark1_balance` | on | 0 | 1 |
-| `E3_dspark1_sendbuf2_balance` | on | 2 | 1 |
+| Name | DSpark | `PP_SEND_BUFFERS` | `PP_MICROBATCH_BALANCE` | `PP_NUM_MICROBATCHES` |
+|---|---|---|---|---|
+| `C_ep1_dspark0` | off | 0 | 0 | 2 (default) |
+| `D_ep1_dspark1` | on | 0 | 0 | 2 |
+| `E1_dspark1_sendbuf2` | on | 2 | 0 | 2 |
+| `E2_dspark1_balance` | on | 0 | 1 | 2 |
+| `E3_dspark1_sendbuf2_balance` | on | 2 | 1 | 2 |
+| `E4_dspark1_m3_sendbuf3_balance` | on | 3 | 1 | 3 |
 
 For each configuration, `vllm bench serve` runs at concurrency 1/8/32/64 with
 2k-token inputs, plus a 32k-token prefill run. Use `ONLY="D_ep1_dspark1 ..."`
@@ -194,11 +195,17 @@ the concurrency where it occurs.
 
 **Step profile** (`VLLM_PP_STEP_PROFILE_INTERVAL=N`, on by default in the
 matrix). Every N steps each worker logs CUDA-event averages:
-`step` (GPU cadence), `execute` and `busy` (execute / step),
-`recv_wait`, `send_wait`, `sample` and `draft`.
+`step` (GPU cadence), `execute`, `busy`, `recv_wait`, `send_wait`,
+`token_wait`, `sample`, `draft` and `gpu`.
+- `busy` is `(execute - token_wait) / step`. `gpu` adds `sample` (which
+  includes `draft`), the last stage's sampling and DSpark drafting, so read
+  stage 1's load from `gpu`.
 - A low `busy` on stage 1 with a high `recv_wait` means stage 0 starves it.
 - A high `send_wait` on stage 0 means stage 0 stalls on the 19 -> 20 send.
-- `draft` is the DSpark proposer on stage 1.
+- `token_wait` is stage 0 waiting for the sampled tokens and drafts of an
+  earlier step to come back from stage 1. Both stages idling with a large
+  `token_wait` (or `recv_wait` on stage 1) means the round trip through the
+  stages, not either stage's work, limits the pipeline. That is when M=3 helps.
 
 The host never synchronizes; events are read once they complete.
 
@@ -278,9 +285,28 @@ DBO is a different mechanism: it splits one step into two ubatches to overlap
 the EP all-to-all on one rank. It stays rejected with PP and with
 speculative decoding (`vllm/config/vllm.py`) and is not used here.
 
-Leave both options off for the first deployment, then compare D against
-E1, E2 and E3. `test_pp_send_buffers_and_microbatch_balance_keep_outputs`
-checks that enabling them keeps the greedy outputs.
+**Microbatches M (`VLLM_PP_NUM_MICROBATCHES`, `PP_NUM_MICROBATCHES` in
+serve.sh).** The default M equals the PP size, 2. Each request decodes every M
+steps, the sampled-token ring is M deep and `M + 1` batches are in flight. With
+two microbatches and two stages, a microbatch must go through both stages,
+sampling, drafting and the token broadcast before it can decode again, which is
+more than two stage-steps. Even with perfectly balanced stages each step then
+carries a bubble of about the P2P, broadcast and scheduling time. M=3 covers the
+round trip when `L <= M x step`, with `L` the sum of both stages, sampling,
+drafting and communication.
+
+M=3 costs about 1.5x TPOT (a request decodes every 3 steps), makes each
+microbatch a third of the running requests, and holds `4 x
+max_num_batched_tokens` in flight for the KV reservation. Set
+`PP_SEND_BUFFERS` to M with it. The scheduler and every worker read the
+variable, so set it for the whole server. A value below the PP size is rejected;
+it is ignored without the V2 runner and async scheduling. The engine-to-worker
+RPC queue holds 10 messages and each step uses about two, which fits M=3
+(8 messages) but not M=4.
+
+Leave the options off for the first deployment, then compare D against E1-E4.
+`test_pp_options_keep_outputs` checks, for M=2 and M=3, that enabling them
+keeps the greedy outputs.
 
 ## Code changes behind this deployment
 

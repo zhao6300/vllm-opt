@@ -6,15 +6,21 @@ Enabled with ``VLLM_PP_STEP_PROFILE_INTERVAL=N``: every N steps each worker
 logs the average GPU time of its steps, split into spans:
 
 - ``step``: GPU time between the starts of consecutive steps (the cadence).
-- ``execute``: the model runner's ``execute_model`` (input prep + forward).
+- ``execute``: the model runner's ``execute_model`` (input prep + forward),
+  including ``token_wait``.
 - ``recv_wait``: the stream waiting for the previous stage's activations.
 - ``send_wait``: the stream waiting for this rank's earlier sends to drain
   (with ``VLLM_PP_SEND_BUFFERS``, also the copy into the send buffer).
+- ``token_wait``: the stream waiting for the sampled tokens and drafts that
+  the last stage broadcast back (non-last stages). A large share of the step
+  means the round trip through the stages, not a stage's own work, limits the
+  pipeline: the case ``VLLM_PP_NUM_MICROBATCHES`` > ``pp_size`` addresses.
 - ``sample``: ``sample_tokens`` on the last stage, including ``draft``.
 - ``draft``: the speculative proposer (DSpark) on the last stage.
 
-``execute / step`` is the stage's busy ratio; a stage that is mostly
-``recv_wait`` is starved by its predecessor. Events are recorded on the
+``busy`` is ``(execute - token_wait) / step`` and ``gpu`` adds the last
+stage's sampling and drafting; a stage that is mostly ``recv_wait`` is starved by its
+predecessor. Events are recorded on the
 current stream outside CUDA graph replay, so FULL graphs are timed as a
 whole. Kernel-level splits (EP all-to-all, P2P transfer) come from torch
 profiler traces; see ``examples/deployment/deepseek_v41_pp2_dp4_ep4_sm120``.
@@ -32,7 +38,7 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-SPANS = ("execute", "recv_wait", "send_wait", "sample", "draft")
+SPANS = ("execute", "recv_wait", "send_wait", "token_wait", "sample", "draft")
 
 
 class StepStats:
@@ -60,7 +66,12 @@ class StepStats:
         steps = max(self.num_steps, 1)
         out = {name: self.span_ms.get(name, 0.0) / steps for name in SPANS}
         out["step"] = self.step_ms / max(self.num_intervals, 1)
-        out["busy"] = out["execute"] / out["step"] if out["step"] > 0 else 0.0
+        # ``token_wait`` happens inside ``execute`` and is waiting, not work.
+        work = max(out["execute"] - out["token_wait"], 0.0)
+        out["busy"] = work / out["step"] if out["step"] > 0 else 0.0
+        # ``sample`` includes the draft; the last stage's sampling and drafting
+        # keep the GPU busy too, which ``busy`` leaves out.
+        out["gpu"] = (work + out["sample"]) / out["step"] if out["step"] > 0 else 0.0
         return out
 
 
@@ -133,8 +144,8 @@ class PPStepProfiler:
         s = self.stats.summary()
         self._log(
             "PP step profile %s over %d steps (ms/step): step %.2f, execute "
-            "%.2f (busy %.0f%%), recv_wait %.2f, send_wait %.2f, sample %.2f, "
-            "draft %.2f",
+            "%.2f (busy %.0f%%), recv_wait %.2f, send_wait %.2f, token_wait "
+            "%.2f, sample %.2f, draft %.2f, gpu %.0f%%",
             self.label,
             self.stats.num_steps,
             s["step"],
@@ -142,8 +153,10 @@ class PPStepProfiler:
             100 * s["busy"],
             s["recv_wait"],
             s["send_wait"],
+            s["token_wait"],
             s["sample"],
             s["draft"],
+            100 * s["gpu"],
         )
         self.stats.reset()
 

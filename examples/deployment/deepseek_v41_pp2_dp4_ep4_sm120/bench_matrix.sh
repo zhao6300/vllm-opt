@@ -38,17 +38,18 @@ mkdir -p "$RESULT_DIR"
 # Per-rank step timings in every server log (read by summarize_results.py).
 export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-200}
 
-# name EP DSPARK PP_SEND_BUFFERS PP_MICROBATCH_BALANCE
-# C/D are the plan's baselines; E adds the phase 3/4 PP options to D one at a
-# time and together. EP=0 is left out: without EP every GPU holds all of its
-# stage's routed experts (about half of 259.5 GiB MXFP4), which does not fit
-# in 96 GB.
+# name EP DSPARK PP_SEND_BUFFERS PP_MICROBATCH_BALANCE PP_NUM_MICROBATCHES
+# C/D are the plan's baselines; E1-E3 add the phase 3/4 PP options to D one at
+# a time and together; E4 adds three decode microbatches (M=3, four batches in
+# flight). EP=0 is left out: without EP every GPU holds all of its stage's
+# routed experts (about half of 259.5 GiB MXFP4), which does not fit in 96 GB.
 CONFIGS=(
-    "C_ep1_dspark0 1 0 0 0"
-    "D_ep1_dspark1 1 1 0 0"
-    "E1_dspark1_sendbuf2 1 1 2 0"
-    "E2_dspark1_balance 1 1 0 1"
-    "E3_dspark1_sendbuf2_balance 1 1 2 1"
+    "C_ep1_dspark0 1 0 0 0 0"
+    "D_ep1_dspark1 1 1 0 0 0"
+    "E1_dspark1_sendbuf2 1 1 2 0 0"
+    "E2_dspark1_balance 1 1 0 1 0"
+    "E3_dspark1_sendbuf2_balance 1 1 2 1 0"
+    "E4_dspark1_m3_sendbuf3_balance 1 1 3 1 3"
 )
 if [ -n "${ONLY:-}" ]; then
     # e.g. ONLY="D_ep1_dspark1 E3_dspark1_sendbuf2_balance"
@@ -97,10 +98,11 @@ bench() {
 }
 
 for config in "${CONFIGS[@]}"; do
-    read -r name ep dspark send_buffers balance <<<"$config"
+    read -r name ep dspark send_buffers balance microbatches <<<"$config"
     echo "=== $name ==="
     EP=$ep DSPARK=$dspark PORT=$PORT MODEL=$MODEL \
         PP_SEND_BUFFERS=$send_buffers PP_MICROBATCH_BALANCE=$balance \
+        PP_NUM_MICROBATCHES=$microbatches \
         PROFILE_DIR=${PROFILE_DIR:+$PROFILE_DIR/$name} \
         bash "$HERE/serve.sh" >"$RESULT_DIR/$name.server.log" 2>&1 &
     pid=$!

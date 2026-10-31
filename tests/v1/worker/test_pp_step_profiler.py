@@ -96,3 +96,33 @@ def test_repeated_spans_in_a_step_add_up():
     assert s["draft"] == 0.5
     assert s["step"] == 10.0
     assert s["busy"] == 0.5
+
+
+def test_token_wait_inside_execute_is_not_busy_time():
+    # Stage 0: 6 ms execute of which 2 ms wait for the tokens of an earlier
+    # step; stage 1 style 3 ms sampling (1 ms of it drafting) after it.
+    stats = StepStats()
+    stats.add(
+        10.0,
+        {"execute": 6.0, "token_wait": 2.0, "sample": 3.0, "draft": 1.0},
+    )
+    s = stats.summary()
+    assert s["token_wait"] == 2.0
+    assert s["busy"] == 0.4  # (6 - 2) / 10
+    # The draft is part of sample: it is not added again.
+    assert s["gpu"] == 0.7  # (6 - 2 + 3) / 10
+
+
+def test_token_wait_span_is_reported():
+    clock, logs = _Clock(), []
+    prof = _profiler(clock, interval=1, logs=logs)
+    prof.begin_step()
+    with prof.span("execute"):
+        clock.now += 8.0
+        with prof.span("token_wait"):
+            clock.now += 2.0
+    clock.now += 2.0
+    prof.begin_step()
+    assert "token_wait 2.00" in logs[0]
+    # execute spans 10 ms including the wait; the step is 12 ms.
+    assert "execute 10.00 (busy 67%)" in logs[0]
