@@ -720,9 +720,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             logger.info_once(
                 "DeepSeek V4.1 aux hidden states %s are captured on PP stages %s; "
                 "relayed to the last stage over PP: %s.",
-                list(stages),
-                list(stages.values()),
-                relayed or "none",
+                str(list(stages)),
+                str(list(stages.values())),
+                str(relayed) if relayed else "none",
             )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):

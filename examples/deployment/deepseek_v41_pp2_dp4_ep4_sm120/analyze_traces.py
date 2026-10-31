@@ -21,10 +21,11 @@ NCCL Broadcast is the sampled-token and draft relay back to stage 0.
 import argparse
 import gzip
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+import regex as re
 
 CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
     ("pp_p2p (nccl send/recv)", re.compile(r"nccl.*SendRecv|nccl.*Send|nccl.*Recv")),

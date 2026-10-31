@@ -14,10 +14,11 @@ each rank logged (from VLLM_PP_STEP_PROFILE_INTERVAL).
 
 import argparse
 import json
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+import regex as re
 
 COLUMNS = [
     ("mean_ttft_ms", "TTFT ms", "{:.1f}"),

@@ -3,6 +3,7 @@
 """Layer-sharing dependencies of a DeepSeek V4.1 pipeline partition."""
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,7 @@ class SharingDependency:
 
 
 def get_sharing_dependencies(
-    config: object, stage_ranges: list[tuple[int, int]]
+    config: Any, stage_ranges: list[tuple[int, int]]
 ) -> tuple[SharingDependency, ...]:
     """Resolve KV, index and candidate sources before constructing layers."""
     num_layers = config.num_hidden_layers

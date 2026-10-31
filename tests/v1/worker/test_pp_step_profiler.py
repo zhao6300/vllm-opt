@@ -51,7 +51,8 @@ def _step(
 
 
 def test_reports_per_step_averages_and_busy_ratio():
-    clock, logs = _Clock(), []
+    clock = _Clock()
+    logs: list[str] = []
     prof = _profiler(clock, interval=2, logs=logs)
     for _ in range(3):
         _step(prof, clock, recv=2.0, execute=6.0, idle=2.0)
@@ -67,7 +68,8 @@ def test_reports_per_step_averages_and_busy_ratio():
 
 
 def test_unfinished_steps_are_not_read():
-    clock, logs = _Clock(), []
+    clock = _Clock()
+    logs: list[str] = []
     prof = _profiler(clock, interval=1, logs=logs)
     clock.done_until = -1.0  # Nothing has run on the GPU yet.
     _step(prof, clock, recv=1.0, execute=1.0, idle=0.0)
@@ -80,7 +82,8 @@ def test_unfinished_steps_are_not_read():
 
 
 def test_spans_outside_a_step_are_ignored():
-    clock, logs = _Clock(), []
+    clock = _Clock()
+    logs: list[str] = []
     prof = _profiler(clock, interval=1, logs=logs)
     with prof.span("draft"):
         clock.now += 5.0
@@ -114,7 +117,8 @@ def test_token_wait_inside_execute_is_not_busy_time():
 
 
 def test_token_wait_span_is_reported():
-    clock, logs = _Clock(), []
+    clock = _Clock()
+    logs: list[str] = []
     prof = _profiler(clock, interval=1, logs=logs)
     prof.begin_step()
     with prof.span("execute"):

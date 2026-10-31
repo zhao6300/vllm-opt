@@ -47,7 +47,7 @@ def load_text_config(model: str) -> SimpleNamespace:
 def check_gpus(num_gpus: int) -> None:
     import torch
 
-    count = torch.cuda.device_count()
+    count = torch.accelerator.device_count()
     caps = [torch.cuda.get_device_capability(i) for i in range(count)]
     report(
         f"{num_gpus} SM120 GPUs",

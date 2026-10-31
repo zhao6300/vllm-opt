@@ -6,7 +6,7 @@ This uses plain attention data parallelism. DCP, DBO and microbatching stay off.
 
 ## Layout
 
-```
+```text
 pipeline_parallel_size=2, tensor_parallel_size=1, data_parallel_size=4,
 enable_expert_parallel=true, VLLM_PP_LAYER_PARTITION=20,20
 ```
@@ -16,7 +16,7 @@ rank `d` gets visible GPUs `[2d, 2d+1]` (stage 0, stage 1). Each stage's four
 ranks form both its DP group and its EP group:
 
 | | Global ranks | Layers | DP / EP group |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Stage 0 | 0, 2, 4, 6 | 0-19 (+ embedding, Engram layers 1 and 14) | {0, 2, 4, 6} |
 | Stage 1 | 1, 3, 5, 7 | 20-39 (+ norm, LM head, DSpark) | {1, 3, 5, 7} |
 
@@ -35,7 +35,7 @@ which reads `nvidia-smi topo -m` and the GPUs' sysfs NUMA nodes, chooses the
 split with the cheapest links inside each EP group, and exports the
 interleaved order. On a 4+4 two-socket host:
 
-```
+```bash
 CUDA_VISIBLE_DEVICES=0,4,1,5,2,6,3,7   # stage 0 = physical 0-3 (NUMA 0), stage 1 = 4-7 (NUMA 1)
 ```
 
@@ -51,7 +51,7 @@ automatic order.
 
 Every worker logs its placement at startup, e.g. with the order above:
 
-```
+```text
 Parallel topology: global_rank=1 dp_rank=0 pp_rank=1 pp_ranks=[0, 1] tp_rank=0 ep_rank=0 ep_ranks=[1, 3, 5, 7] physical_gpu=4 device=cuda:0
 ```
 
@@ -73,6 +73,7 @@ layers 0-19 on stage 0, then layers 20-39 on stage 1. In DeepSeek V4.1,
 though, layer 20 is the last KV source. Layers 21-39 own no compressed KV,
 only a 128-token SWA cache, and their indexers read layer 20's K. Decoder
 SWA bounded replay uses this:
+
 - layer 20 writes its KV for every token;
 - layer 20's rest and layers 21-39 then run on each request's last
   `sliding_window` tokens only.
@@ -92,7 +93,7 @@ need token ids. Smaller mixed steps on stage 1 run the full batch.
 ## Memory (rough, per GPU; measure on the real host)
 
 | Stage | Routed experts (MXFP4, /4 by EP) + scales | Attention/dense (replicated per DP rank) | Embedding / head | DSpark |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 0 | ~31 + ~3 GiB | ~3.5 GiB | embedding ~1.9 GiB | - |
 | 1 | ~31 + ~3 GiB | ~3.5 GiB | head ~1.9 GiB + DSpark embedding ~1.9 GiB | draft layers |
 
@@ -108,7 +109,7 @@ test checkpoint.
 What runs on SM120 for this configuration, and the settings it requires:
 
 | Component | SM120 implementation | Requirement |
-|---|---|---|
+| --- | --- | --- |
 | Target and DSpark attention | `DeepseekV4FlashInferSM120Attention` (`FLASHINFER_MLA_SPARSE_DSV41`); the drafter inherits the target backend | `--kv-cache-dtype nvfp4_ds_mla`: FP8 MXFP8-record SWA cache plus NVFP4 compressed cache. `fp8` aliases to it. `fp8_ds_mla`, `auto` and `bfloat16` are rejected |
 | FlashInfer decode dispatch | `SparseMLASm120Wrapper`, DSV4.1 table | entries for `(padded heads, SWA window)` for the target and `(padded heads, window + 5 padded to 64)` for the non-causal DSpark drafter. Layer construction raises without them |
 | KV pages | 64 compressed states per kernel page | `--block-size 64`, the size the SM120 FP4 KV path was validated with |
@@ -138,7 +139,7 @@ attention, KV and DSpark settings and adds PP=2 and EP.
      DSpark shapes, and that the DeepGEMM symbols the SM120 path calls exist.
 2. **Phase 0, SM120 kernel tests on one GPU:** these check that the kernels compute
    correct values. The preflight only checks that they exist.
-   ```
+   ```bash
    pytest tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py \
           tests/v1/attention/test_deepseek_v41_block_size.py \
           tests/v1/attention/test_dspark_noncausal_sparse_mla.py \
@@ -170,7 +171,7 @@ attention, KV and DSpark settings and adds PP=2 and EP.
 `bench_matrix.sh` runs these configurations, the plan's C, D and E:
 
 | Name | DSpark | `PP_SEND_BUFFERS` | `PP_MICROBATCH_BALANCE` | `PP_NUM_MICROBATCHES` |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `C_ep1_dspark0` | off | 0 | 0 | 2 (default) |
 | `D_ep1_dspark1` | on | 0 | 0 | 2 |
 | `E1_dspark1_sendbuf2` | on | 2 | 0 | 2 |
@@ -181,6 +182,7 @@ attention, KV and DSpark settings and adds PP=2 and EP.
 For each configuration, `vllm bench serve` runs at concurrency 1/8/32/64 with
 2k-token inputs, plus a 32k-token prefill run. Use `ONLY="D_ep1_dspark1 ..."`
 to run a subset. At the end, `summarize_results.py` prints:
+
 - a table of TTFT, p99 TTFT, TPOT, p99 TPOT, output and total tok/s, and
   DSpark acceptance rate and length;
 - the last `PP step profile` line of every rank.
@@ -197,6 +199,7 @@ the concurrency where it occurs.
 matrix). Every N steps each worker logs CUDA-event averages:
 `step` (GPU cadence), `execute`, `busy`, `recv_wait`, `send_wait`,
 `token_wait`, `sample`, `draft` and `gpu`.
+
 - `busy` is `(execute - token_wait) / step`. `gpu` adds `sample` (which
   includes `draft`), the last stage's sampling and DSpark drafting, so read
   stage 1's load from `gpu`.
@@ -212,6 +215,7 @@ The host never synchronizes; events are read once they complete.
 **Kernel breakdown.** With `PROFILE_DIR=/tmp/traces` the matrix also captures
 torch profiler traces, and `analyze_traces.py` splits each rank's GPU time
 into these categories:
+
 - PP P2P (NCCL SendRecv)
 - EP all-to-all (NCCL AllGather/ReduceScatter of `allgather_reducescatter`)
 - token/draft relay (NCCL Broadcast)
@@ -226,7 +230,7 @@ and P2P shares: under FULL CUDA graphs, Python-level hooks around them never run
 value. Per DP rank, the limits are, in the order they usually bind:
 
 | Limit | Per DP rank | Source |
-|---|---|---|
+| --- | --- | --- |
 | TPOT target | measured: the knee of the sweep | each request decodes every 2 steps, so TPOT ≈ 2 × step time |
 | SM120 decode plan | about 20 requests (10 per microbatch × 6 tokens = 64 rows) | `_FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64`; wider steps use FlashInfer's prefill plan. A possible step change to look for in the sweep |
 | CUDA graph coverage | about 170 requests with the default 512-token ceiling | `min(max_num_seqs × 6 × 2, 512)` on non-datacenter Blackwell; larger decode steps run eager. Raise with `MAX_CUDAGRAPH_CAPTURE_SIZE` |
@@ -245,6 +249,7 @@ divided by 4. If that lands above ~170 per rank, also raise
 By default, stage 0 waits at the top of every step for its previous send of
 `hidden_states` + `pre_mix`. Its outputs are CUDA-graph static buffers, so the
 next replay would otherwise overwrite data that is still being sent. With N ≥ 1:
+
 - the worker (`vllm/v1/worker/gpu/pp_send_ring.py`) copies each step's payload
   into one of N buffers, preallocated at `max_num_batched_tokens` rows before
   memory profiling, so the KV cache budget accounts for them;
@@ -259,6 +264,7 @@ The ring is skipped when experimental pipeline-sharing payloads are on.
 
 The step-level pipeline was already in place, and this deployment uses it as
 is:
+
 - With the V2 runner and async scheduling, the engine keeps `pp_size + 1 = 3`
   batches in flight (`max_concurrent_batches`, `EngineCore.step_with_batch_queue`).
 - The scheduler lets each request decode only every `pp_size` steps
@@ -275,6 +281,7 @@ A burst of requests that finish prefill in the same step all land in one
 microbatch, so every other step reaches the stages nearly empty and each stage
 idles about half the time. `VLLM_PP_MICROBATCH_BALANCE=1`
 (`PP_MICROBATCH_BALANCE` in serve.sh) fixes this:
+
 - after each schedule, it moves the lowest-priority decodes just scheduled into
   the smaller microbatch, until the sizes differ by at most one;
 - a moved request waits one extra step once;

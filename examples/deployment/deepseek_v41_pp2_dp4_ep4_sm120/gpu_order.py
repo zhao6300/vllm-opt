@@ -25,10 +25,11 @@ replace them for offline checks.
 
 import argparse
 import itertools
-import re
 import subprocess
 import sys
 from pathlib import Path
+
+import regex as re
 
 # Relative cost of a GPU pair's path (nvidia-smi topo -m legend): NVLink, a
 # single PCIe switch, multiple switches, the host bridge, across PCIe host
