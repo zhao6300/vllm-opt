@@ -288,6 +288,26 @@ idles about half the time. `VLLM_PP_MICROBATCH_BALANCE=1`
 - no request decodes sooner than `pp_size` steps after its last decode, which
   is the gap the token ring requires.
 
+`PP_MICROBATCH_BALANCE=pack` (`VLLM_PP_MICROBATCH_BALANCE=pack`) does the
+opposite: it gathers the decodes in the fullest microbatch.
+
+- A request just scheduled moves into the fullest other microbatch while that
+  one is at least as big as its own, so a group that is already the fullest
+  stays put. A moved request waits extra steps once, never fewer than M.
+- The steps of the other microbatch then carry no decode. A request cannot
+  decode again before its token returns (the stage round trip, about two
+  steps), so with the decodes in one microbatch a stage is idle for part of each
+  cycle. A bounded prefill chunk fits there without delaying a token. Bound it
+  with `--max-num-batched-tokens` (for example 1024) and
+  `--long-prefill-token-threshold` (for example 512).
+- Total running requests stay capped by `--max-num-seqs` (the runner slot
+  count), so one microbatch can hold all of them and nothing spills over. Set
+  `VLLM_PP_PACK_MAX_SEQS` (`PP_PACK_MAX_SEQS`) to cap the decodes per
+  microbatch; the rest go to the next fullest one. Leave it at 0 until the
+  decode step time is seen to grow with the batch size.
+- A prefill chunk is still scheduled in the steps that carry decodes, so those
+  steps get longer by the chunk's time.
+
 DBO is a different mechanism: it splits one step into two ubatches to overlap
 the EP all-to-all on one rank. It stays rejected with PP and with
 speculative decoding (`vllm/config/vllm.py`) and is not used here.

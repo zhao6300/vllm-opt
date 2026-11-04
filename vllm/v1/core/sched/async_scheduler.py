@@ -29,10 +29,18 @@ class AsyncScheduler(Scheduler):
                 self.pp_size,
                 self.decode_stagger,
             )
-        # Keep the decode microbatches the same size (VLLM_PP_MICROBATCH_BALANCE).
+        # How decodes are spread over the microbatches
+        # (VLLM_PP_MICROBATCH_BALANCE): equal sizes, or packed into the fullest.
+        balance_mode = envs.VLLM_PP_MICROBATCH_BALANCE
         self.balance_decode_microbatches = (
-            self.decode_stagger > 1 and envs.VLLM_PP_MICROBATCH_BALANCE
+            self.decode_stagger > 1 and balance_mode == "balance"
         )
+        self.pack_decode_microbatches = (
+            self.decode_stagger > 1 and balance_mode == "pack"
+        )
+        self.pack_max_seqs = envs.VLLM_PP_PACK_MAX_SEQS
+        if self.pack_max_seqs < 0:
+            raise ValueError("VLLM_PP_PACK_MAX_SEQS must be >= 0")
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -70,8 +78,27 @@ class AsyncScheduler(Scheduler):
                 )
                 staggered.append(request)
 
-        if self.use_v2_model_runner and self.balance_decode_microbatches:
-            self._balance_decode_microbatches(staggered)
+        if self.use_v2_model_runner:
+            if self.balance_decode_microbatches:
+                self._balance_decode_microbatches(staggered)
+            elif self.pack_decode_microbatches:
+                self._pack_decode_microbatches(staggered)
+
+    def _decode_microbatch_sizes(self) -> list[int]:
+        """Decoding requests per microbatch, indexed from the next step.
+
+        Requests scheduled now (next eligible ``decode_stagger`` steps away)
+        are in the last microbatch.
+        """
+        stagger = self.decode_stagger
+        base = self.current_step + 1  # The next step's microbatch is bucket 0.
+        sizes = [0] * stagger
+        for request in self.running:
+            if request.is_prefill_chunk or request.is_finished():
+                continue
+            step = max(request.next_decode_eligible_step, base)
+            sizes[(step - base) % stagger] += 1
+        return sizes
 
     def _balance_decode_microbatches(self, scheduled: list[Request]) -> None:
         """Move decodes from this step's microbatch to the smallest one.
@@ -90,13 +117,8 @@ class AsyncScheduler(Scheduler):
         gap stays valid.
         """
         stagger = self.decode_stagger
-        base = self.current_step + 1  # The next step's microbatch is bucket 0.
-        sizes = [0] * stagger
-        for request in self.running:
-            if request.is_prefill_chunk or request.is_finished():
-                continue
-            step = max(request.next_decode_eligible_step, base)
-            sizes[(step - base) % stagger] += 1
+        base = self.current_step + 1
+        sizes = self._decode_microbatch_sizes()
         # Requests scheduled now are next eligible at current_step + stagger.
         this_bucket = stagger - 1
         movable = list(scheduled)
@@ -106,6 +128,40 @@ class AsyncScheduler(Scheduler):
                 break
             request = movable.pop()
             # The first step of bucket `target` at least `stagger` steps away.
+            request.next_decode_eligible_step = base + target + stagger
+            sizes[this_bucket] -= 1
+            sizes[target] += 1
+
+    def _pack_decode_microbatches(self, scheduled: list[Request]) -> None:
+        """Move decodes from this step's microbatch into the fullest other one.
+
+        Packing keeps the decodes in as few microbatches as possible: the steps
+        of the other microbatches carry no decode, so a bounded prefill chunk
+        there does not delay any token. A request just scheduled moves only
+        while the fullest other microbatch is at least as big as its own, so
+        a group that is already the fullest stays put. With
+        ``VLLM_PP_PACK_MAX_SEQS`` set, a microbatch with that many decodes
+        takes no more and the rest go to the next fullest one, including the
+        excess of a burst that starts decoding together.
+
+        A moved request waits extra steps once, never fewer than
+        ``decode_stagger`` (see ``_balance_decode_microbatches``).
+        """
+        stagger = self.decode_stagger
+        base = self.current_step + 1
+        sizes = self._decode_microbatch_sizes()
+        this_bucket = stagger - 1
+        cap = self.pack_max_seqs
+        movable = list(scheduled)
+        while movable:
+            targets = [b for b in range(this_bucket) if cap == 0 or sizes[b] < cap]
+            if not targets:
+                break
+            target = max(targets, key=lambda b: (sizes[b], -b))
+            over_cap = cap > 0 and sizes[this_bucket] > cap
+            if sizes[target] < sizes[this_bucket] and not over_cap:
+                break
+            request = movable.pop()
             request.next_decode_eligible_step = base + target + stagger
             sizes[this_bucket] -= 1
             sizes[target] += 1

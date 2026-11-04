@@ -45,8 +45,11 @@ export VLLM_PP_SEND_BUFFERS=${PP_SEND_BUFFERS:-0}
 # token_wait / recv_wait in the step profile); TPOT grows with M. Set PP_SEND_BUFFERS
 # to M with it.
 export VLLM_PP_NUM_MICROBATCHES=${PP_NUM_MICROBATCHES:-0}
-# Phase 4: keep the decode microbatches equal in size.
+# Phase 4: 0/off, 1/balance (equal decode microbatches) or pack (decodes in the
+# fullest microbatch). PP_PACK_MAX_SEQS caps the decodes per microbatch in pack
+# mode (0 = no cap).
 export VLLM_PP_MICROBATCH_BALANCE=${PP_MICROBATCH_BALANCE:-0}
+export VLLM_PP_PACK_MAX_SEQS=${PP_PACK_MAX_SEQS:-0}
 # Phase 2: per-rank step timings every N steps (0 = off).
 export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-0}
 

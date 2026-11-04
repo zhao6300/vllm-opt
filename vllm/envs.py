@@ -64,7 +64,8 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
-    VLLM_PP_MICROBATCH_BALANCE: bool = False
+    VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
+    VLLM_PP_PACK_MAX_SEQS: int = 0
     VLLM_PP_SEND_BUFFERS: int = 0
     VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -400,6 +401,19 @@ def use_mega_aot_artifact():
     )
 
     return os.environ.get("VLLM_USE_MEGA_AOT_ARTIFACT", default_value) == "1"
+
+
+def _pp_microbatch_balance() -> str:
+    """VLLM_PP_MICROBATCH_BALANCE: off, balance or pack ("0" and "1" are the
+    older spellings of off and balance)."""
+    value = os.getenv("VLLM_PP_MICROBATCH_BALANCE", "off")
+    mode = {"0": "off", "1": "balance"}.get(value, value)
+    if mode not in ("off", "balance", "pack"):
+        raise ValueError(
+            f"Invalid value '{value}' for VLLM_PP_MICROBATCH_BALANCE. "
+            "Valid options: off, balance, pack (or 0, 1)."
+        )
+    return mode
 
 
 def env_with_choices(
@@ -938,13 +952,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # step, at the cost of M x step time per token and smaller microbatches.
     # Read by the scheduler and every worker: set it for the whole server.
     "VLLM_PP_NUM_MICROBATCHES": lambda: int(os.getenv("VLLM_PP_NUM_MICROBATCHES", "0")),
-    # V2 runner + PP + async scheduling: keep the decode microbatches (the
-    # requests decoded in alternating steps) the same size. A burst of requests
-    # that start decoding in one step otherwise stays in one microbatch, and
-    # every other step reaches the stages nearly empty.
-    "VLLM_PP_MICROBATCH_BALANCE": lambda: bool(
-        int(os.getenv("VLLM_PP_MICROBATCH_BALANCE", "0"))
-    ),
+    # V2 runner + PP + async scheduling: how decode requests are spread over the
+    # decode microbatches (the requests decoded in alternating steps). A burst
+    # of requests that start decoding in one step otherwise stays in one
+    # microbatch, and every other step reaches the stages nearly empty.
+    # "balance" (or "1") keeps the microbatches the same size. "pack" gathers
+    # the decodes in the fullest microbatch, so the other steps carry no decode
+    # and a small prefill chunk fits in the idle time of a stage. "off" (or
+    # "0", the default) leaves the assignment alone.
+    "VLLM_PP_MICROBATCH_BALANCE": lambda: _pp_microbatch_balance(),
+    # "pack" mode: most decode requests one microbatch holds before the rest
+    # go to the next fullest one. 0 never spills over, which is what the
+    # scheduler's max_num_seqs (total running requests) allows anyway.
+    "VLLM_PP_PACK_MAX_SEQS": lambda: int(os.getenv("VLLM_PP_PACK_MAX_SEQS", "0")),
     # Number of send buffers per non-last PP rank. 0 waits for the previous
     # step's intermediate-tensor send before each forward (default). N >= 1
     # copies each step's payload into one of N preallocated buffers and waits
@@ -2403,6 +2423,7 @@ def compile_factors() -> dict[str, object]:
         # PP scheduling, send buffering and step timing run outside the model.
         "VLLM_PP_NUM_MICROBATCHES",
         "VLLM_PP_MICROBATCH_BALANCE",
+        "VLLM_PP_PACK_MAX_SEQS",
         "VLLM_PP_SEND_BUFFERS",
         "VLLM_PP_STEP_PROFILE_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives

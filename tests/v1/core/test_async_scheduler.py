@@ -812,7 +812,9 @@ def test_resumable_request_handoff():
     assert len(request.output_token_ids) == 1
 
 
-def _pp_scheduler(stagger: int, balance: bool):
+def _pp_scheduler(
+    stagger: int, balance: bool, pack: bool = False, pack_max_seqs: int = 0
+):
     """An async V2 scheduler rotating decodes through ``stagger`` microbatches
     (``stagger + 1`` batches in flight)."""
     scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
@@ -820,6 +822,8 @@ def _pp_scheduler(stagger: int, balance: bool):
     scheduler.use_pp = True
     scheduler.decode_stagger = stagger
     scheduler.balance_decode_microbatches = balance
+    scheduler.pack_decode_microbatches = pack
+    scheduler.pack_max_seqs = pack_max_seqs
     return scheduler
 
 
@@ -912,3 +916,71 @@ def test_pp_decode_microbatch_balancing_keeps_the_pp_cadence(
         counts[step % stagger] += 1
     base, extra = divmod(num_requests, stagger)
     assert sorted(counts) == sorted([base + 1] * extra + [base] * (stagger - extra))
+
+
+def _decode_sizes_with_arrivals(
+    scheduler: AsyncScheduler, arrivals: dict[int, int], num_steps: int
+) -> tuple[list[int], dict[str, list[int]]]:
+    """Decode requests per step, and the steps each request decoded in, when
+    ``arrivals[step]`` requests are added just before ``step`` is scheduled."""
+    stagger = scheduler.decode_stagger
+    in_flight: deque[SchedulerOutput] = deque()
+    sizes: list[int] = []
+    decoded_in: dict[str, list[int]] = defaultdict(list)
+    next_id = 0
+    for step in range(num_steps):
+        count = arrivals.get(step, 0)
+        for request in create_requests(
+            num_requests=count,
+            max_tokens=256,
+            req_ids=[f"r{next_id + i}" for i in range(count)],
+        ):
+            scheduler.add_request(request)
+        next_id += count
+
+        output = scheduler.schedule()
+        new_ids = {r.req_id for r in output.scheduled_new_reqs}
+        decoding = [r for r in output.num_scheduled_tokens if r not in new_ids]
+        sizes.append(len(decoding))
+        for req_id in decoding:
+            decoded_in[req_id].append(step)
+        in_flight.append(output)
+        if len(in_flight) == stagger + 1:
+            done = in_flight.popleft()
+            scheduler.update_from_output(done, _make_model_runner_output(done))
+    return sizes, decoded_in
+
+
+def test_pp_decode_microbatch_packing_gathers_staggered_arrivals():
+    arrivals = {0: 4, 1: 4}
+    kwargs = dict(arrivals=arrivals, num_steps=16)
+
+    spread, _ = _decode_sizes_with_arrivals(_pp_scheduler(2, balance=False), **kwargs)
+    # Requests that start decoding in different steps stay in separate
+    # microbatches.
+    assert spread[-4:] == [4, 4, 4, 4]
+
+    packed, _ = _decode_sizes_with_arrivals(
+        _pp_scheduler(2, balance=False, pack=True), **kwargs
+    )
+    # Packing moves them into one microbatch: every other step is decode-free.
+    assert packed[-4:] in ([8, 0, 8, 0], [0, 8, 0, 8])
+
+
+def test_pp_decode_microbatch_packing_spills_over_the_cap():
+    scheduler = _pp_scheduler(2, balance=False, pack=True, pack_max_seqs=5)
+    sizes, _ = _decode_sizes_with_arrivals(scheduler, {0: 8}, num_steps=16)
+    assert sorted(sizes[-2:]) == [3, 5]
+    assert sizes[-4:-2] == sizes[-2:]
+
+
+@pytest.mark.parametrize("stagger", [2, 3])
+def test_pp_decode_microbatch_packing_keeps_the_pp_cadence(stagger: int):
+    """No request decodes again sooner than decode_stagger steps."""
+    scheduler = _pp_scheduler(stagger, balance=False, pack=True)
+    arrivals = {0: 3, 1: 3, 2: 2}
+    _, decoded_in = _decode_sizes_with_arrivals(scheduler, arrivals, num_steps=24)
+    assert decoded_in
+    for req_id, steps in decoded_in.items():
+        gaps = [b - a for a, b in zip(steps, steps[1:])]
+        assert all(gap >= stagger for gap in gaps), (req_id, steps)
