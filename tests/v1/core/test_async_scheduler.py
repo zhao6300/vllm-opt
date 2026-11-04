@@ -813,11 +813,17 @@ def test_resumable_request_handoff():
 
 
 def _pp_scheduler(
-    stagger: int, balance: bool, pack: bool = False, pack_max_seqs: int = 0
+    stagger: int,
+    balance: bool,
+    pack: bool = False,
+    pack_max_seqs: int = 0,
+    **scheduler_kwargs,
 ):
     """An async V2 scheduler rotating decodes through ``stagger`` microbatches
     (``stagger + 1`` batches in flight)."""
-    scheduler = create_scheduler(async_scheduling=True, use_v2_model_runner=True)
+    scheduler = create_scheduler(
+        async_scheduling=True, use_v2_model_runner=True, **scheduler_kwargs
+    )
     scheduler.pp_size = min(stagger, 2)
     scheduler.use_pp = True
     scheduler.decode_stagger = stagger
@@ -984,3 +990,139 @@ def test_pp_decode_microbatch_packing_keeps_the_pp_cadence(stagger: int):
     for req_id, steps in decoded_in.items():
         gaps = [b - a for a, b in zip(steps, steps[1:])]
         assert all(gap >= stagger for gap in gaps), (req_id, steps)
+
+
+def _prefill_tokens_per_step(
+    scheduler: AsyncScheduler, arrivals: dict[int, tuple[int, int]], num_steps: int
+) -> list[tuple[int, int]]:
+    """(decoding requests, prefill tokens) of each step, when
+    ``arrivals[step] = (count, prompt_len)`` requests are added just before
+    ``step`` is scheduled. Prefill chunks sample no token, as on a worker."""
+    in_flight: deque[tuple[SchedulerOutput, set[str]]] = deque()
+    steps: list[tuple[int, int]] = []
+    next_id = 0
+    for step in range(num_steps):
+        count, prompt_len = arrivals.get(step, (0, 0))
+        if count:
+            for request in create_requests(
+                num_requests=count,
+                num_tokens=prompt_len,
+                max_tokens=10_000,
+                req_ids=[f"r{next_id + i}" for i in range(count)],
+            ):
+                scheduler.add_request(request)
+            next_id += count
+
+        output = scheduler.schedule()
+        new_ids = {r.req_id for r in output.scheduled_new_reqs}
+        decoding = {
+            req_id
+            for req_id, num_tokens in output.num_scheduled_tokens.items()
+            if req_id not in new_ids and num_tokens == 1
+        }
+        steps.append((len(decoding), output.total_num_scheduled_tokens - len(decoding)))
+        prompt_done = {
+            req_id
+            for req_id in output.num_scheduled_tokens
+            if scheduler.requests[req_id].num_computed_tokens
+            >= scheduler.requests[req_id].num_prompt_tokens
+        }
+        in_flight.append((output, prompt_done))
+        if len(in_flight) == scheduler.decode_stagger + 1:
+            done, done_prompt = in_flight.popleft()
+            req_ids = list(done.num_scheduled_tokens)
+            scheduler.update_from_output(
+                done,
+                ModelRunnerOutput(
+                    req_ids=req_ids,
+                    req_id_to_index={r: i for i, r in enumerate(req_ids)},
+                    sampled_token_ids=[
+                        [1] if r in done_prompt else [] for r in req_ids
+                    ],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+    return steps
+
+
+def _capped_pack_scheduler(
+    decode_cap: int, free_cap: int, pack_max_seqs: int = 0
+) -> AsyncScheduler:
+    scheduler = _pp_scheduler(
+        2,
+        balance=False,
+        pack=True,
+        pack_max_seqs=pack_max_seqs,
+        max_num_seqs=64,
+        max_num_batched_tokens=2048,
+    )
+    scheduler.pack_decode_step_prefill_tokens = decode_cap
+    scheduler.pack_free_step_prefill_tokens = free_cap
+    return scheduler
+
+
+def test_pack_caps_the_prefill_tokens_of_steps_with_and_without_decodes():
+    scheduler = _capped_pack_scheduler(decode_cap=128, free_cap=512)
+    arrivals = {0: (8, 20), 20: (1, 1500)}
+    steps = _prefill_tokens_per_step(scheduler, arrivals, num_steps=80)[20:]
+
+    with_decodes = [prefill for decodes, prefill in steps if decodes]
+    without_decodes = [prefill for decodes, prefill in steps if not decodes and prefill]
+    assert max(with_decodes) == 128
+    assert max(without_decodes) == 512
+    assert sum(with_decodes) + sum(without_decodes) == 1500
+
+
+def test_pack_zero_decode_step_cap_prefills_only_in_free_steps():
+    scheduler = _capped_pack_scheduler(decode_cap=0, free_cap=512)
+    arrivals = {0: (8, 20), 20: (1, 1500)}
+    steps = _prefill_tokens_per_step(scheduler, arrivals, num_steps=80)[20:]
+
+    assert all(prefill == 0 for decodes, prefill in steps if decodes)
+    # The prompt still gets all its tokens, in the steps without decodes.
+    assert sum(prefill for _, prefill in steps) == 1500
+
+
+def test_pack_zero_decode_step_cap_is_dropped_without_a_free_step():
+    # Capping each microbatch at 2 decodes spreads four requests over both, so
+    # every step has decodes and a zero cap would starve the prefill.
+    scheduler = _capped_pack_scheduler(decode_cap=0, free_cap=512, pack_max_seqs=2)
+    arrivals = {0: (4, 20), 20: (1, 1500)}
+    steps = _prefill_tokens_per_step(scheduler, arrivals, num_steps=80)[20:]
+
+    assert sum(prefill for _, prefill in steps) == 1500
+
+
+def test_pack_prefill_caps_default_to_the_scheduler_limits(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    for name in (
+        "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        use_v2_model_runner=True,
+        max_num_batched_tokens=2048,
+        long_prefill_token_threshold=256,
+    )
+    assert scheduler.pack_decode_step_prefill_tokens == 256
+    assert scheduler.pack_free_step_prefill_tokens == 2048
+
+    scheduler = create_scheduler(
+        async_scheduling=True, use_v2_model_runner=True, max_num_batched_tokens=2048
+    )
+    assert scheduler.pack_decode_step_prefill_tokens == 2048
+    assert scheduler.pack_free_step_prefill_tokens == 2048
+
+    monkeypatch.setenv("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", "0")
+    monkeypatch.setenv("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", "640")
+    scheduler = create_scheduler(
+        async_scheduling=True, use_v2_model_runner=True, max_num_batched_tokens=2048
+    )
+    assert scheduler.pack_decode_step_prefill_tokens == 0
+    assert scheduler.pack_free_step_prefill_tokens == 640

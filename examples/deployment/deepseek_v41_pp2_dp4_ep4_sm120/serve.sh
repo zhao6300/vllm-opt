@@ -21,6 +21,9 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 # Per DP rank: the server admits up to 4 x MAX_NUM_SEQS concurrent requests.
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
+# Most prefill tokens one request takes per step (--long-prefill-token-threshold).
+# Empty leaves it off.
+LONG_PREFILL_TOKEN_THRESHOLD=${LONG_PREFILL_TOKEN_THRESHOLD:-}
 # Largest decode step (tokens) replayed as a CUDA graph; larger steps run
 # eager. vLLM's default on SM120 is min(MAX_NUM_SEQS x 6 x 2, 512): with five
 # DSpark drafts and two PP microbatches that covers ~85 requests per
@@ -50,6 +53,15 @@ export VLLM_PP_NUM_MICROBATCHES=${PP_NUM_MICROBATCHES:-0}
 # mode (0 = no cap).
 export VLLM_PP_MICROBATCH_BALANCE=${PP_MICROBATCH_BALANCE:-0}
 export VLLM_PP_PACK_MAX_SEQS=${PP_PACK_MAX_SEQS:-0}
+# Pack mode: prefill tokens a step may carry with / without decodes. Unset: the
+# decode step takes LONG_PREFILL_TOKEN_THRESHOLD (or MAX_NUM_BATCHED_TOKENS
+# without it), the free step MAX_NUM_BATCHED_TOKENS.
+if [ -n "${PP_PACK_DECODE_PREFILL_TOKENS:-}" ]; then
+    export VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS=$PP_PACK_DECODE_PREFILL_TOKENS
+fi
+if [ -n "${PP_PACK_FREE_PREFILL_TOKENS:-}" ]; then
+    export VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS=$PP_PACK_FREE_PREFILL_TOKENS
+fi
 # Phase 2: per-rank step timings every N steps (0 = off).
 export VLLM_PP_STEP_PROFILE_INTERVAL=${VLLM_PP_STEP_PROFILE_INTERVAL:-0}
 
@@ -112,6 +124,9 @@ if [ "$EP" = 1 ]; then
 fi
 if [ "$NUMA_BIND" = 1 ]; then
     args+=(--numa-bind)
+fi
+if [ -n "$LONG_PREFILL_TOKEN_THRESHOLD" ]; then
+    args+=(--long-prefill-token-threshold "$LONG_PREFILL_TOKEN_THRESHOLD")
 fi
 if [ -n "$MAX_CUDAGRAPH_CAPTURE_SIZE" ]; then
     args+=(--max-cudagraph-capture-size "$MAX_CUDAGRAPH_CAPTURE_SIZE")

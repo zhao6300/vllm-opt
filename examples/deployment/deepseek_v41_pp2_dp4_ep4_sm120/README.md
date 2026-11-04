@@ -306,7 +306,21 @@ opposite: it gathers the decodes in the fullest microbatch.
   microbatch; the rest go to the next fullest one. Leave it at 0 until the
   decode step time is seen to grow with the batch size.
 - A prefill chunk is still scheduled in the steps that carry decodes, so those
-  steps get longer by the chunk's time.
+  steps get longer by the chunk's time. Two caps bound the prefill tokens a
+  step carries, by kind of step:
+    - `VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS` (`PP_PACK_DECODE_PREFILL_TOKENS`)
+      for steps that have decodes to run. They are on the critical path of every
+      decoding request, so each prefill token there adds to TPOT. 0 defers all
+      prefill from those steps. The 0 is dropped when every microbatch has
+      decodes (no free step is left), so prefill cannot starve.
+    - `VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS` (`PP_PACK_FREE_PREFILL_TOKENS`) for
+      steps without decodes. These fit in the idle time of a stage (about 500 to
+      650 tokens on this setup, to measure) and should stay below it, or the next
+      decode step waits behind them.
+    - Unset, the decode step takes `--long-prefill-token-threshold`
+      (`LONG_PREFILL_TOKEN_THRESHOLD` in serve.sh), or `--max-num-batched-tokens`
+      without it, and the free step `--max-num-batched-tokens`. They are total
+      caps per step; `--long-prefill-token-threshold` still caps each request.
 
 DBO is a different mechanism: it splits one step into two ubatches to overlap
 the EP all-to-all on one rank. It stays rejected with PP and with

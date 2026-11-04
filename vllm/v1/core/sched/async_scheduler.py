@@ -41,6 +41,23 @@ class AsyncScheduler(Scheduler):
         self.pack_max_seqs = envs.VLLM_PP_PACK_MAX_SEQS
         if self.pack_max_seqs < 0:
             raise ValueError("VLLM_PP_PACK_MAX_SEQS must be >= 0")
+        # Prefill token caps of the steps with and without decodes (pack mode).
+        budget = self.scheduler_config.max_num_batched_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        decode_step_cap = envs.VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS
+        free_step_cap = envs.VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS
+        for name, cap in (
+            ("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", decode_step_cap),
+            ("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", free_step_cap),
+        ):
+            if cap is not None and cap < 0:
+                raise ValueError(f"{name} must be >= 0")
+        self.pack_decode_step_prefill_tokens = (
+            decode_step_cap if decode_step_cap is not None else threshold or budget
+        )
+        self.pack_free_step_prefill_tokens = (
+            free_step_cap if free_step_cap is not None else budget
+        )
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         super()._update_after_schedule(scheduler_output)
@@ -84,14 +101,39 @@ class AsyncScheduler(Scheduler):
             elif self.pack_decode_microbatches:
                 self._pack_decode_microbatches(staggered)
 
-    def _decode_microbatch_sizes(self) -> list[int]:
-        """Decoding requests per microbatch, indexed from the next step.
+    def _prefill_token_cap(self) -> int | None:
+        """Prefill token cap of the step being scheduled (pack mode).
 
-        Requests scheduled now (next eligible ``decode_stagger`` steps away)
-        are in the last microbatch.
+        A step with decodes to run gets ``pack_decode_step_prefill_tokens``,
+        any other step ``pack_free_step_prefill_tokens``. A cap of 0 for the
+        decode steps is dropped when every microbatch has decodes, since no
+        free step would be left to prefill in.
+        """
+        if not (self.use_v2_model_runner and self.pack_decode_microbatches):
+            return None
+        has_decodes = any(
+            not r.is_prefill_chunk
+            and not r.is_finished()
+            and r.next_decode_eligible_step <= self.current_step
+            for r in self.running
+        )
+        if not has_decodes:
+            return self.pack_free_step_prefill_tokens
+        cap = self.pack_decode_step_prefill_tokens
+        if cap == 0 and all(self._decode_microbatch_sizes(self.current_step)):
+            return None
+        return cap
+
+    def _decode_microbatch_sizes(self, first_step: int | None = None) -> list[int]:
+        """Decoding requests per microbatch, indexed from ``first_step``.
+
+        ``first_step`` defaults to the next step, once this one is scheduled:
+        requests scheduled now (next eligible ``decode_stagger`` steps away)
+        are then in the last microbatch.
         """
         stagger = self.decode_stagger
-        base = self.current_step + 1  # The next step's microbatch is bucket 0.
+        # The microbatch of the first step is bucket 0.
+        base = self.current_step + 1 if first_step is None else first_step
         sizes = [0] * stagger
         for request in self.running:
             if request.is_prefill_chunk or request.is_finished():

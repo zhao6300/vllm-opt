@@ -66,6 +66,8 @@ if TYPE_CHECKING:
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
     VLLM_PP_PACK_MAX_SEQS: int = 0
+    VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS: int | None = None
+    VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS: int | None = None
     VLLM_PP_SEND_BUFFERS: int = 0
     VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
@@ -965,6 +967,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # go to the next fullest one. 0 never spills over, which is what the
     # scheduler's max_num_seqs (total running requests) allows anyway.
     "VLLM_PP_PACK_MAX_SEQS": lambda: int(os.getenv("VLLM_PP_PACK_MAX_SEQS", "0")),
+    # "pack" mode: most prefill tokens a step may carry, in steps that have
+    # decodes to run (DECODE_STEP) and in steps that have none (FREE_STEP). The
+    # decode step is on the critical path of every decoding request, so each
+    # prefill token there adds to TPOT; a free step only has to fit in the idle
+    # time of a stage. 0 defers the prefill of that kind of step. Unset: the
+    # decode step takes --long-prefill-token-threshold (or
+    # --max-num-batched-tokens without it), the free step
+    # --max-num-batched-tokens.
+    "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", None)
+    ),
+    "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", None)
+    ),
     # Number of send buffers per non-last PP rank. 0 waits for the previous
     # step's intermediate-tensor send before each forward (default). N >= 1
     # copies each step's payload into one of N preallocated buffers and waits
@@ -2424,6 +2440,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PP_NUM_MICROBATCHES",
         "VLLM_PP_MICROBATCH_BALANCE",
         "VLLM_PP_PACK_MAX_SEQS",
+        "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS",
         "VLLM_PP_SEND_BUFFERS",
         "VLLM_PP_STEP_PROFILE_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives

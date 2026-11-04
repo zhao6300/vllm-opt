@@ -677,6 +677,10 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _prefill_token_cap(self) -> int | None:
+        """Most prefill tokens this step may carry, or None for no extra cap."""
+        return None
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -749,6 +753,9 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Prefill tokens this step may still take (None: no extra cap).
+        prefill_left = self._prefill_token_cap()
+
         # Local prefill cadence: hold prefill until the interval since the last
         # prefill-carrying step has elapsed, so decode runs in longer
         # uninterrupted stretches. Mirrors the DP gate above, including its
@@ -807,6 +814,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
+                prefill_left is not None
+                and request.is_prefill_chunk
+                and not prefill_left
+            ):
+                req_index += 1
+                continue
+
+            if (
                 self.ec_connector is not None
                 and request.mm_features
                 and not self.ec_connector.ensure_cache_available(
@@ -824,6 +839,8 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if prefill_left is not None and request.is_prefill_chunk:
+                num_new_tokens = min(num_new_tokens, prefill_left)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -932,6 +949,11 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if (
+                                prefill_left is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_left += restored
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -972,6 +994,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if prefill_left is not None and request.is_prefill_chunk:
+                prefill_left -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1249,6 +1273,7 @@ class Scheduler(SchedulerInterface):
                 # has arrived (_update_waiting_for_remote_kv).
                 num_replay_tokens = 0
 
+                prefill_work = num_computed_tokens < request.num_tokens - 1
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -1256,6 +1281,9 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    break
+                elif prefill_left is not None and prefill_work and not prefill_left:
+                    # This step's prefill token cap is used up.
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1297,6 +1325,12 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if (
+                        prefill_left is not None
+                        and prefill_work
+                        and not pad_spec_decode
+                    ):
+                        num_new_tokens = min(num_new_tokens, prefill_left)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1520,6 +1554,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if prefill_left is not None and prefill_work:
+                    prefill_left -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
