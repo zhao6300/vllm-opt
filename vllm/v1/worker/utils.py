@@ -678,7 +678,20 @@ def prepare_kernel_block_sizes(
             kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
         if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
             continue
-        if not kv_cache_spec.has_layer_views:
+        # Specs that pin the number of states in a kernel page (DeepSeek-V4.1:
+        # 64 compressed states for both the sparse-MLA and indexer kernels)
+        # pick their block size from the compression ratio rather than from the
+        # backend vote, which cannot join on one size.
+        kernel_block_states = getattr(kv_cache_spec, "kernel_block_states", None)
+        if kernel_block_states is not None and isinstance(
+            kv_cache_spec.tokens_per_state, int
+        ):
+            compress_ratio = kv_cache_spec.tokens_per_state
+            selected_block_size = min(
+                kv_cache_spec.block_size, kernel_block_states * compress_ratio
+            )
+            kernel_block_sizes.append(selected_block_size)
+        elif not kv_cache_spec.has_layer_views:
             kernel_block_sizes.append(kv_cache_spec.block_size)
         elif isinstance(kv_cache_spec, AttentionSpec):
             # This is an attention backend that supports virtual block splitting.

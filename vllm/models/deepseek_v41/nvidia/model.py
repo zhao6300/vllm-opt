@@ -19,6 +19,7 @@ from vllm.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.utils import get_pp_indices
 from vllm.forward_context import (
     get_forward_context,
     in_piecewise_cudagraph,
@@ -109,6 +110,13 @@ from ..common.engram import (
     gather_engram_hashes,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+from ..common.pipeline import (
+    get_aux_hidden_state_stages,
+    get_sharing_dependencies,
+    stage_entry_mhc_state,
+    validate_local_sharing,
+)
+from ..common.pipeline_sharing import PipelineSharing
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
     hc_expand,
@@ -713,11 +721,57 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # Aux hidden states (DSpark/EAGLE-3 target layers) captured on an upstream
+    # PP stage travel in the PP payload; the last stage prepends them to its own.
+    supports_aux_hidden_states_over_pp = True
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        if len(self.stage_ranges) > 1:
+            stages = get_aux_hidden_state_stages(
+                self.aux_hidden_state_layers, self.stage_ranges
+            )
+            last_stage = len(self.stage_ranges) - 1
+            relayed = [i for i, stage in stages.items() if stage != last_stage]
+            logger.info_once(
+                "DeepSeek V4.1 aux hidden states %s are captured on PP stages %s; "
+                "relayed to the last stage over PP: %s.",
+                str(list(stages)),
+                str(list(stages.values())),
+                str(relayed) if relayed else "none",
+            )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
+        pp_size = get_pp_group().world_size
+        stage_ranges = [
+            get_pp_indices(config.num_hidden_layers, rank, pp_size)
+            for rank in range(pp_size)
+        ]
+        self.sharing_dependencies = get_sharing_dependencies(config, stage_ranges)
+        self.stage_ranges = stage_ranges
+        additional_config = vllm_config.additional_config
+        sharing_enabled = isinstance(additional_config, dict) and additional_config.get(
+            "deepseek_v41_pp_sharing", False
+        )
+        self.pipeline_sharing: PipelineSharing | None = None
+        self.pipeline_payload_keys: frozenset[str] = frozenset()
+        if sharing_enabled:
+            assert isinstance(additional_config, dict)
+            self.pipeline_sharing = PipelineSharing(
+                vllm_config,
+                prefix,
+                get_pp_group().rank_in_group,
+                self.sharing_dependencies,
+                _select_dsv4_attn_cls(vllm_config),
+                additional_config.get("deepseek_v41_pp_share_max_bytes", 512 * 1024**2),
+            )
+            self.pipeline_payload_keys = self.pipeline_sharing.payload_keys
+        else:
+            validate_local_sharing(self.sharing_dependencies)
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
@@ -1124,19 +1178,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 pre_mix = sp_shard(pre_mix)
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
-        hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
-            range(self.start_layer, self.decoder_replay_start),
-            hidden_states,
-            positions,
-            input_ids,
-            pre_mix,
-            post_mix,
-            res_mix,
-            residual,
-            aux_hidden_by_layer,
-            engram_hashes,
-            engram_mask,
-        )
+        if self.decoder_replay_start == self.start_layer:
+            # A later PP stage that starts at the last KV source replays from its
+            # first layer. The PP payload is the previous layer's posted stream;
+            # turn it into the unfinalized state the replay layers expect.
+            assert not get_pp_group().is_first_rank
+            assert isinstance(hidden_states, torch.Tensor) and pre_mix is not None
+            hidden_states, residual, post_mix, res_mix = stage_entry_mhc_state(
+                hidden_states, pre_mix
+            )
+        else:
+            hidden_states, residual, post_mix, res_mix, pre_mix = self._run_layers(
+                range(self.start_layer, self.decoder_replay_start),
+                hidden_states,
+                positions,
+                input_ids,
+                pre_mix,
+                post_mix,
+                res_mix,
+                residual,
+                aux_hidden_by_layer,
+                engram_hashes,
+                engram_mask,
+            )
         late_aux: list[torch.Tensor] = []
         if self.decoder_replay_layers is not None:
             hidden_states, pre_mix, *late_aux = self.decoder_replay_layers(
@@ -1171,9 +1235,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.use_sequence_parallel:
                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+            # Aux id L is layer L's attention input, i.e. layer L-1's output,
+            # so the stage owning layer L-1 captures it (the stage-end aux in
+            # _collapse). Middle stages relay upstream slots (PPHandler).
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                {
+                    "hidden_states": hidden_states,
+                    "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
+        aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            + aux_hidden_states
+        )
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -1243,7 +1318,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     residual,
                     engram_hashes,
                     engram_mask,
-                    capture_previous_aux=idx in self.aux_hidden_state_layers,
+                    # A stage's first layer would capture its input, which the
+                    # previous stage already captured at its end and relays.
+                    capture_previous_aux=idx in self.aux_hidden_state_layers
+                    and (idx > self.start_layer or self.start_layer == 0),
                     mega_gate_metadata=mega_gate_metadata,
                 )
             )
@@ -1665,6 +1743,7 @@ class DeepseekV41LLMForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.model.make_empty_intermediate_tensors
         )
+        self.pipeline_payload_keys = self.model.pipeline_payload_keys
 
         self.set_moe_parameters()
 

@@ -6,6 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.models.deepseek_v41.common.pipeline import (
+    get_aux_hidden_state_stages,
+    get_sharing_dependencies,
+    stage_entry_mhc_state,
+    validate_local_sharing,
+)
 from vllm.platforms import current_platform
 
 
@@ -68,3 +74,111 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     mhc_residual, mhc_pre_mix = mhc_pre_calls[0]
     torch.testing.assert_close(mhc_residual, hidden + 10)
     assert mhc_pre_mix is pre_mix
+
+
+def _config():
+    return SimpleNamespace(
+        num_hidden_layers=40,
+        compress_ratios=[0, 0] + [2] * 18 + [1] * 20,
+        kv_source_layer_ids=[2, 8, 14, 20],
+        index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+        candidate_source_layer_id=20,
+        candidate_topk_blocks=2048,
+    )
+
+
+@pytest.mark.parametrize(
+    "ranges", [[(0, 40)], [(0, 20), (20, 40)], [(0, 8), (8, 14), (14, 20), (20, 40)]]
+)
+def test_group_aligned_pipeline_cuts_keep_all_sources_local(ranges):
+    validate_local_sharing(get_sharing_dependencies(_config(), ranges))
+
+
+def test_equal_pp4_reports_cross_stage_kv_index_and_candidates():
+    dependencies = get_sharing_dependencies(
+        _config(), [(0, 10), (10, 20), (20, 30), (30, 40)]
+    )
+    cross = {
+        (d.kind, d.source_layer, d.consumer_layer)
+        for d in dependencies
+        if d.source_stage != d.consumer_stage
+    }
+    assert {("kv", 8, 10), ("index", 28, 30), ("candidate", 20, 32)} <= cross
+    with pytest.raises(NotImplementedError, match="source layer 8.*stage 0.*stage 1"):
+        validate_local_sharing(dependencies)
+
+
+@pytest.mark.parametrize("values", [[8, 2], [2, 2], [0, 2], [-1, 2], [2, 40]])
+def test_invalid_source_lists_fail_before_layer_construction(values):
+    config = _config()
+    config.kv_source_layer_ids = values
+    with pytest.raises(ValueError, match="kv_source_layer_ids"):
+        get_sharing_dependencies(config, [(0, 40)])
+
+
+def test_compressed_consumer_requires_an_earlier_source():
+    config = _config()
+    config.kv_source_layer_ids = [8, 14, 20]
+    with pytest.raises(ValueError, match="layer 2 has no preceding kv source"):
+        get_sharing_dependencies(config, [(0, 40)])
+
+
+def test_candidate_source_must_publish_indices():
+    config = _config()
+    config.candidate_source_layer_id = 21
+    with pytest.raises(ValueError, match="candidate source must be an index source"):
+        get_sharing_dependencies(config, [(0, 40)])
+
+
+PP2_RANGES = [(0, 20), (20, 40)]
+
+
+def test_dspark_target_layers_are_captured_on_the_last_pp2_stage():
+    # dspark_target_layer_ids=[37, 38, 39]: no PP relay needed.
+    assert get_aux_hidden_state_stages((37, 38, 39), PP2_RANGES) == {
+        37: 1,
+        38: 1,
+        39: 1,
+    }
+
+
+def test_stage_end_aux_belongs_to_the_stage_that_ends_there():
+    # Aux id 20 is layer 19's output, captured at stage 0's end and relayed;
+    # aux id 40 is the final layer output on the last stage.
+    assert get_aux_hidden_state_stages((2, 20, 21, 40), PP2_RANGES) == {
+        2: 0,
+        20: 0,
+        21: 1,
+        40: 1,
+    }
+
+
+@pytest.mark.parametrize("layer_id", [0, -1, 41])
+def test_aux_ids_outside_the_backbone_are_rejected(layer_id):
+    with pytest.raises(ValueError, match="aux hidden state id"):
+        get_aux_hidden_state_stages((layer_id,), PP2_RANGES)
+
+
+def _mhc_post_ref(x, residual, post_layer_mix, comb_res_mix):
+    # tests/kernels/mhc/test_mhc_kernels.py::mhc_post_ref
+    term2 = torch.bmm(comb_res_mix.mT, residual.float())
+    return (x.float().unsqueeze(-2) * post_layer_mix + term2).bfloat16()
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+def test_stage_entry_state_posts_back_to_the_received_stream(num_tokens):
+    """The state a later PP stage starts replay from must post to exactly the
+    stream the previous stage sent, so its first layer's KV write and forward
+    see the same input as without PP."""
+    hc_mult, hidden = 4, 64
+    received = torch.randn(num_tokens, hc_mult, hidden).bfloat16()
+    pre_mix = torch.rand(num_tokens, hc_mult)
+
+    x, residual, post_mix, res_mix = stage_entry_mhc_state(received, pre_mix)
+
+    assert x.shape == (num_tokens, hidden) and x.dtype == received.dtype
+    assert post_mix.shape == (num_tokens, hc_mult, 1)
+    assert res_mix.shape == (num_tokens, hc_mult, hc_mult) and res_mix.is_contiguous()
+    assert post_mix.dtype == res_mix.dtype == torch.float32
+    assert residual is received
+    assert torch.equal(_mhc_post_ref(x, residual, post_mix, res_mix), received)
