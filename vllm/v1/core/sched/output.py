@@ -166,6 +166,13 @@ class CachedRequestData:
     def num_reqs(self) -> int:
         return len(self.req_ids)
 
+    @property
+    def resumed_req_ids(self) -> set[str]:
+        """Always empty: a resumed request is re-sent in full in
+        ``scheduled_new_reqs``. Kept for external KV connectors (e.g. LMCache's
+        ``LMCacheMPConnector``) that still read it."""
+        return set()
+
     @cached_property
     def _req_id_to_num_output_tokens(self) -> dict[str, int]:
         """Cache mapping of req_id to num_output_tokens for O(1) lookup.

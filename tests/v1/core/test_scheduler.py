@@ -4418,6 +4418,9 @@ def test_kv_connector_handles_preemption(is_async, use_ec_connector, ec_role):
         # remote hit. So only single new token is scheduled.
         expected_num_scheduled_tokens=1,
     )
+    # A connector that still reads resumed_req_ids sees none: the resumed
+    # request is in scheduled_new_reqs.
+    assert output.scheduled_cached_reqs.resumed_req_ids == set()
     assert len(scheduler.running) == 1
     assert len(scheduler.waiting) == 0
     # A resumed (previously preempted) request is emitted as a
