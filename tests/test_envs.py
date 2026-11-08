@@ -625,3 +625,35 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "off"),
+        ("0", "off"),
+        ("1", "balance"),
+        ("off", "off"),
+        ("balance", "balance"),
+        ("pack", "pack"),
+    ],
+)
+def test_pp_microbatch_balance_modes(
+    monkeypatch: pytest.MonkeyPatch, value: str | None, expected: str
+):
+    if value is None:
+        monkeypatch.delenv("VLLM_PP_MICROBATCH_BALANCE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_MICROBATCH_BALANCE", value)
+
+    mode = envs.VLLM_PP_MICROBATCH_BALANCE
+    assert mode == expected
+    assert "VLLM_PP_MICROBATCH_BALANCE" not in envs.compile_factors()
+    assert "VLLM_PP_PACK_MAX_SEQS" not in envs.compile_factors()
+
+
+def test_pp_microbatch_balance_rejects_unknown_mode(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VLLM_PP_MICROBATCH_BALANCE", "spread")
+
+    with pytest.raises(ValueError, match="VLLM_PP_MICROBATCH_BALANCE"):
+        _ = envs.VLLM_PP_MICROBATCH_BALANCE

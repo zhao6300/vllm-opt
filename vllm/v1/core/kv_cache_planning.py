@@ -1297,6 +1297,8 @@ def _max_memory_usage_bytes_from_groups(
     )
     total_blocks = 0
     for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
         spec = group.kv_cache_spec
         if isinstance(spec, UniformTypeKVCacheSpecs):
             total_blocks += spec.max_memory_usage_pages(vllm_config)

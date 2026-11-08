@@ -26,6 +26,12 @@ def _reject_image_placeholder(text: Any) -> None:
         )
 
 
+def _replace_image_placeholder(text: Any) -> Any:
+    if isinstance(text, str):
+        return text.replace(IMAGE_PLACEHOLDER, "[deepseek_image]")
+    return text
+
+
 def _normalize_messages(
     messages: list[ChatCompletionMessageParam],
 ) -> list[dict[str, Any]]:
@@ -45,17 +51,18 @@ def _normalize_messages(
             raise ValueError(f"Invalid role: {role}")
         if "reasoning" in message:
             message["reasoning_content"] = message["reasoning"]
-        _reject_image_placeholder(message.get("reasoning_content"))
+        message["reasoning_content"] = _replace_image_placeholder(
+            message.get("reasoning_content")
+        )
         content = message.get("content")
         if isinstance(content, str):
-            _reject_image_placeholder(content)
+            message["content"] = _replace_image_placeholder(content)
         elif isinstance(content, list):
             parts = []
             for block in content:
                 part_type = block.get("type")
                 if part_type in ("text", "input_text", "output_text"):
-                    _reject_image_placeholder(block.get("text"))
-                    parts.append(block.get("text", ""))
+                    parts.append(_replace_image_placeholder(block.get("text", "")))
                 elif part_type in (
                     "image_url",
                     "input_image",
@@ -68,8 +75,7 @@ def _normalize_messages(
                 elif part_type == "tool_reference":
                     # The system prompt already lists every tool, deferred
                     # ones included, so the name is all the model needs.
-                    _reject_image_placeholder(block.get("name"))
-                    parts.append(block.get("name", ""))
+                    parts.append(_replace_image_placeholder(block.get("name", "")))
                 else:
                     raise ValueError(
                         "DeepSeek V4.1 supports text and image content only; "
@@ -77,6 +83,44 @@ def _normalize_messages(
                     )
             message["content"] = "\n\n".join(parts)
 
+    return result
+
+
+def _normalize_messages2(
+    messages: list[ChatCompletionMessageParam],
+) -> list[dict[str, Any]]:
+    # vLLM additions to the reference: Responses API part types, image_pil,
+    # and ValueError (400) instead of the reference's asserts.
+    result = [dict(message) for message in copy.deepcopy(messages)]
+    image_idx = 0
+    for message in result:
+        image_indices = message["_image_indices"] = []
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise ValueError(f"Invalid role: {role}")
+        if "reasoning" in message:
+            message["reasoning_content"] = message["reasoning"]
+        _reject_image_placeholder(message.get("reasoning_content"))
+        content = message.get("content")
+        if isinstance(content, str):
+            _reject_image_placeholder(content)
+        elif isinstance(content, list):
+            parts = []
+            for block in content:
+                part_type = block.get("type")
+                if part_type in ("text", "input_text", "output_text"):
+                    _reject_image_placeholder(block.get("text"))
+                    parts.append(block.get("text", ""))
+                elif part_type in ("image_url", "input_image", "image_pil"):
+                    parts.append(IMAGE_PLACEHOLDER)
+                    image_indices.append(image_idx)
+                    image_idx += 1
+                else:
+                    raise ValueError(
+                        "DeepSeek V4.1 supports text and image content only; "
+                        f"got {part_type!r}"
+                    )
+            message["content"] = "\n\n".join(parts)
     return result
 
 

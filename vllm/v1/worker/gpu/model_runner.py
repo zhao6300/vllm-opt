@@ -148,6 +148,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_step_profiler import pp_step_span
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -339,6 +340,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                ring_depth=self.vllm_config.pp_num_microbatches,
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -581,6 +583,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         return self.model
+
+    @property
+    def pipeline_payload_keys(self) -> frozenset[str]:
+        return getattr(self.get_model(), "pipeline_payload_keys", frozenset())
 
     def get_draft_model(self) -> nn.Module | None:
         speculator = self.speculator
@@ -2348,7 +2354,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
-            with use_workspace_lane(self._draft_workspace_lane):
+            if isinstance(self.sampler, GPUWatermarkSampler):
+                self.speculator.prepare_watermarking(
+                    self.sampler, input_batch.idx_mapping
+                )
+            with (
+                use_workspace_lane(self._draft_workspace_lane),
+                pp_step_span("draft"),
+            ):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

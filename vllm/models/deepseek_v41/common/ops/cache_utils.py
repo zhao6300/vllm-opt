@@ -270,49 +270,24 @@ def _dequantize_and_gather_k_kernel(
         # Output pointer for this token (flattened)
         output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
-        # ========== Dequantize FP8 portion using UE8M0 ==========
-        for qblock_idx in tl.static_range(n_quant_blocks):
-            qblock_start = qblock_idx * quant_block
+        qblocks = tl.arange(0, triton.next_power_of_2(n_quant_blocks))
+        offsets = qblocks[:, None] * quant_block + tl.arange(0, quant_block)[None, :]
+        mask = (qblocks[:, None] < n_quant_blocks) & (offsets < fp8_dim)
+        x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+        fp8_dtype = tl.float8e4b8 if use_fnuz else tl.float8e4nv
+        x = x_uint8.to(fp8_dtype, bitcast=True).to(tl.float32)
+        encoded_scales = tl.load(
+            token_scale_ptr + qblocks, mask=qblocks < n_quant_blocks, other=127
+        )
+        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+        tl.store(
+            output_row_ptr + offsets, (x * scales[:, None]).to(tl.bfloat16), mask=mask
+        )
 
-            if qblock_start < fp8_dim:
-                offsets = qblock_start + tl.arange(0, quant_block)
-                mask = offsets < fp8_dim
-
-                # Load quantized fp8 values (stored as uint8)
-                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
-
-                # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
-                if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
-                else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
-
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
-
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
-
-        # ========== Copy BF16 portion directly ==========
-        bf16_output_offset = fp8_dim  # After 448 elements in output
-
-        # Read bf16 from cache
         bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
-
-        # Process in chunks of 16
-        for j in tl.static_range(bf16_dim // 16):
-            chunk_offsets = j * 16 + tl.arange(0, 16)
-            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+        rope_offsets = tl.arange(0, bf16_dim)
+        rope = tl.load(bf16_cache_ptr + rope_offsets)
+        tl.store(output_row_ptr + fp8_dim + rope_offsets, rope)
 
 
 @triton.jit
@@ -1261,6 +1236,154 @@ def build_flashinfer_mixed_sparse_indices(
         num_warps=num_warps,
     )
     return sparse_indices, sparse_topk_lens
+
+
+def paged_cache_page_rows(cache: torch.Tensor) -> int:
+    """Records one paged block of ``cache`` holds, for the 2D/3D/HND/NHD forms."""
+    if cache.dim() == 4:
+        return cache.shape[2] if cache.shape[1] == 1 else cache.shape[1]
+    if cache.dim() == 3:
+        return cache.shape[1]
+    return 1
+
+
+def paged_cache_block_span(cache: torch.Tensor) -> int:
+    """Rows between consecutive paged blocks of ``cache``, padding included."""
+    token_stride = cache.stride(-2) if cache.dim() >= 3 else cache.shape[-1]
+    if token_stride <= 0 or cache.stride(0) % token_stride != 0:
+        raise NotImplementedError(
+            "FLASHINFER_MLA_SPARSE_DSV4 packed KV requires the per-block stride "
+            f"({cache.stride(0)}) to be a multiple of the per-token stride "
+            f"({token_stride}); this layout is not supported yet."
+        )
+    return cache.stride(0) // token_stride
+
+
+def paged_slots_to_cache_rows(
+    slots: torch.Tensor, page_rows: int, page_span: int
+) -> torch.Tensor:
+    """Map ``block * block_size + offset`` slots to rows of a padded cache.
+
+    FlashInfer's DSv4.1 readers address a record as a flat row of the whole
+    cache (``row * row_pitch``), while ``rope_quant_insert``'s Triton writers
+    walk the block stride. Padded pages therefore need the slot rewritten to
+    the row it actually occupies; dense pages map to themselves.
+
+    Args:
+        slots: int paged slot ids; negative entries stay negative.
+        page_rows: Records one physical page holds.
+        page_span: Rows between consecutive physical pages, padding included.
+
+    Returns:
+        ``slots`` itself when the pages are dense, else a new tensor.
+
+    """
+    if page_rows == page_span:
+        return slots
+    page = torch.div(slots, page_rows, rounding_mode="floor")
+    rows = torch.where(slots >= 0, page * page_span + slots - page * page_rows, slots)
+    return rows
+
+
+@triton.jit
+def _remap_flashinfer_index(values, block_size, block_span):
+    # FlashInfer's DSv4 kernel indexes sparse KV by physical token stride, so
+    # packed pages (#44577) need block*block_size+off -> block*block_span+off.
+    # The launcher declares these indices with sparse_indices_are_storage_offsets=True.
+    is_valid = values >= 0
+    safe_values = tl.where(is_valid, values, 0)
+    values = (safe_values // block_size) * block_span
+    values += safe_values % block_size
+    return tl.where(is_valid, values, -1)
+
+
+@triton.jit
+def _remap_storage_offset_index_kernel(
+    src_ptr,
+    dst_ptr,
+    src_row_stride,
+    dst_row_stride,
+    width,
+    block_size,
+    page_rows,
+    page_span,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < width
+    values = tl.load(src_ptr + row * src_row_stride + cols, mask=mask, other=-1)
+    is_valid = values >= 0
+    safe_values = tl.where(is_valid, values, 0)
+    # Manager block -> physical page -> row of the whole cache.
+    pages_per_block = block_size // page_rows
+    page = (safe_values // block_size) * pages_per_block
+    page += (safe_values % block_size) // page_rows
+    offset = (safe_values % block_size) % page_rows
+    values = tl.where(is_valid, page * page_span + offset, -1)
+    tl.store(dst_ptr + row * dst_row_stride + cols, values, mask=mask)
+
+
+def remap_flashinfer_sparse_indices(
+    indices: torch.Tensor,
+    block_size: int,
+    page_rows: int,
+    page_span: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Rewrite logical paged slot ids as flat cache-row offsets.
+
+    FlashInfer's inline-scale DSv4.1 kernels address a record as
+    ``row * row_pitch`` over the whole cache, so a packed page that is padded
+    to whole rows (or that shares its block with other layers' pages) stores
+    slot ``block * block_size + off`` at row ``block * page_span + off``.
+
+    Args:
+        indices: int32 paged slot ids, ``[..., 1, width]`` or ``[..., width]``.
+        block_size: States a logical (manager) block addresses.
+        page_rows: Rows a physical cache page holds.
+        page_span: Rows between consecutive physical pages, padding included.
+        out: Destination of the remapped ids; allocated when omitted.
+
+    Returns:
+        ``indices`` itself when the page is dense and one page per block,
+        otherwise the remapped ids (``out`` when given). Negative entries stay
+        negative.
+
+    """
+    assert indices.dtype == torch.int32 and indices.stride(-1) == 1, (
+        f"sparse indices must be a contiguous-row int32 tensor, got "
+        f"{indices.dtype} with strides {tuple(indices.stride())}"
+    )
+    assert indices.dim() in (2, 3) and (indices.dim() == 2 or indices.shape[1] == 1), (
+        f"sparse indices must be [rows, width] or [rows, 1, width], got {indices.shape}"
+    )
+    assert block_size % page_rows == 0, (
+        f"a {block_size}-state block does not split into {page_rows}-row pages"
+    )
+    assert page_span >= page_rows, (
+        f"a {page_rows}-row page cannot span {page_span} rows"
+    )
+    if page_rows == block_size and page_span == block_size:
+        return indices
+    width = indices.shape[-1]
+    rows = indices.numel() // width
+    if out is None:
+        out = torch.empty_like(indices)
+    block = 1024
+    _remap_storage_offset_index_kernel[(rows, cdiv(width, block))](
+        indices,
+        out,
+        indices.stride(0),
+        out.stride(0),
+        width,
+        block_size,
+        page_rows,
+        page_span,
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out if out.shape == indices.shape else out.view(indices.shape)
 
 
 @triton.jit(
