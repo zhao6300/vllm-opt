@@ -984,6 +984,79 @@ def test_pp_decode_microbatch_packing_keeps_the_pp_cadence(stagger: int):
         assert all(gap >= stagger for gap in gaps), (req_id, steps)
 
 
+@pytest.mark.parametrize("mode", ["balance", "pack"])
+@pytest.mark.parametrize("stagger", [2, 3])
+def test_pp_microbatch_moves_change_only_when_a_request_decodes(
+    stagger: int, mode: str
+):
+    """Moving a decode to another microbatch must not drop it from this step.
+
+    The worker applies this step's sampled tokens to every request in the
+    batch, so a moved request keeps its placeholders and still runs now; only
+    its next eligible step changes, and never by less than ``decode_stagger``
+    steps, which is when the sampled-token ring hands its tokens back.
+    """
+    scheduler = _pp_scheduler(stagger, balance=mode == "balance", pack=mode == "pack")
+    requests = []
+    in_flight: deque[SchedulerOutput] = deque()
+    moved = 0
+    for step in range(1, 4 * stagger + 1):
+        if step in (1, 2):
+            # Two staggered arrivals leave decodes in different microbatches,
+            # so there is something to repack.
+            arrivals = create_requests(
+                num_requests=stagger,
+                max_tokens=256,
+                req_ids=[f"s{step}r{i}" for i in range(stagger)],
+            )
+            for request in arrivals:
+                scheduler.add_request(request)
+                requests.append(request)
+
+        due = {
+            request.request_id
+            for request in scheduler.running
+            if not request.is_prefill_chunk
+            and not request.is_finished()
+            and request.next_decode_eligible_step <= scheduler.current_step
+        }
+        placeholders = {
+            request.request_id: request.num_output_placeholders for request in requests
+        }
+        output = scheduler.schedule()
+        new_ids = {new_req.req_id for new_req in output.scheduled_new_reqs}
+        decoding = set(output.num_scheduled_tokens) - new_ids
+
+        # Every decode that is due runs in this step, moved or not.
+        assert due <= decoding, (step, due - decoding)
+        for request in requests:
+            req_id = request.request_id
+            if req_id not in output.num_scheduled_tokens:
+                # An unscheduled request must not gain placeholders either.
+                assert request.num_output_placeholders == placeholders[req_id], (
+                    step,
+                    req_id,
+                )
+                continue
+            if req_id in decoding:
+                assert request.num_output_placeholders == (
+                    placeholders[req_id] + scheduler.num_sampled_tokens_per_step
+                ), (step, req_id)
+            # Repacking only pushes the next decode out, never closer.
+            assert (
+                request.next_decode_eligible_step - scheduler.current_step >= stagger
+            ), (step, req_id)
+            if request.next_decode_eligible_step > scheduler.current_step + stagger:
+                moved += 1
+
+        in_flight.append(output)
+        if len(in_flight) == stagger + 1:
+            done = in_flight.popleft()
+            scheduler.update_from_output(done, _make_model_runner_output(done))
+
+    assert moved > 0
+
+
 def _prefill_tokens_per_step(
     scheduler: AsyncScheduler, arrivals: dict[int, tuple[int, int]], num_steps: int
 ) -> list[tuple[int, int]]:
@@ -1103,16 +1176,12 @@ def test_pack_prefill_caps_default_to_the_scheduler_limits(
     assert scheduler.pack_decode_step_prefill_tokens == 256
     assert scheduler.pack_free_step_prefill_tokens == 2048
 
-    scheduler = create_scheduler(
-        async_scheduling=True, max_num_batched_tokens=2048
-    )
+    scheduler = create_scheduler(async_scheduling=True, max_num_batched_tokens=2048)
     assert scheduler.pack_decode_step_prefill_tokens == 2048
     assert scheduler.pack_free_step_prefill_tokens == 2048
 
     monkeypatch.setenv("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", "0")
     monkeypatch.setenv("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", "640")
-    scheduler = create_scheduler(
-        async_scheduling=True, max_num_batched_tokens=2048
-    )
+    scheduler = create_scheduler(async_scheduling=True, max_num_batched_tokens=2048)
     assert scheduler.pack_decode_step_prefill_tokens == 0
     assert scheduler.pack_free_step_prefill_tokens == 640

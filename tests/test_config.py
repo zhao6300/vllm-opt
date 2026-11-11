@@ -1386,6 +1386,20 @@ def test_adaptive_verification_requires_full_cudagraphs(graph_mode, should_raise
         VllmConfig._validate_adaptive_verification(config)
 
 
+def test_adaptive_verification_allows_pipeline_parallelism():
+    """Every PP stage trims the same batch, so the cost curves and confidences
+    are relayed across stages instead of rejecting pipeline parallelism."""
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+        lora_config=None,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    VllmConfig._validate_adaptive_verification(config)
+
+
 def test_batch_sharded_sampling_rejects_return_sampling_mask():
     """The batch-sharded gather drops sampling masks, so the combination must
     fail loudly instead of returning ``sampling_mask=None``."""

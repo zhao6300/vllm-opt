@@ -14,6 +14,8 @@ The quantization types and formats enumerate which quantization schemes are supp
 
 Async backends support the use of DBO (Dual Batch Overlap) and shared expert overlap (where shared experts are computed during the combine step).
 
+When the backend cannot overlap the shared experts internally (for example the `allgather_reducescatter` NCCL backend, whose `supports_async()` is false), the shared experts still run on an auxiliary CUDA stream, concurrently with the routed experts, as long as the batch has at most `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` tokens (default 256). Decode steps replayed from a full CUDA graph use `VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD` instead; unset, it follows the prefill threshold. Raise it to cover a full decode batch (requests x (draft tokens + 1)) and measure: past the point where the routed experts and the shared experts contend for the same SMs, overlap can cost more than it saves.
+
 Certain models require the topk weights to be applied to the input activations rather than the output activations when topk==1, e.g. Llama. For modular kernels, this feature is supported by the `FusedMoEPrepareAndFinalizeModular` subclass. For non-modular kernels, it is up to the experts function to deal with this flag.
 
 Unless otherwise specified, backends are controlled via the `--all2all-backend` command-line argument (or the `all2all_backend` parameter in `ParallelConfig`). All backends except `flashinfer` only work with EP+DP or EP+TP. `Flashinfer` can work with EP or DP without EP.

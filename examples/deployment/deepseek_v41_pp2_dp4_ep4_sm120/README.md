@@ -377,3 +377,11 @@ CPU unit tests (no GPU needed):
 `tests/v1/worker/test_gpu_worker.py -k "pp_send or send_ring"`,
 `tests/v1/core/test_async_scheduler.py -k microbatch`,
 `tests/models/test_deepseek_v41_pipeline.py`.
+
+## Optimization roadmap
+
+[`PLAN.md`](PLAN.md) tracks the DeepInfer comparison and the prioritized
+optimization work (shared-expert overlap, adaptive verification, fused
+sampling, SWA state persistence, metadata fusion, routing, failover).
+It is the checklist to update as tasks land; this README stays the
+deployment reference.

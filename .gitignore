@@ -258,3 +258,6 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 /.rocm-wheel/
 /.rocm-kernel-map/
 __pycache__
+
+# Local serving logs and build artifacts
+.artifacts/

@@ -17,6 +17,19 @@ PORT=${PORT:-8000}
 EP=${EP:-1}
 DSPARK=${DSPARK:-1}
 ASYNC=${ASYNC:-1}
+# P0-2: adaptive verification trims each step's verified draft block from a
+# startup-profiled cost model and per-slot acceptance estimates. With PP all
+# stages trim the same batch, so the profile keeps the slowest stage's cost per
+# shape and stage 1 relays its confidences to stage 0 every step. Off by
+# default; A/B it against the fixed five drafts.
+ADAPTIVE_VERIFICATION=${ADAPTIVE_VERIFICATION:-0}
+# P0-1: run the shared expert on its aux stream while the routed MoE runs, for
+# decode batches up to this many tokens. 256 is vLLM's default; raise it to
+# cover a full decode batch (MAX_NUM_SEQS x (drafts + 1) rows) and A/B the MoE
+# step. Left unset, it follows VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+if [ -n "${SHARED_EXPERTS_STREAM_DECODE_TOKENS:-}" ]; then
+    export VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD=$SHARED_EXPERTS_STREAM_DECODE_TOKENS
+fi
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
 # Per DP rank: the server admits up to 4 x MAX_NUM_SEQS concurrent requests.
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
@@ -133,7 +146,11 @@ fi
 if [ "$DSPARK" = 1 ]; then
     # dspark_block_size=5, target layers 37/38/39, 128 draft experts (top 3)
     # come from the checkpoint config.
-    args+=(--speculative-config '{"method":"dspark","num_speculative_tokens":5}')
+    if [ "$ADAPTIVE_VERIFICATION" = 1 ]; then
+        args+=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":true}')
+    else
+        args+=(--speculative-config '{"method":"dspark","num_speculative_tokens":5}')
+    fi
 fi
 if [ "$ASYNC" = 1 ]; then
     args+=(--async-scheduling)

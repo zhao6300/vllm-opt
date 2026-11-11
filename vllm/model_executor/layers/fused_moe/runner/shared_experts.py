@@ -7,6 +7,11 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.compilation import CUDAGraphMode
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -117,6 +122,18 @@ class SharedExperts(torch.nn.Module):
             and parallel_config.all2all_backend not in _EPLB_OVERLAP_SAFE_BACKENDS
         ) or parallel_config.use_fi_nvl_two_sided_kernels
 
+    def _token_threshold(self) -> int:
+        threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+        if (
+            is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+        ):
+            threshold = max(
+                threshold,
+                envs.VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD,
+            )
+        return threshold
+
     def _determine_shared_experts_order(
         self,
         hidden_states: torch.Tensor,
@@ -130,8 +147,7 @@ class SharedExperts(torch.nn.Module):
         should_run_shared_in_aux_stream = (
             current_platform.is_cuda_alike()
             and self._stream is not None
-            and hidden_states.shape[0]
-            <= envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+            and hidden_states.shape[0] <= self._token_threshold()
         )
 
         if should_run_shared_in_aux_stream:

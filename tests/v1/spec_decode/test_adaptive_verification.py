@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -10,10 +11,13 @@ import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
-from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu import async_utils
+from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    _merge_cost_curves,
+    _merge_rank_curves,
     assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
@@ -363,3 +367,73 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
     survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
     assign_draft_token_budget(confidence_probs, idx_mapping, capacities, 800, survival)
     assert capacities.tolist() == [3] * 266 + [2] + [0] * 33
+
+
+def test_merge_rank_curves_keeps_the_slowest_stage_per_shape():
+    # Pipeline stages time their own layers, and a step cannot finish before
+    # its slowest stage: shape 8 costs 30 (stage 1), shape 16 costs 20 (stage
+    # 0). The stages without the drafter report 0 and must not erase its curve,
+    # and a shape only one stage profiled still has to appear.
+    assert _merge_rank_curves(
+        [
+            [(8, 10.0), (16, 20.0)],
+            [(8, 30.0), (16, 5.0), (32, 7.0)],
+        ]
+    ) == [(8, 30.0), (16, 20.0), (32, 7.0)]
+    assert _merge_rank_curves([[(8, 0.0)], [(8, 4.0)]]) == [(8, 4.0)]
+    assert _merge_rank_curves([[(8, 0.0)], []]) == [(8, 0.0)]
+    assert _merge_rank_curves([]) == []
+
+
+def test_merge_cost_curves_keeps_sparse_buckets_on_the_startup_point():
+    base = [(1, 10.0), (4, 40.0)]
+    buckets = {
+        4: deque([2.0, 6.0, 10.0, 14.0]),
+        8: deque([1.0, 2.0, 3.0]),
+    }
+    assert _merge_cost_curves(base, buckets) == [(1, 10.0), (4, 8.0)]
+
+
+class _FakeCudaEvent:
+    """CPU stand-in for a timing event: orders records on one stream."""
+
+    tick = 0.0
+    available = False
+
+    def record(self) -> None:
+        self.timestamp = _FakeCudaEvent.tick
+        _FakeCudaEvent.tick += 1.0
+
+    def query(self) -> bool:
+        return _FakeCudaEvent.available
+
+    def elapsed_time(self, end: "_FakeCudaEvent") -> float:
+        return end.timestamp - self.timestamp
+
+
+def test_step_timing_sampling_is_interval_gated_and_non_blocking(monkeypatch):
+    monkeypatch.setattr(async_utils, "_timing_event", _FakeCudaEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = False
+    collector = StepTimingCollector()
+    collector.enable_sampling(2)
+
+    def run_step() -> None:
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step()
+    run_step()
+    run_step()
+
+    # One sample per two steps, and none is resolved before its events finish.
+    assert collector.poll_sampled() == []
+    _FakeCudaEvent.available = True
+    samples = collector.poll_sampled()
+    assert [
+        (s.forward_ms, s.drafter_ms, s.num_target_tokens, s.num_reqs, s.full_cudagraph)
+        for s in samples
+    ] == [(1.0, 1.0, 0, 0, False), (1.0, 1.0, 0, 0, False)]
+    assert collector.poll_sampled() == []

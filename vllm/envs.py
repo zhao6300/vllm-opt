@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -326,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -1233,6 +1236,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Clamped to max_model_len - query_len. Default: 8192 tokens
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+    ),
+    # How often live decode steps refresh the adaptive-verification cost
+    # tables from measured timings. 0 keeps the startup profile only.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL", "0")
+    ),
+    # Timed samples kept per (request count / token count) bucket when
+    # refreshing the tables. Larger windows track slower drift but react less
+    # to a sudden change in step cost.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW", "256")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2303,6 +2317,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TODO(alexm-redhat): Tune to be more dynamic based on GPU type
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
+    ),
+    # Decode steps replay FULL graphs, where the MoE all-to-all is also on the
+    # critical path, so the useful cutoff can differ from the prefill one.
+    # Unset falls back to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD": lambda: int(
+        int(
+            os.getenv(
+                "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD",
+                os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256),
+            )
+        )
     ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
