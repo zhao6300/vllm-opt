@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 state saving/compression and independently schedulable cache insertion."""
 
+import numpy as np
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
@@ -435,50 +436,73 @@ def _insert_fp4_packed_or_append(
         )
         return
 
-    num_tokens = slot_mapping.numel()
-    append_rows: list[int] = []
-    token = 0
-    while token < num_tokens:
-        slot = slot_mapping[token].item()
-        run_end = token + page_tokens
+    # compress_ratio == 1 here, so every token closes a group and ``positions``
+    # needs no boundary check. One host copy of the slots replaces the former
+    # per-element ``.item()`` syncs.
+    slots_cpu = slot_mapping.cpu().numpy()
+    runs = _whole_page_runs(slots_cpu, page_tokens)
+    packed_mask = np.zeros(slots_cpu.shape[0], dtype=bool)
+    for start, end in runs:
+        packed_mask[start:end] = True
+        page_ids = (
+            slot_mapping[start:end:page_tokens]
+            .div(page_tokens, rounding_mode="trunc")
+            .to(torch.long)
+        )
+        packed = flashinfer_dsv41_fp4_quantize_pack(
+            roped_latent[start:end].view(-1, page_tokens, 512),
+            kv_layout="NHD",
+            inline_scale=True,
+        )
+        kv_cache.index_copy_(
+            0,
+            page_ids,
+            packed.reshape(-1, page_tokens, 288),
+        )
 
-        if slot >= 0 and slot % page_tokens == 0:
-            while run_end < num_tokens and slot_mapping[run_end].item() == slot_mapping[
-                token
-            ].item() + (run_end - token):
-                run_end += page_tokens
-
-            if run_end <= num_tokens and torch.all(
-                (positions[token:run_end] + 1) % compress_ratio == 0
-            ):
-                page_ids = (
-                    slot_mapping[token:run_end:page_tokens]
-                    .div(page_tokens, rounding_mode="trunc")
-                    .to(torch.long)
-                )
-                packed = flashinfer_dsv41_fp4_quantize_pack(
-                    roped_latent[token:run_end].view(-1, page_tokens, 512),
-                    kv_layout="NHD",
-                    inline_scale=True,
-                )
-                kv_cache.index_copy_(
-                    0,
-                    page_ids,
-                    packed.reshape(-1, page_tokens, 288),
-                )
-                token = run_end
-                continue
-        append_rows.append(token)
-        token += 1
-
-    if append_rows:
-        append_rows_t = torch.tensor(append_rows, device=slot_mapping.device)
+    append_rows = np.flatnonzero(~packed_mask)
+    if append_rows.size:
+        append_rows_t = torch.from_numpy(append_rows).to(slot_mapping.device)
         flashinfer_dsv41_fp4_quantize_append(
             roped_latent[append_rows_t],
             append_slots[append_rows_t],
             kv_cache,
             inline_scale=True,
         )
+
+
+def _whole_page_runs(slots: np.ndarray, page_tokens: int) -> list[tuple[int, int]]:
+    """Token ranges ``[start, end)`` made only of complete, in-order pages.
+
+    A page qualifies when it starts on a page boundary and its ``page_tokens``
+    slots are consecutive, so one pack call can write it whole. Every slot of
+    the page is checked: a batch holding several requests, or decode tokens next
+    to a prefill, can have a page-aligned slot followed by slots of another
+    request. Adjacent qualifying pages are merged into one run; they need not
+    be adjacent in the cache because the caller derives each page id from the
+    page's first slot.
+    """
+    num_tokens = slots.shape[0]
+    offsets = np.arange(page_tokens, dtype=slots.dtype)
+    runs: list[tuple[int, int]] = []
+    token = 0
+    while token < num_tokens:
+        end = token + page_tokens
+        first = slots[token]
+        if (
+            first >= 0
+            and first % page_tokens == 0
+            and end <= num_tokens
+            and np.array_equal(slots[token:end], first + offsets)
+        ):
+            if runs and runs[-1][1] == token:
+                runs[-1] = (runs[-1][0], end)
+            else:
+                runs.append((token, end))
+            token = end
+        else:
+            token += 1
+    return runs
 
 
 @triton.jit
