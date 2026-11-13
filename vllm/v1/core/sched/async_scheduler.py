@@ -110,10 +110,20 @@ class AsyncScheduler(Scheduler):
             self._pack_decode_microbatches(staggered)
 
     def _prefill_token_cap(self) -> int | None:
+        """Prefill token cap of the step being scheduled: the tighter of the
+        pack mode cap and the time budget cap."""
+        caps = [
+            cap
+            for cap in (self._pack_prefill_token_cap(), self._time_budget_prefill_cap())
+            if cap is not None
+        ]
+        return min(caps) if caps else None
+
+    def _pack_prefill_token_cap(self) -> int | None:
         """Prefill token cap of the step being scheduled (pack mode).
 
-        A step with decodes to run gets ``pack_decode_step_prefill_tokens``,
-        any other step ``pack_free_step_prefill_tokens``. A cap of 0 for the
+        A step with decodes to run gets `pack_decode_step_prefill_tokens`,
+        any other step `pack_free_step_prefill_tokens`. A cap of 0 for the
         decode steps is dropped when every microbatch has decodes, since no
         free step would be left to prefill in.
         """
@@ -133,10 +143,10 @@ class AsyncScheduler(Scheduler):
         return cap
 
     def _decode_microbatch_sizes(self, first_step: int | None = None) -> list[int]:
-        """Decoding requests per microbatch, indexed from ``first_step``.
+        """Decoding requests per microbatch, indexed from `first_step`.
 
-        ``first_step`` defaults to the next step, once this one is scheduled:
-        requests scheduled now (next eligible ``decode_stagger`` steps away)
+        `first_step` defaults to the next step, once this one is scheduled:
+        requests scheduled now (next eligible `decode_stagger` steps away)
         are then in the last microbatch.
         """
         stagger = self.decode_stagger
@@ -153,17 +163,17 @@ class AsyncScheduler(Scheduler):
     def _balance_decode_microbatches(self, scheduled: list[Request]) -> None:
         """Move decodes from this step's microbatch to the smallest one.
 
-        With PP, a request decodes every ``decode_stagger`` steps, so the
-        decoding requests fall into ``decode_stagger`` microbatches by the step
+        With PP, a request decodes every `decode_stagger` steps, so the
+        decoding requests fall into `decode_stagger` microbatches by the step
         they are next eligible in, and the stages work on them in turn. A burst
         of requests that start decoding together stays in one microbatch, and
         the other steps carry nearly nothing. This moves the lowest-priority
-        requests just scheduled (``scheduled``, in scheduling order) into the
+        requests just scheduled (`scheduled`, in scheduling order) into the
         smallest microbatch until the sizes differ by at most one.
 
         A moved request waits extra steps once, never fewer than
-        ``decode_stagger``: the worker-side sampled-token ring hands its
-        tokens back ``decode_stagger`` steps later and keeps them, so a longer
+        `decode_stagger`: the worker-side sampled-token ring hands its
+        tokens back `decode_stagger` steps later and keeps them, so a longer
         gap stays valid.
         """
         stagger = self.decode_stagger
@@ -190,12 +200,12 @@ class AsyncScheduler(Scheduler):
         there does not delay any token. A request just scheduled moves only
         while the fullest other microbatch is at least as big as its own, so
         a group that is already the fullest stays put. With
-        ``VLLM_PP_PACK_MAX_SEQS`` set, a microbatch with that many decodes
+        `VLLM_PP_PACK_MAX_SEQS` set, a microbatch with that many decodes
         takes no more and the rest go to the next fullest one, including the
         excess of a burst that starts decoding together.
 
         A moved request waits extra steps once, never fewer than
-        ``decode_stagger`` (see ``_balance_decode_microbatches``).
+        `decode_stagger` (see `_balance_decode_microbatches`).
         """
         stagger = self.decode_stagger
         base = self.current_step + 1

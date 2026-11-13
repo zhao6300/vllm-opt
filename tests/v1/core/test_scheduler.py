@@ -56,6 +56,7 @@ from vllm.v1.core.sched.diffusion_scheduler import (
 )
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.prefill_budget import PrefillCostModel
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -9056,3 +9057,159 @@ def test_cpu_encoder_input_updates_preserve_shm_handles():
     )
     assert scheduler.schedule().encoder_input_updates == {request.request_id: {1: None}}
     assert request.mm_features[0].data is handle
+
+
+@pytest.mark.parametrize(
+    ("decode_tokens", "context", "align"),
+    [(0, 0, 1), (256, 0, 1), (0, 50_000, 1), (100, 50_000, 64), (2000, 0, 1)],
+)
+def test_prefill_cost_model_returns_the_largest_chunk_within_budget(
+    decode_tokens: int, context: int, align: int
+):
+    model = PrefillCostModel(
+        budget_ms=100,
+        fixed_ms=10,
+        ms_per_token=0.05,
+        ms_per_token_context=0.00001,
+        min_chunk_tokens=64,
+    )
+    chunk = model.max_prefill_tokens(decode_tokens, context, align)
+
+    if chunk == model.min_chunk_tokens:
+        # The decodes and the context leave room for less than the minimum.
+        assert model.step_ms(decode_tokens, chunk + 1, context) > model.budget_ms
+        return
+    assert chunk % align == 0
+    assert model.step_ms(decode_tokens, chunk, context) <= model.budget_ms
+    assert model.step_ms(decode_tokens, chunk + align, context) > model.budget_ms
+
+
+def test_prefill_cost_model_chunks_shrink_with_load_and_context():
+    model = PrefillCostModel(
+        budget_ms=50,
+        fixed_ms=5,
+        ms_per_token=0.02,
+        ms_per_token_context=0.00002,
+        min_chunk_tokens=1,
+    )
+    idle = model.max_prefill_tokens(0, 0)
+    assert model.max_prefill_tokens(500, 0) < idle
+    assert model.max_prefill_tokens(0, 20_000) < idle
+    # A cost independent of the context is the linear solution.
+    flat = PrefillCostModel(budget_ms=50, fixed_ms=5, ms_per_token=0.02)
+    assert flat.max_prefill_tokens(0, 100_000) == 2250
+
+
+def test_prefill_cost_model_rejects_coefficients_it_cannot_solve_with():
+    with pytest.raises(ValueError, match="VLLM_PREFILL_COST_MS_PER_TOKEN"):
+        PrefillCostModel(budget_ms=50, fixed_ms=0, ms_per_token=0)
+    with pytest.raises(ValueError, match="budget"):
+        PrefillCostModel(budget_ms=0, fixed_ms=0, ms_per_token=1)
+
+
+def test_prefill_cost_model_is_off_without_a_budget(monkeypatch):
+    monkeypatch.delenv("VLLM_PREFILL_STEP_BUDGET_MS", raising=False)
+    assert PrefillCostModel.from_env() is None
+
+
+def _decode_one(scheduler, output, req_ids: list[str]) -> None:
+    """Feed back one sampled token per request, so they keep decoding."""
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=req_ids,
+            sampled_token_ids=[[0] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def _set_prefill_budget(monkeypatch, budget_ms: float, ms_per_token: float) -> None:
+    monkeypatch.setenv("VLLM_PREFILL_STEP_BUDGET_MS", str(budget_ms))
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", str(ms_per_token))
+    monkeypatch.setenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "16")
+
+
+def test_step_time_budget_caps_the_prefill_chunk(monkeypatch):
+    """1120 ms at 10 ms per token leaves 112 tokens for the prefill chunk."""
+    _set_prefill_budget(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["p0"] == 112
+
+
+def test_step_time_budget_leaves_room_for_the_decodes_of_the_step(monkeypatch):
+    """Four decoding requests take 40 ms of the budget: 108 tokens, 96 aligned."""
+    _set_prefill_budget(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    decoding = create_requests(
+        num_requests=4,
+        num_tokens=8,
+        max_tokens=100,
+        req_ids=[f"d{i}" for i in range(4)],
+    )
+    for request in decoding:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _decode_one(scheduler, output, [f"d{i}" for i in range(4)])
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["p0"] == 96
+    assert all(output.num_scheduled_tokens[f"d{i}"] == 1 for i in range(4))
+
+
+def test_step_time_budget_shrinks_chunks_as_the_context_grows(monkeypatch):
+    """A long prompt prefills in chunks that each fit the budget and shrink with
+    the context they attend over, until the prompt is done."""
+    monkeypatch.setenv("VLLM_PREFILL_STEP_BUDGET_MS", "40")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "0.1")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.0002")
+    monkeypatch.setenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "16")
+    model = PrefillCostModel.from_env()
+    assert model is not None
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    chunks = []
+    while request.num_computed_tokens < request.num_prompt_tokens:
+        context = request.num_computed_tokens
+        output = scheduler.schedule()
+        chunk = output.num_scheduled_tokens["p0"]
+        chunks.append(chunk)
+        assert model.step_ms(0, chunk, context) <= model.budget_ms
+        done = context + chunk >= request.num_prompt_tokens
+        scheduler.update_from_output(
+            output,
+            ModelRunnerOutput(
+                req_ids=["p0"],
+                sampled_token_ids=[[0] if done else []],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+            ),
+        )
+
+    assert sum(chunks) == 2000
+    assert chunks[0] > chunks[-2]
+    assert chunks[:-1] == sorted(chunks[:-1], reverse=True)
+
+
+def test_step_time_budget_is_off_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_PREFILL_STEP_BUDGET_MS", raising=False)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["p0"] == 3000

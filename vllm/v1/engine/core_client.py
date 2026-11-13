@@ -1801,6 +1801,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
 
+        # Token-aware routing (VLLM_DP_LB_TOKEN_AWARE): the prompt tokens this
+        # client sent to each engine whose request has no output yet, i.e.
+        # whose prefill is still pending.
+        self.token_aware_lb = envs.VLLM_DP_LB_TOKEN_AWARE
+        self.lb_prefill_tokens_per_request = max(
+            envs.VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST, 1
+        )
+        self.req_pending_prefill_tokens: dict[str, int] = {}
+        self.engine_pending_prefill_tokens: Counter[EngineIdentity] = Counter()
+
         super().__init__(
             vllm_config,
             executor_class,
@@ -1854,6 +1864,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # when other clients or stale requests load the engine.
                 inflight = self.engine_inflight[self.core_engines[idx]]
                 score: float = max(self.client_count * inflight, waiting + running)
+                if self.token_aware_lb:
+                    # A pending prefill occupies the engine's steps for as many
+                    # tokens as it has, however few requests that is. Like the
+                    # in-flight count, scale this client's share by the clients.
+                    score += (
+                        self.client_count
+                        * self.engine_pending_prefill_tokens[self.core_engines[idx]]
+                        / self.lb_prefill_tokens_per_request
+                    )
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache
                     # pressure: a queue on a KV-bound engine drains slowly, so
@@ -1879,7 +1898,19 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
+        if self.token_aware_lb and request.prompt_token_ids is not None:
+            num_prompt_tokens = len(request.prompt_token_ids)
+            self.req_pending_prefill_tokens[request.request_id] = num_prompt_tokens
+            self.engine_pending_prefill_tokens[chosen_engine] += num_prompt_tokens
         return chosen_engine
+
+    def _release_pending_prefill(self, req_id: str) -> None:
+        """Drop a request's pending prefill tokens from its engine's load."""
+        num_tokens = self.req_pending_prefill_tokens.pop(req_id, None)
+        if num_tokens is None:
+            return
+        if (engine := self.reqs_in_flight.get(req_id)) is not None:
+            self.engine_pending_prefill_tokens[engine] -= num_tokens
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1904,6 +1935,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.req_pending_prefill_tokens:
+            # The first output of a request means its prefill is done; a request
+            # that finishes without one (an abort) also stops being pending.
+            for output in outputs.outputs:
+                self._release_pending_prefill(output.request_id)
+            for req_id in outputs.finished_requests or ():
+                self._release_pending_prefill(req_id)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:

@@ -29,6 +29,7 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
@@ -209,12 +210,21 @@ def _make_pooling_request(
     )
 
 
-def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncMPClient:
+def _make_dplb_client(
+    num_engines: int = 3,
+    client_count: int = 1,
+    token_aware: bool = False,
+    prefill_tokens_per_request: int = 1000,
+) -> DPLBAsyncMPClient:
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = client_count
     client.reqs_in_flight = {}
     client.streaming_reqs = set()
     client.engine_inflight = Counter()
+    client.token_aware_lb = token_aware
+    client.lb_prefill_tokens_per_request = prefill_tokens_per_request
+    client.req_pending_prefill_tokens = {}
+    client.engine_pending_prefill_tokens = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
     client.lb_engines = [[0, 0, 0.0] for _ in range(num_engines)]
     client.eng_start_index = 0
@@ -408,6 +418,77 @@ def test_dplb_finished_requests_release_inflight():
 
     assert client.engine_inflight[engine] == 0
     assert req.request_id not in client.reqs_in_flight
+
+
+@pytest.mark.parametrize(("token_aware", "expected"), [(False, 0), (True, 1)])
+def test_dplb_token_aware_routing_avoids_an_engine_busy_prefilling(
+    token_aware: bool, expected: int
+):
+    """Both engines run one request, but engine 0's is a long prompt still
+    prefilling. Without the pending tokens the scores tie and engine 0 wins the
+    scan; with them the request goes to engine 1."""
+    client = _make_dplb_client(num_engines=2, token_aware=token_aware)
+    client.lb_engines = [[0, 1, 0.0], [0, 1, 0.0]]
+    client.engine_pending_prefill_tokens[client.core_engines[0]] = 4000
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1), [7] * 500)
+    )
+
+    assert chosen == client.core_engines[expected]
+
+
+def test_dplb_token_aware_weighs_tokens_against_requests():
+    """Pending prefill tokens trade off against the request count at
+    `lb_prefill_tokens_per_request` tokens per request."""
+    client = _make_dplb_client(
+        num_engines=2, token_aware=True, prefill_tokens_per_request=1000
+    )
+    # Engine 0 runs three requests, engine 1 runs one with 5000 tokens pending.
+    client.lb_engines = [[0, 3, 0.0], [0, 1, 0.0]]
+    engine_1 = client.core_engines[1]
+    client.engine_pending_prefill_tokens[engine_1] = 5000
+    # Scores: engine 0 = 3, engine 1 = 1 + 5.
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+    # With fewer pending tokens engine 1 is cheaper again: 1 + 1 < 3 + 1.
+    client.engine_pending_prefill_tokens[engine_1] = 1000
+    client.lb_engines = [[0, 3, 0.0], [0, 1, 0.0]]
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
+
+
+def test_dplb_pending_prefill_tokens_released_by_first_output_or_finish():
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    first = make_request(SamplingParams(max_tokens=4), [1] * 300)
+    aborted = make_request(SamplingParams(max_tokens=4), [1] * 200)
+    client.get_core_engine_for_request(first)
+    client.get_core_engine_for_request(aborted)
+    assert sum(client.engine_pending_prefill_tokens.values()) == 500
+
+    # The first output ends the pending prefill; the request is still in flight.
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=first.request_id, new_token_ids=[5])]
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_prefill_tokens.values()) == 200
+    assert first.request_id in client.reqs_in_flight
+
+    # Finishing without an output (an abort) releases it too, and only once.
+    outputs = EngineCoreOutputs(finished_requests={aborted.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_prefill_tokens.values()) == 0
+    assert not client.req_pending_prefill_tokens
+
+
+def test_dplb_without_token_aware_tracks_no_prefill_tokens():
+    client = _make_dplb_client(num_engines=2)
+    client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=4), [1] * 300)
+    )
+    assert not client.req_pending_prefill_tokens
+    assert not client.engine_pending_prefill_tokens
 
 
 @pytest.mark.parametrize("final_sent", [False, True])

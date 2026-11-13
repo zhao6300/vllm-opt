@@ -68,6 +68,13 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
     VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
+    VLLM_DP_LB_TOKEN_AWARE: bool = False
+    VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
+    VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
+    VLLM_PREFILL_COST_FIXED_MS: float = 0.0
+    VLLM_PREFILL_COST_MS_PER_TOKEN: float = 0.0
+    VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT: float = 0.0
+    VLLM_PREFILL_MIN_CHUNK_TOKENS: int = 256
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1272,6 +1279,46 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # decode stagger minus one.
     "VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG", "1")
+    ),
+    # Data-parallel load balancing by pending prefill work. By default a new
+    # request goes to the engine with the fewest waiting + running requests.
+    # With this set, the prompt tokens an engine has not finished prefilling
+    # (this API server's requests, until their first output) add to its score,
+    # so a long prompt avoids an engine already busy prefilling.
+    "VLLM_DP_LB_TOKEN_AWARE": lambda: bool(
+        int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
+    ),
+    # With VLLM_DP_LB_TOKEN_AWARE: how many pending prefill tokens weigh as much
+    # as one waiting/running request in an engine's score.
+    "VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST": lambda: int(
+        os.getenv("VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST", "2048")
+    ),
+    # Time budget in milliseconds of one scheduler step. When positive, the
+    # scheduler caps the prefill tokens a step carries so the modelled step time
+    # stays within it: fixed + per_token * (decode + prefill tokens)
+    # + per_token_context * prefill * (context + prefill / 2). 0 keeps the
+    # fixed max_num_batched_tokens cap. The cost coefficients below have no
+    # defaults to guess from and must be fitted on the deployment.
+    "VLLM_PREFILL_STEP_BUDGET_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_STEP_BUDGET_MS", "0")
+    ),
+    # Step time independent of the token count, in milliseconds.
+    "VLLM_PREFILL_COST_FIXED_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_FIXED_MS", "0")
+    ),
+    # Milliseconds one token adds to a step (required when the budget is set).
+    "VLLM_PREFILL_COST_MS_PER_TOKEN": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "0")
+    ),
+    # Milliseconds a prefill token adds per token of context it attends over.
+    # 0 models a cost independent of the context length.
+    "VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0")
+    ),
+    # Fewest prefill tokens a step with a time budget still carries, so a
+    # prefill advances when decodes alone fill the budget.
+    "VLLM_PREFILL_MIN_CHUNK_TOKENS": lambda: int(
+        os.getenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "256")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
