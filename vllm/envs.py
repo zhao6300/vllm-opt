@@ -2319,8 +2319,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
     # Decode steps replay FULL graphs, where the MoE all-to-all is also on the
-    # critical path, so the useful cutoff can differ from the prefill one.
-    # Unset falls back to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    # critical path, so the useful cutoff can differ from the prefill one. The
+    # cutoff applies while the FULL graph is recorded, since replay runs no
+    # Python. Unset falls back to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
     "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD": lambda: int(
         int(
             os.getenv(

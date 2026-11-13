@@ -122,17 +122,30 @@ class SharedExperts(torch.nn.Module):
             and parallel_config.all2all_backend not in _EPLB_OVERLAP_SAFE_BACKENDS
         ) or parallel_config.use_fi_nvl_two_sided_kernels
 
+    def _recording_full_graph(self) -> bool:
+        """Whether this forward is being recorded into a FULL CUDA graph.
+
+        The capture path passes CUDAGraphMode.NONE to the forward (so compiled
+        wrappers keep running eagerly inside the capture), so the FULL graph is
+        only visible as an active stream capture; see vllm/_aiter_ops.py.
+        FULL graphs are replayed without Python, so the decision must be made
+        while recording them.
+        """
+        if not is_forward_context_available():
+            return False
+        mode = get_forward_context().cudagraph_runtime_mode
+        if mode == CUDAGraphMode.FULL:
+            return True
+        return (
+            mode == CUDAGraphMode.NONE
+            and current_platform.is_cuda_alike()
+            and torch.cuda.is_current_stream_capturing()
+        )
+
     def _token_threshold(self) -> int:
-        threshold = envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
-        if (
-            is_forward_context_available()
-            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
-        ):
-            threshold = max(
-                threshold,
-                envs.VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD,
-            )
-        return threshold
+        if self._recording_full_graph():
+            return envs.VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD
+        return envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
 
     def _determine_shared_experts_order(
         self,

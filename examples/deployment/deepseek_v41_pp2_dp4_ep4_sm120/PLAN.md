@@ -113,13 +113,19 @@ SM 数减掉通信配额，避免 shared GEMM 饿死通信。
 **本次实现（`feat/dsv41-sm120-p0`）：** decode 步从 FULL graph 重放，MoE
 all-to-all 也在关键路径上，overlap 的收益拐点与 prefill 不同。新增
 `VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD`（`vllm/envs.py`）：
-在 `CUDAGraphMode.FULL` 下用它与 prefill 阈值取大；未设置时回落到
-`VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`，默认行为不变（
-`shared_experts.py:_token_threshold`）。`serve.sh` 暴露为
+记录 FULL graph 时用它替换 prefill 阈值（replay 不跑 Python，决定必须在
+录制时做）；未设置时回落到 `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`，
+默认行为不变（`shared_experts.py:_token_threshold`）。`serve.sh` 暴露为
 `SHARED_EXPERTS_STREAM_DECODE_TOKENS`。文档已补
 （`docs/design/moe_kernel_features.md`）。
 
-**测量结果（`feat/dsv41-sm120-p0`，2026-11-11）：** 用
+**更正（2026-11-12）：** 初版按 `CUDAGraphMode.FULL` 判断，但 V2 runner
+录制 FULL graph 时 forward context 的 `cudagraph_runtime_mode` 是 `NONE`
+（replay 则完全不跑 Python），所以 decode 阈值从未生效，下面的 A/B 实际
+只测了 prefill 阈值。现改为用 `is_current_stream_capturing()` 识别录制中的
+FULL graph；旧结论作废，需要重新 A/B。
+
+**测量结果（`feat/dsv41-sm120-p0`，2026-11-11，阈值未生效，作废）：** 用
 `SHARED_EXPERTS_STREAM_DECODE_TOKENS` 覆盖 decode 全量 token 后，
 decode 吞吐与 TPOT 均无显著变化（未测到稳定收益，也未测到退化）。
 推测 decode 步从 FULL graph 重放，关键路径由 MoE 通信与 attention 支配，

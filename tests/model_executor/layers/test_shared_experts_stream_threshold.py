@@ -18,6 +18,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     MoEActivation,
     RoutingMethodType,
 )
+from vllm.model_executor.layers.fused_moe.runner import (
+    shared_experts as shared_experts_module,
+)
 from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
@@ -71,6 +74,24 @@ def make_shared_experts(monkeypatch):
     return make
 
 
+@pytest.fixture
+def recording_graph(monkeypatch):
+    """Put the process in the state the runner records a FULL graph in.
+
+    The capture path passes CUDAGraphMode.NONE to the model forward so compiled
+    wrappers keep running eagerly inside the capture; only the active stream
+    capture reveals that a FULL graph is being recorded.
+    """
+
+    def start() -> None:
+        monkeypatch.setattr(
+            shared_experts_module.current_platform, "is_cuda_alike", lambda: True
+        )
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    return start
+
+
 def _forward_context(mode: CUDAGraphMode) -> ForwardContext:
     return ForwardContext(
         no_compile_layers={},
@@ -80,39 +101,60 @@ def _forward_context(mode: CUDAGraphMode) -> ForwardContext:
     )
 
 
-def test_decode_threshold_applies_to_full_graphs_only(make_shared_experts, monkeypatch):
+def test_decode_threshold_applies_to_recorded_full_graphs(
+    make_shared_experts, monkeypatch, recording_graph
+):
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD", "384")
     shared_experts = make_shared_experts()
 
-    # Outside a forward pass, and in non-graph steps, prefill keeps the cutoff.
+    # Outside a forward pass, and in eager and PIECEWISE steps, prefill keeps
+    # the cutoff.
     assert shared_experts._token_threshold() == 256
     with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
         assert shared_experts._token_threshold() == 256
     with override_forward_context(_forward_context(CUDAGraphMode.PIECEWISE)):
         assert shared_experts._token_threshold() == 256
 
-    # Capture and replay of a FULL decode graph use the decode cutoff.
+    # Recording a FULL decode graph uses the decode cutoff. The runner keeps
+    # cudagraph_runtime_mode at NONE throughout capture.
+    recording_graph()
+    with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
+        assert shared_experts._token_threshold() == 384
+    # A replay under a runtime that does report FULL keeps working too.
     with override_forward_context(_forward_context(CUDAGraphMode.FULL)):
         assert shared_experts._token_threshold() == 384
 
 
-def test_decode_threshold_never_lowers_the_prefill_cutoff(
-    make_shared_experts, monkeypatch
+def test_piecewise_capture_keeps_the_prefill_cutoff(make_shared_experts, monkeypatch):
+    """PIECEWISE graphs serve prefill batches even while they are recorded."""
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD", "384")
+    shared_experts = make_shared_experts()
+
+    with override_forward_context(_forward_context(CUDAGraphMode.PIECEWISE)):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        assert shared_experts._token_threshold() == 256
+
+
+def test_decode_threshold_replaces_the_prefill_cutoff(
+    make_shared_experts, monkeypatch, recording_graph
 ):
-    """A smaller decode cutoff must not shrink the prefill threshold."""
+    """The decode knob is independent: it may lower the cutoff as well."""
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "512")
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD", "384")
     shared_experts = make_shared_experts()
 
-    with override_forward_context(_forward_context(CUDAGraphMode.FULL)):
-        assert shared_experts._token_threshold() == 512
+    recording_graph()
     with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
+        assert shared_experts._token_threshold() == 384
+    with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
         assert shared_experts._token_threshold() == 512
 
 
 def test_unset_decode_threshold_follows_the_prefill_one(
-    make_shared_experts, monkeypatch
+    make_shared_experts, monkeypatch, recording_graph
 ):
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "128")
     monkeypatch.delenv(
@@ -120,16 +162,20 @@ def test_unset_decode_threshold_follows_the_prefill_one(
     )
     shared_experts = make_shared_experts()
 
-    with override_forward_context(_forward_context(CUDAGraphMode.FULL)):
+    recording_graph()
+    with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
         assert shared_experts._token_threshold() == 128
 
 
-def test_disabled_stream_never_overlaps(make_shared_experts, monkeypatch):
+def test_disabled_stream_never_overlaps(
+    make_shared_experts, monkeypatch, recording_graph
+):
     """VLLM_DISABLE_SHARED_EXPERTS_STREAM must win over any token count."""
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD", "384")
     shared_experts = make_shared_experts()
 
-    with override_forward_context(_forward_context(CUDAGraphMode.FULL)):
+    recording_graph()
+    with override_forward_context(_forward_context(CUDAGraphMode.NONE)):
         order = shared_experts._determine_shared_experts_order(torch.empty(8, 64))
 
     assert order == SharedExpertsOrder.NO_OVERLAP
