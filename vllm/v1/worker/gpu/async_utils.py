@@ -109,13 +109,15 @@ class StepTimingCollector:
         """Costs from different execution modes must not share a cost curve."""
         self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
 
-    def forward_start(self) -> None:
+    def forward_start(self, sample: bool = True) -> None:
+        """Start timing a step; `sample=False` keeps it out of the continuous
+        samples (it is still timed inside `collect`)."""
         if self._collecting:
             self._step = StepTimingEvents()
             self._sampling = False
             self._step.forward_start.record()
             return
-        if self._sample_interval <= 0 or self._sampling:
+        if not sample or self._sample_interval <= 0 or self._sampling:
             return
         if self._sample_countdown > 0:
             self._sample_countdown -= 1

@@ -1852,8 +1852,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if self.adaptive_verification is not None:
+        if self.adaptive_verification is not None and not dummy_run:
+            # Only served steps count toward the online refresh: the refresh is
+            # a PP collective, and dummy runs differ across stages (the last
+            # stage alone runs the sampler warmup after capture).
             self.adaptive_verification.observe_timings(self.step_timing.poll_sampled())
+        if self.adaptive_verification is not None:
             # Non-last PP stages rank this step's drafts with the confidences
             # the last rank relayed at the end of the previous one.
             self.adaptive_verification.wait_for_remote_confidences()
@@ -2136,7 +2140,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
-        self.step_timing.forward_start()
+        # Dummy steps (idle DP replicas, warmup) are padded to other ranks'
+        # sizes, so their timings would misprice the shapes they are keyed by.
+        self.step_timing.forward_start(sample=not dummy_run)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:

@@ -492,3 +492,33 @@ def test_trim_waits_for_the_relay_lag_steps_before_the_newest(monkeypatch, lag):
         accept()
         (slot,) = [name for kind, name in log if kind == "record"]
         latest_relay_in_slot[slot] = step
+
+
+def test_step_timing_sampling_skips_dummy_steps(monkeypatch):
+    # Dummy steps are padded to other ranks' sizes; sampling one would price a
+    # shape with another shape's cost.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    collector.enable_sampling(1)
+
+    def run_step(sample: bool) -> None:
+        collector.forward_start(sample=sample)
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step(sample=False)
+    assert collector.poll_sampled() == []
+    run_step(sample=True)
+    assert len(collector.poll_sampled()) == 1
+
+    # Profiling (collect) still times dummy steps.
+    with collector.collect() as timings:
+        run_step(sample=False)
+    assert len(timings) == 1
