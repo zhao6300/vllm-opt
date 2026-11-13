@@ -605,3 +605,35 @@ def test_standalone_draft_kv_dtype_override(
     )
     assert target.kernel_config.moe_backend == "flashinfer_cutlass"
     assert target.attention_config.backend == AttentionBackendEnum.FLASHINFER
+
+
+@pytest.mark.parametrize("dp_rank", [0, 3])
+def test_profile_capture_sizes_broadcasts_from_the_last_stage(monkeypatch, dp_rank):
+    """The cost-profiling sizes come from the last PP stage of this DP replica.
+
+    broadcast_object takes the source as a rank within the PP group; passing
+    the global last_rank only worked on the first DP replica.
+    """
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    pp_size = 2
+    ranks = [dp_rank * pp_size + i for i in range(pp_size)]
+    calls = []
+
+    class FakePPGroup:
+        world_size = pp_size
+        last_rank = ranks[-1]
+
+        def broadcast_object(self, obj, src=0):
+            assert src < self.world_size, f"Invalid src rank ({src})"
+            calls.append(src)
+            return [8, 16]
+
+    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakePPGroup())
+    runner = SimpleNamespace(
+        use_pp=True,
+        cudagraph_manager=SimpleNamespace(captured_token_counts=lambda: [8]),
+    )
+    assert GPUModelRunner._profile_capture_sizes(runner) == [8, 16]
+    assert calls == [pp_size - 1]

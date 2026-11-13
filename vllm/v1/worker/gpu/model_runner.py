@@ -1146,8 +1146,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         capture_sizes = self.cudagraph_manager.captured_token_counts()
         if self.use_pp:
             pp_group = get_pp_group()
+            # broadcast_object takes the rank within the group; last_rank is
+            # global and only equals it on the first DP replica.
             capture_sizes = pp_group.broadcast_object(
-                capture_sizes, src=pp_group.last_rank
+                capture_sizes, src=pp_group.world_size - 1
             )
         return capture_sizes
 
