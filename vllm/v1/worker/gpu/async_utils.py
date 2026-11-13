@@ -106,8 +106,17 @@ class StepTimingCollector:
         )
 
     def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
-        """Costs from different execution modes must not share a cost curve."""
-        self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
+        """Costs from different execution modes must not share a cost curve.
+
+        A step is keyed by the token count it runs, padding included: under DP
+        a rank replays the graph of the largest rank, so its own token count
+        would price that graph's cost on a smaller shape.
+        """
+        self._batch = (
+            full_cudagraph,
+            input_batch.num_tokens_after_padding,
+            input_batch.num_reqs,
+        )
 
     def forward_start(self, sample: bool = True) -> None:
         """Start timing a step; `sample=False` keeps it out of the continuous

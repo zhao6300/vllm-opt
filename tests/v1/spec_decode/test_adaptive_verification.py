@@ -522,3 +522,60 @@ def test_step_timing_sampling_skips_dummy_steps(monkeypatch):
     with collector.collect() as timings:
         run_step(sample=False)
     assert len(timings) == 1
+
+
+def test_fill_graph_padding_admits_drafts_into_padded_rows():
+    # Verification past 3 tokens is 100x dearer, so the budget stops at one
+    # draft; a graph padded to 5 tokens (another DP rank's size) runs two more
+    # rows anyway, and they take the next-best drafts.
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+    )
+    num_tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    assert num_tokens == 3
+
+    assert manager.fill_graph_padding(5) == 5
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 3
+    # Never beyond the scheduled drafts, and no change without spare rows.
+    assert manager.fill_graph_padding(64) == 6
+    assert manager.fill_graph_padding(6) is None
+
+
+def test_fill_graph_padding_respects_the_rejection_sampler_chunk():
+    manager = make_manager(
+        np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32),
+        np.ones(7),
+    )
+    manager._max_total_logits = 3  # 2 bonus logits + at most 1 draft
+    num_tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    assert num_tokens == 3
+    assert manager.fill_graph_padding(6) is None
+
+
+def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):
+    # Under DP a rank replays the largest rank's graph; keying by its own
+    # token count would price that graph on a smaller shape.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(num_tokens=10, num_tokens_after_padding=64, num_reqs=5)
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+    assert [(s.num_target_tokens, s.num_reqs) for s in timings] == [(64, 5)]

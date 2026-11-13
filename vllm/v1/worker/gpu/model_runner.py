@@ -1936,6 +1936,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
 
+        if (
+            self.adaptive_verification is not None
+            and batch_req_state is not None
+            and batch_req_state.num_draft_tokens_np is not None
+            and self.pcp_manager is None
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc.num_ubatches == 1
+            and batch_desc.num_tokens > num_toks
+        ):
+            # The FULL graph runs its padded rows anyway (under DP, up to the
+            # largest rank): verify more drafts in them. Request count and
+            # per-request query lengths stay within the graph's bounds.
+            filled = self.adaptive_verification.fill_graph_padding(
+                batch_desc.num_tokens
+            )
+            if filled is not None:
+                num_toks = filled
+                batch_req_state = batch_req_state._replace(num_tokens=filled)
+
         cudagraph_stats = None
         if not dummy_run:
             # Common case.

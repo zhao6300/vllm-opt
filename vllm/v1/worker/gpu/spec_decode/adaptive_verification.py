@@ -300,6 +300,7 @@ class AdaptiveVerificationManager:
         self._base_draft_curve: list[tuple[int, float]] = []
         self._base_verify_curve: list[tuple[int, float]] = []
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+        self._batch_max_draft_budget = 0
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -621,7 +622,34 @@ class AdaptiveVerificationManager:
             num_non_draft_tokens_per_req,
             draft_budget,
         )
+        self._batch_max_draft_budget = max_draft_budget
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+
+    def fill_graph_padding(self, num_padded_tokens: int) -> int | None:
+        """Admit the next-best drafts into rows the graph runs anyway.
+
+        The budget is chosen for this rank's token count, but under DP every
+        rank replays the graph of the largest rank, so the rows up to
+        ``num_padded_tokens`` cost nothing extra. Returns the new token count,
+        or None when the budget is unchanged.
+        """
+        batch_budget = self._batch_budget
+        if batch_budget is None:
+            return None
+        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        num_tokens = sum(num_non_draft_tokens_per_req.values()) + draft_budget
+        extra = min(
+            num_padded_tokens - num_tokens,
+            self._batch_max_draft_budget - draft_budget,
+        )
+        if extra <= 0:
+            return None
+        self._batch_budget = (
+            num_drafts_per_req,
+            num_non_draft_tokens_per_req,
+            draft_budget + extra,
+        )
+        return num_tokens + extra
 
     def compact_batch(
         self,
