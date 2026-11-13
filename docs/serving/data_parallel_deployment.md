@@ -82,6 +82,24 @@ When deploying large DP sizes using this method, the API server process can beco
 ![DP Internal LB Diagram](../assets/deployment/dp_internal_lb.png)
 </figure>
 
+### Routing by pending prefill tokens
+
+By default the API server sends a new request to the DP rank with the lowest load, counted in waiting and running requests. A long prompt weighs the same as a short one, although it keeps its rank busy for several steps, and every step of an MoE deployment waits for the slowest rank.
+
+Set `VLLM_DP_LB_TOKEN_AWARE=1` to add the prompt tokens a rank has not finished prefilling to its score. The API server tracks them from the requests it routed, until each one's first output or its end. `VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST` (default 2048) sets how many pending tokens weigh as much as one request. It is off by default, and the default weight has not been tuned.
+
+### Sizing prefill chunks by a step time budget
+
+The scheduler caps the prefill tokens of a step with `--max-num-batched-tokens`, whatever else the step carries. In a DP MoE deployment the chunks of a long prompt then make steps of very different length, and the decodes of every rank wait for them.
+
+Set `VLLM_PREFILL_STEP_BUDGET_MS` to a positive number of milliseconds to cap the prefill tokens of each step so that a cost model keeps the step within it:
+
+```text
+fixed + per_token * (decode + prefill) + per_token_context * prefill * (context + prefill / 2)
+```
+
+with the coefficients `VLLM_PREFILL_COST_FIXED_MS`, `VLLM_PREFILL_COST_MS_PER_TOKEN` (required) and `VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT` (default 0, a cost independent of the context). They have no defaults: fit them on the deployment from step times at several token counts. A step still carries at least `VLLM_PREFILL_MIN_CHUNK_TOKENS` (default 256) prefill tokens so a prefill advances under a heavy decode load, and chunks are rounded down to a block multiple. Each rank sizes its own chunks; ranks do not agree on a common budget. The budget combines with `--max-num-batched-tokens` and the other prefill caps by taking the tightest. It is off by default.
+
 ## Hybrid Load Balancing
 
 Hybrid load balancing sits between the internal and external approaches. Each node runs its own API server(s) that only queue requests to the data-parallel engines colocated on that node. An upstream load balancer (for example, an ingress controller or traffic router) spreads user requests across those per-node endpoints.

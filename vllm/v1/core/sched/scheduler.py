@@ -49,6 +49,7 @@ from vllm.v1.core.sched.output import (
     ScheduledEncoderInputStats,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_budget import PrefillCostModel
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -425,6 +426,14 @@ class Scheduler(SchedulerInterface):
         # schedule() call including empty ones, so it would expire the hold
         # early; it keeps its own meaning (next_decode_eligible_step).
         self.num_executed_steps = 0
+        # Optional time budget per step (VLLM_PREFILL_STEP_BUDGET_MS): caps the
+        # prefill tokens a step carries by a cost model instead of by tokens.
+        self.prefill_cost_model = PrefillCostModel.from_env()
+        if self.prefill_cost_model is not None:
+            logger.info(
+                "Prefill chunks are sized by a step time budget: %s",
+                self.prefill_cost_model,
+            )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -718,7 +727,28 @@ class Scheduler(SchedulerInterface):
 
     def _prefill_token_cap(self) -> int | None:
         """Most prefill tokens this step may carry, or None for no extra cap."""
-        return None
+        return self._time_budget_prefill_cap()
+
+    def _time_budget_prefill_cap(self) -> int | None:
+        """Prefill tokens that keep the step within its time budget.
+
+        The step carries one token run per decoding request that is eligible
+        now, plus the prefill chunks. Chunks of one step share the cap, and the
+        context they attend over is taken from the longest running prefill.
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return None
+        decode_tokens = 0
+        context = 0
+        for request in self.running:
+            if request.is_finished():
+                continue
+            if request.is_prefill_chunk:
+                context = max(context, request.num_computed_tokens)
+            elif request.next_decode_eligible_step <= self.current_step:
+                decode_tokens += 1 + self.num_spec_tokens
+        return model.max_prefill_tokens(decode_tokens, context, align=self.block_size)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

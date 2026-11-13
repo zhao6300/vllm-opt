@@ -384,8 +384,10 @@ profiler 自身扰动 7–11%（DeepInfer 文档口径）。
 
 - [ ] 完成
 
-**现状：** launcher 只按连接数选最闲的 API worker
-（`vllm/entrypoints/launchers/launcher.py:79-110`）。
+**现状：** launcher 只在 API server 进程间按连接数分流
+（`vllm/entrypoints/launchers/launcher.py:79-110`）；DP rank 的选择在
+`DPLBAsyncMPClient.get_core_engine_for_request`（`vllm/v1/engine/core_client.py`），
+只看 waiting + running 请求数。已加开关 `VLLM_DP_LB_TOKEN_AWARE`（待 A/B）。
 
 **DeepInfer 做法：** prefill 按 4 档上下文长度（<16K / 16–64K /
 64–256K / ≥256K）分层，按上一轮算力配额拉取，组内按最低配额路由，

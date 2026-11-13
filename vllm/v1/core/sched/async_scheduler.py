@@ -94,6 +94,16 @@ class AsyncScheduler(Scheduler):
             self._pack_decode_microbatches(staggered)
 
     def _prefill_token_cap(self) -> int | None:
+        """Prefill token cap of the step being scheduled: the tighter of the
+        pack mode cap and the time budget cap."""
+        caps = [
+            cap
+            for cap in (self._pack_prefill_token_cap(), self._time_budget_prefill_cap())
+            if cap is not None
+        ]
+        return min(caps) if caps else None
+
+    def _pack_prefill_token_cap(self) -> int | None:
         """Prefill token cap of the step being scheduled (pack mode).
 
         A step with decodes to run gets ``pack_decode_step_prefill_tokens``,
