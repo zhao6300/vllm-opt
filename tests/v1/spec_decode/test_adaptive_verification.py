@@ -437,3 +437,58 @@ def test_step_timing_sampling_is_interval_gated_and_non_blocking(monkeypatch):
         for s in samples
     ] == [(1.0, 1.0, 0, 0, False), (1.0, 1.0, 0, 0, False)]
     assert collector.poll_sampled() == []
+
+
+class _RelayEvent:
+    def __init__(self, log: list, name: int) -> None:
+        self.log, self.name = log, name
+
+    def record(self) -> None:
+        self.log.append(("record", self.name))
+
+
+class _RelayStream:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def wait_event(self, event: _RelayEvent) -> None:
+        self.log.append(("wait", event.name))
+
+
+def _relay_manager(monkeypatch, lag: int):
+    """A manager with the relay bookkeeping on CPU stand-ins."""
+    log: list = []
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(device="cpu")
+    manager._relay_lag = lag
+    manager._relays_accepted = 0
+    manager._relay_events = [_RelayEvent(log, i) for i in range(lag + 1)]
+    manager._remote_confidences = torch.ones(2, 3)
+    manager._confidence_probs = torch.zeros(2, 3)
+    slot = SimpleNamespace(gpu=torch.zeros(2, 3), copy_to_cpu=lambda: None)
+    manager._stale_confidences = [slot, slot]
+    manager._copy_events = [SimpleNamespace(record=lambda: None)] * 2
+    manager._next_confidence_slot = lambda: 0  # type: ignore[method-assign]
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: _RelayStream(log))
+    return manager, manager.accept_remote_confidences, log
+
+
+@pytest.mark.parametrize("lag", [0, 1, 2])
+def test_trim_waits_for_the_relay_lag_steps_before_the_newest(monkeypatch, lag):
+    manager, accept, log = _relay_manager(monkeypatch, lag)
+    latest_relay_in_slot: dict[int, int] = {}
+    for step in range(8):
+        # execute_model(step) waits, then sample_tokens(step) accepts a relay.
+        log.clear()
+        manager.wait_for_remote_confidences()
+        waits = [name for kind, name in log if kind == "wait"]
+        wanted = step - 1 - lag  # relay `lag` steps before the newest one
+        if wanted < 0:
+            assert waits == []
+        else:
+            # The waited event must still hold that relay, not a later one.
+            assert [latest_relay_in_slot[w] for w in waits] == [wanted]
+        log.clear()
+        accept()
+        (slot,) = [name for kind, name in log if kind == "record"]
+        latest_relay_in_slot[slot] = step

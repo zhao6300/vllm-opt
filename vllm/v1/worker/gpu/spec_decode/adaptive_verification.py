@@ -269,6 +269,7 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
         receives_remote_confidences: bool = False,
+        confidence_relay_lag: int = 0,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -344,10 +345,14 @@ class AdaptiveVerificationManager:
         # batch with the confidences it relays. They land on the PP broadcast
         # stream, hence the event the main stream waits on before the trim.
         self._remote_confidences: torch.Tensor | None = None
-        self._confidence_relayed = False
+        self._relay_lag = max(confidence_relay_lag, 0)
+        self._relays_accepted = 0
+        self._relay_events: list[torch.cuda.Event] = []
         if receives_remote_confidences:
             self._remote_confidences = torch.empty_like(self._confidence_probs)
-            self._confidence_ready = torch.cuda.Event()
+            self._relay_events = [
+                torch.cuda.Event() for _ in range(self._relay_lag + 1)
+            ]
 
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
@@ -526,19 +531,27 @@ class AdaptiveVerificationManager:
         write_slot.gpu.copy_(self._confidence_probs)
         write_slot.copy_to_cpu()
         self._copy_events[write_idx].record()
-        self._confidence_ready.record()
-        self._confidence_relayed = True
+        self._relay_events[self._relays_accepted % len(self._relay_events)].record()
+        self._relays_accepted += 1
 
     def wait_for_remote_confidences(self) -> None:
-        """Order the main stream after the last step's confidence relay.
+        """Order the main stream after a relay of the confidences.
 
         The whole stage trims and ranks the batch on the main stream, and the
-        relayed buffer it reads was written on the PP broadcast stream.
+        relayed buffer it reads was written on the PP broadcast stream. A
+        request's confidences are only rewritten when it is in a batch, and the
+        decode stagger keeps a request out of the next `lag + 1` batches, so the
+        trim of this step only needs the relay `lag` steps before the newest.
+        Waiting for the newest one would hold this stage's forward until the
+        last stage finished the previous step, drafter included, and stop the
+        stages from overlapping.
         """
-        if self._confidence_relayed:
-            torch.cuda.current_stream(self.req_states.device).wait_event(
-                self._confidence_ready
-            )
+        if self._relays_accepted <= self._relay_lag:
+            return
+        # Relay j is recorded in slot j % (lag + 1); the one wanted is the slot
+        # the next relay will reuse.
+        event = self._relay_events[self._relays_accepted % len(self._relay_events)]
+        torch.cuda.current_stream(self.req_states.device).wait_event(event)
 
     def get_num_tokens(
         self,
@@ -739,6 +752,7 @@ def maybe_create_adaptive_verification_manager(
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     copy_admitted_drafts_to_host: bool = False,
     receives_remote_confidences: bool = False,
+    confidence_relay_lag: int = 0,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -789,4 +803,5 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
         receives_remote_confidences=receives_remote_confidences,
+        confidence_relay_lag=confidence_relay_lag,
     )

@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
+    VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1247,6 +1248,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to a sudden change in step cost.
     "VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW", "256")
+    ),
+    # With pipeline parallelism, how many steps before the newest relay of the
+    # drafter's confidences a non-last stage's trim may read. 0 waits for the
+    # newest one, which serializes the stages; the value is capped at the
+    # decode stagger minus one.
+    "VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG", "1")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

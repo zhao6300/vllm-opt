@@ -749,6 +749,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
             receives_remote_confidences=not self.is_last_pp_rank,
+            confidence_relay_lag=min(
+                envs.VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG,
+                self.vllm_config.pp_num_microbatches - 1,
+            ),
         )
         if self.adaptive_verification is not None:
             self.step_timing.enable_sampling(self.adaptive_verification.online_interval)
