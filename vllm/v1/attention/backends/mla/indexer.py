@@ -306,10 +306,12 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
-        # ROCm runs adaptive verification through the per-token flattened
-        # indexer path, which derives row ownership from device decode lengths.
+        # ROCm and SM12x run adaptive verification through the per-token
+        # flattened indexer path, which derives row ownership from device
+        # decode lengths.
         return (
             current_platform.is_rocm()
+            or _is_sm12x_with_deep_gemm()
             or super().supports_device_cpu_query_lens_mismatch()
         )
 
@@ -956,6 +958,32 @@ def _supports_flattened_device_query_lens() -> bool:
     )
 
 
+def _is_sm12x_with_deep_gemm() -> bool:
+    return (
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        )
+        and has_deep_gemm()
+    )
+
+
+def _sm12x_supports_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
+    """SM12x has no varlen or multi-row (next_n > 2) paged MQA logits kernel, so
+    DeepSeek-V4/V4.1 decode already flattens each query into a single-token row;
+    the expansion reads the per-request lengths from device tensors."""
+    model_config = vllm_config.model_config
+    return (
+        _is_sm12x_with_deep_gemm()
+        and model_config is not None
+        and (
+            "DeepseekV4ForCausalLM" in model_config.architectures
+            or "DeepseekV41ForCausalLM" in model_config.architectures
+        )
+    )
+
+
 def _rocm_supports_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
     model_config = vllm_config.model_config
     return (
@@ -991,6 +1019,7 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
         and (
             _supports_flattened_device_query_lens()
             or _rocm_supports_flattened_device_query_lens(vllm_config)
+            or _sm12x_supports_flattened_device_query_lens(vllm_config)
         )
     )
 
