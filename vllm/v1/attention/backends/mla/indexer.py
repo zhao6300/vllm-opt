@@ -64,6 +64,20 @@ logger = init_logger(__name__)
 DSA_INDEXER_KV_DTYPES = ("fp8", "mxfp4")
 
 
+def _mxfp4_indexer_model(vllm_config: VllmConfig) -> bool:
+    """Whether this model writes its indexer K cache with an MXFP4 store.
+
+    Only DeepSeek-V4 and V4.1 fuse the K quantize into the store. Every other
+    DSA model inserts through the unfused FP8-only path, so an MXFP4 cache
+    would assert at the first step instead of failing here.
+    """
+    model_config = vllm_config.model_config
+    return model_config is not None and model_config.hf_config.model_type in (
+        "deepseek_v4",
+        "deepseek_v41",
+    )
+
+
 def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
     """Whether the DeepSeek sparse indexer should use the MXFP4 K cache."""
     kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
@@ -82,11 +96,7 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
         # TODO: allow Kimi-K3.1 once AITER's row-group FP4 MQA logits kernel
         # accepts physical page strides; its decode scorer reads the merged
         # index cache in place.
-        model_config = vllm_config.model_config
-        if model_config is None or model_config.hf_config.model_type not in (
-            "deepseek_v4",
-            "deepseek_v41",
-        ):
+        if not _mxfp4_indexer_model(vllm_config):
             raise ValueError(
                 "indexer_kv_dtype='mxfp4' on ROCm is only supported for "
                 "DeepSeek-V4 and DeepSeek-V4.1."
@@ -101,11 +111,21 @@ def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
                 "aiter with VLLM_ROCM_USE_AITER=1."
             )
         return True
-    if use_fp4 and not current_platform.is_device_capability_family(100):
+    if use_fp4 and not (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    ):
         raise ValueError(
-            "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
-            "(sm_10x, e.g. B200/GB200); sm_120 (consumer Blackwell) and "
-            "earlier architectures are not supported."
+            "indexer_kv_dtype='mxfp4' requires a Blackwell GPU whose DeepGEMM "
+            "build ships the MXFP4 MQA-logits kernels (sm_10x datacenter, "
+            "sm_120, or sm_121); earlier architectures are not supported."
+        )
+    if use_fp4 and not _mxfp4_indexer_model(vllm_config):
+        raise ValueError(
+            "indexer_kv_dtype='mxfp4' is only supported for DeepSeek-V4 and "
+            "DeepSeek-V4.1: their fused K store is the only one that writes "
+            "FP4 indexer pages."
         )
     return use_fp4
 
@@ -289,9 +309,13 @@ class KpoolTailBackend(DeepseekV32IndexerBackend):
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # ROCm, XPU, and SM12x run adaptive verification through the per-token
+        # flattened indexer path, which derives row ownership from device
+        # decode lengths.
         return (
             current_platform.is_rocm()
             or current_platform.is_xpu()
+            or _is_sm12x_with_deep_gemm()
             or super().supports_device_cpu_query_lens_mismatch()
         )
 
@@ -319,10 +343,15 @@ class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
     @staticmethod
     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
         # SM12x kernels only instantiate 64-token sparse-MLA blocks (128
-        # trips the block_kv assert, #59203).
-        if current_platform.is_device_capability_family(120):
-            return [64]
-        return [64 if current_platform.is_device_capability_family(90) else 128]
+        # trips the block_kv assert, #59203); SM90 pages must contain 64
+        # compressed states. Wider manager blocks may hold several.
+        if (
+            current_platform.is_device_capability_family(90)
+            or current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        ):
+            return [MultipleOf(64)]
+        return [128]
 
 
 @dataclass(frozen=True)
@@ -934,6 +963,32 @@ def _supports_flattened_device_query_lens() -> bool:
     )
 
 
+def _is_sm12x_with_deep_gemm() -> bool:
+    return (
+        current_platform.is_cuda()
+        and (
+            current_platform.is_device_capability_family(120)
+            or current_platform.is_device_capability_family(121)
+        )
+        and has_deep_gemm()
+    )
+
+
+def _sm12x_supports_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
+    """SM12x has no varlen or multi-row (next_n > 2) paged MQA logits kernel, so
+    DeepSeek-V4/V4.1 decode already flattens each query into a single-token row;
+    the expansion reads the per-request lengths from device tensors."""
+    model_config = vllm_config.model_config
+    return (
+        _is_sm12x_with_deep_gemm()
+        and model_config is not None
+        and (
+            "DeepseekV4ForCausalLM" in model_config.architectures
+            or "DeepseekV41ForCausalLM" in model_config.architectures
+        )
+    )
+
+
 def _supports_deepseek_v4_flattened_device_query_lens(vllm_config: VllmConfig) -> bool:
     model_config = vllm_config.model_config
     return (
@@ -969,6 +1024,7 @@ def _use_flattening(vllm_config: VllmConfig) -> bool:
         and (
             _supports_flattened_device_query_lens()
             or _supports_deepseek_v4_flattened_device_query_lens(vllm_config)
+            or _sm12x_supports_flattened_device_query_lens(vllm_config)
         )
     )
 

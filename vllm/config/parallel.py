@@ -256,6 +256,13 @@ class ParallelConfig:
     `VLLM_MORI_EP_V2` and the deployment by `resolve_mori_all2all`; not meant
     to be set by users."""
 
+    enable_sequence_parallel_moe: bool = False
+    """Allow model-selected sequence-parallel MoE with a single DP rank.
+
+    Model config hooks enable this before communication groups are created.
+    The model must shard its inputs and set FusedMoE's is_sequence_parallel.
+    """
+
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
     sequentially in multiple batches. To avoid RAM OOM when using tensor
@@ -878,7 +885,7 @@ class ParallelConfig:
             )
             and self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size > 1
+            and (self.data_parallel_size > 1 or self.enable_sequence_parallel_moe)
         )
 
     @property

@@ -2,11 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 state saving/compression and independently schedulable cache insertion."""
 
+import numpy as np
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
+from vllm.models.deepseek_v41.common.ops.cache_utils import (
+    paged_cache_block_span,
+    paged_cache_page_rows,
+    paged_slots_to_cache_rows,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import (
+    flashinfer_dsv41_fp4_quantize_append,
+    flashinfer_dsv41_fp4_quantize_pack,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -323,6 +333,26 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 288:
+        roped_latent = torch.empty_like(latent)
+        _gptj_rotate_latent_kernel[(num_tokens,)](
+            latent,
+            positions,
+            cos_sin_cache,
+            roped_latent,
+            COS_STRIDE=cos_sin_cache.stride(0),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+            **launch_kwargs,
+        )
+        _insert_fp4_packed_or_append(
+            roped_latent,
+            slot_mapping,
+            kv_cache,
+            positions,
+            compress_ratio,
+        )
+        return
     if kv_cache.dtype == torch.uint8:
         kernel = {
             584: _rope_quant_insert_kernel,
@@ -370,6 +400,109 @@ def rope_quant_insert(
         num_warps=4,
         **launch_kwargs,
     )
+
+
+def _insert_fp4_packed_or_append(
+    roped_latent: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+) -> None:
+    """Use page packing only for whole consecutive pages, otherwise append."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    if compress_ratio != 1:
+        # Callers already mark non-boundary tokens as PAD; keep the writer
+        # correct on its own so a stray valid slot cannot publish a token that
+        # does not close a compression group.
+        slot_mapping = slot_mapping.masked_fill(
+            (positions + 1) % compress_ratio != 0, -1
+        )
+    # FlashInfer's writer addresses a record as a flat row of the whole cache,
+    # so padded pages need the slot rewritten to the row the token occupies.
+    page_tokens = paged_cache_page_rows(kv_cache)
+    append_slots = paged_slots_to_cache_rows(
+        slot_mapping, page_tokens, paged_cache_block_span(kv_cache)
+    )
+    if (
+        slot_mapping.dim() != 1
+        or compress_ratio != 1
+        or torch.cuda.is_current_stream_capturing()
+        or BreakableCUDAGraphCapture.is_active()
+    ):
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent, append_slots, kv_cache, inline_scale=True
+        )
+        return
+
+    # compress_ratio == 1 here, so every token closes a group and ``positions``
+    # needs no boundary check. One host copy of the slots replaces the former
+    # per-element ``.item()`` syncs.
+    slots_cpu = slot_mapping.cpu().numpy()
+    runs = _whole_page_runs(slots_cpu, page_tokens)
+    packed_mask = np.zeros(slots_cpu.shape[0], dtype=bool)
+    for start, end in runs:
+        packed_mask[start:end] = True
+        page_ids = (
+            slot_mapping[start:end:page_tokens]
+            .div(page_tokens, rounding_mode="trunc")
+            .to(torch.long)
+        )
+        packed = flashinfer_dsv41_fp4_quantize_pack(
+            roped_latent[start:end].view(-1, page_tokens, 512),
+            kv_layout="NHD",
+            inline_scale=True,
+        )
+        kv_cache.index_copy_(
+            0,
+            page_ids,
+            packed.reshape(-1, page_tokens, 288),
+        )
+
+    append_rows = np.flatnonzero(~packed_mask)
+    if append_rows.size:
+        append_rows_t = torch.from_numpy(append_rows).to(slot_mapping.device)
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent[append_rows_t],
+            append_slots[append_rows_t],
+            kv_cache,
+            inline_scale=True,
+        )
+
+
+def _whole_page_runs(slots: np.ndarray, page_tokens: int) -> list[tuple[int, int]]:
+    """Token ranges ``[start, end)`` made only of complete, in-order pages.
+
+    A page qualifies when it starts on a page boundary and its ``page_tokens``
+    slots are consecutive, so one pack call can write it whole. Every slot of
+    the page is checked: a batch holding several requests, or decode tokens next
+    to a prefill, can have a page-aligned slot followed by slots of another
+    request. Adjacent qualifying pages are merged into one run; they need not
+    be adjacent in the cache because the caller derives each page id from the
+    page's first slot.
+    """
+    num_tokens = slots.shape[0]
+    offsets = np.arange(page_tokens, dtype=slots.dtype)
+    runs: list[tuple[int, int]] = []
+    token = 0
+    while token < num_tokens:
+        end = token + page_tokens
+        first = slots[token]
+        if (
+            first >= 0
+            and first % page_tokens == 0
+            and end <= num_tokens
+            and np.array_equal(slots[token:end], first + offsets)
+        ):
+            if runs and runs[-1][1] == token:
+                runs[-1] = (runs[-1][0], end)
+            else:
+                runs.append((token, end))
+            token = end
+        else:
+            token += 1
+    return runs
 
 
 @triton.jit
@@ -518,7 +651,7 @@ def _rope_quant_insert_nvfp4_kernel(
     tiles = tl.reshape(rotated, (32, 16))
     amax = tl.max(tl.abs(tiles), 1)
     # 2**-9 is the smallest normal e4m3 magnitude; 448 the largest.
-    scale = tl.clamp(amax * (1.0 / 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
+    scale = tl.clamp(tl.math.div_rn(amax, 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
     # Round-to-nearest division: Triton's default div.full misplaces values
     # that land exactly on an e2m1 tie.
     scaled = tl.math.div_rn(tiles, tl.reshape(scale.to(tl.float32), (32, 1)))
@@ -573,3 +706,28 @@ def _rope_plain_insert_kernel(
         tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
     else:
         tl.store(dst + d, row)
+
+
+@triton.jit
+def _gptj_rotate_latent_kernel(
+    latent,
+    positions,
+    cos_sin,
+    output,
+    COS_STRIDE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+):
+    t = tl.program_id(0)
+    position = tl.load(positions + t)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+    d = tl.arange(0, 512)
+    normed = tl.load(latent + t.to(tl.int64) * 512 + d).to(tl.float32)
+    even, odd = tl.split(tl.reshape(normed, (256, 2)))
+    pair = tl.arange(0, 256) - 224
+    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
+    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
+    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
+    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
+    rotated = tl.where(rotated != rotated, 0.0, rotated)
+    tl.store(output + t.to(tl.int64) * 512 + d, rotated.to(tl.bfloat16))

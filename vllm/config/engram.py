@@ -8,6 +8,7 @@ from pydantic import model_validator
 from vllm.config.utils import CompileFactors, config, get_compile_factors
 
 if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
     from vllm.config.model import ModelConfig
     from vllm.config.parallel import ParallelConfig
 
@@ -160,6 +161,24 @@ class EngramConfig:
                     f"An Engram peer group of {self.peer_group_size} GPUs cannot "
                     f"hold an engine of {parallel_config.data_parallel_size}"
                 )
+
+        if self.embedding_across_dp and parallel_config.use_sequence_parallel_moe:
+            raise NotImplementedError(
+                "Engram embedding_across_dp is not supported with sequence "
+                "parallel yet."
+            )
+
+    def verify_load_config(self, load_config: "LoadConfig") -> None:
+        """Shared tables require a loader that invokes parameter weight callbacks."""
+        if self.dp_shared_memory and load_config.load_format not in (
+            "auto",
+            "safetensors",
+            "pt",
+        ):
+            raise ValueError(
+                "dp_shared_memory requires load_format 'auto', "
+                f"'safetensors' or 'pt'; got {load_config.load_format!r}."
+            )
 
     def get_parallel_size(self, parallel_config: "ParallelConfig") -> int:
         """Derive the embedding group size from the parallel configuration."""

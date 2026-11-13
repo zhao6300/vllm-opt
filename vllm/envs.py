@@ -62,8 +62,19 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MQA_TOPK: bool = True
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
+    VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
+    VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
     VLLM_XPU_PP_MICROBATCH: bool = True
+    VLLM_PP_NUM_MICROBATCHES: int = 0
+    VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
+    VLLM_PP_PACK_MAX_SEQS: int = 0
+    VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS: int | None = None
+    VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS: int | None = None
+    VLLM_PP_SEND_BUFFERS: int = 0
+    VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
@@ -322,6 +333,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -430,6 +442,19 @@ def compile_on_one_rank() -> bool:
     if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
         return False
     return os.environ.get("VLLM_COMPILE_ON_ONE_RANK", "0") == "1"
+
+
+def _pp_microbatch_balance() -> str:
+    """VLLM_PP_MICROBATCH_BALANCE: off, balance or pack ("0" and "1" are the
+    older spellings of off and balance)."""
+    value = os.getenv("VLLM_PP_MICROBATCH_BALANCE", "off")
+    mode = {"0": "off", "1": "balance"}.get(value, value)
+    if mode not in ("off", "balance", "pack"):
+        raise ValueError(
+            f"Invalid value '{value}' for VLLM_PP_MICROBATCH_BALANCE. "
+            "Valid options: off, balance, pack (or 0, 1)."
+        )
+    return mode
 
 
 def env_with_choices(
@@ -983,6 +1008,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(
         int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
     ),
+    # V2 runner + PP + async scheduling: decode microbatches M. Each request
+    # decodes every M steps, the sampled-token ring is M deep and M + 1 batches
+    # are in flight. 0 (default) is pipeline_parallel_size; larger values fill
+    # a pipeline whose round trip through the stages exceeds one microbatch
+    # step, at the cost of M x step time per token and smaller microbatches.
+    # Read by the scheduler and every worker: set it for the whole server.
+    "VLLM_PP_NUM_MICROBATCHES": lambda: int(os.getenv("VLLM_PP_NUM_MICROBATCHES", "0")),
+    # V2 runner + PP + async scheduling: how decode requests are spread over the
+    # decode microbatches (the requests decoded in alternating steps). A burst
+    # of requests that start decoding in one step otherwise stays in one
+    # microbatch, and every other step reaches the stages nearly empty.
+    # "balance" (or "1") keeps the microbatches the same size. "pack" gathers
+    # the decodes in the fullest microbatch, so the other steps carry no decode
+    # and a small prefill chunk fits in the idle time of a stage. "off" (or
+    # "0", the default) leaves the assignment alone.
+    "VLLM_PP_MICROBATCH_BALANCE": lambda: _pp_microbatch_balance(),
+    # "pack" mode: most decode requests one microbatch holds before the rest
+    # go to the next fullest one. 0 never spills over, which is what the
+    # scheduler's max_num_seqs (total running requests) allows anyway.
+    "VLLM_PP_PACK_MAX_SEQS": lambda: int(os.getenv("VLLM_PP_PACK_MAX_SEQS", "0")),
+    # "pack" mode: most prefill tokens a step may carry, in steps that have
+    # decodes to run (DECODE_STEP) and in steps that have none (FREE_STEP). The
+    # decode step is on the critical path of every decoding request, so each
+    # prefill token there adds to TPOT; a free step only has to fit in the idle
+    # time of a stage. 0 defers the prefill of that kind of step. Unset: the
+    # decode step takes --long-prefill-token-threshold (or
+    # --max-num-batched-tokens without it), the free step
+    # --max-num-batched-tokens.
+    "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", None)
+    ),
+    "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", None)
+    ),
+    # Number of send buffers per non-last PP rank. 0 waits for the previous
+    # step's intermediate-tensor send before each forward (default). N >= 1
+    # copies each step's payload into one of N preallocated buffers and waits
+    # only for the send that last used that buffer, so a stage can run up to
+    # N steps ahead of its successor's receives.
+    "VLLM_PP_SEND_BUFFERS": lambda: int(os.getenv("VLLM_PP_SEND_BUFFERS", "0")),
+    # Log per-rank PP step timings (GPU time from CUDA events: step cadence,
+    # execute, receive and send waits, sampling, drafting) averaged over this
+    # many steps. 0 disables it.
+    "VLLM_PP_STEP_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_PP_STEP_PROFILE_INTERVAL", "0")
+    ),
     # When True, GroupCoordinator constructs its CPU/device subgroups via
     # ``torch.distributed.split_group(backend=...)``
     # and ``init_distributed_environment`` initializes the default PG with
@@ -1163,6 +1234,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB", "2048")
     ),
+    # FlashInfer SM120 sparse-MLA prefill kernel selection: "auto", "swapab"
+    # or "mg". Only used by the DeepSeek-V4.1 FP4 extra-cache path.
+    "VLLM_FLASHINFER_SM120_PREFILL_IMPL": lambda: os.getenv(
+        "VLLM_FLASHINFER_SM120_PREFILL_IMPL", "auto"
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1170,6 +1246,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Clamped to max_model_len - query_len. Default: 8192 tokens
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+    ),
+    # How often live decode steps refresh the adaptive-verification cost
+    # tables from measured timings. 0 keeps the startup profile only.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL", "0")
+    ),
+    # Timed samples kept per (request count / token count) bucket when
+    # refreshing the tables. Larger windows track slower drift but react less
+    # to a sudden change in step cost.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW", "256")
+    ),
+    # With pipeline parallelism, how many steps before the newest relay of the
+    # drafter's confidences a non-last stage's trim may read. 0 waits for the
+    # newest one, which serializes the stages; the value is capped at the
+    # decode stagger minus one.
+    "VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG", "1")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2267,6 +2361,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
+    # Decode steps replay FULL graphs, where the MoE all-to-all is also on the
+    # critical path, so the useful cutoff can differ from the prefill one. The
+    # cutoff applies while the FULL graph is recorded, since replay runs no
+    # Python. Unset falls back to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD": lambda: int(
+        int(
+            os.getenv(
+                "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD",
+                os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256),
+            )
+        )
+    ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
@@ -2518,6 +2624,14 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # PP scheduling, send buffering and step timing run outside the model.
+        "VLLM_PP_NUM_MICROBATCHES",
+        "VLLM_PP_MICROBATCH_BALANCE",
+        "VLLM_PP_PACK_MAX_SEQS",
+        "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_SEND_BUFFERS",
+        "VLLM_PP_STEP_PROFILE_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

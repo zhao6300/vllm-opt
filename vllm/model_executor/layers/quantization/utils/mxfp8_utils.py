@@ -234,6 +234,9 @@ def _mxfp8_e4m3_quantize_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.platforms import current_platform
 
+    if x.numel() == 0:
+        return mxfp8_e4m3_quantize_fake(x, is_sf_swizzled_layout, alignment)
+
     flashinfer_mxfp8_quantize = _flashinfer_mxfp8_quantize()
     if flashinfer_mxfp8_quantize is not None:
         x_q, x_scales = flashinfer_mxfp8_quantize(

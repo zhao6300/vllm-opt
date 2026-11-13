@@ -36,6 +36,15 @@ MAX_POS = 4096
 CUTEDSL_MODULE = "vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl"
 
 
+def mxfp4_indexer_cache_supported() -> bool:
+    """Whether DeepGEMM ships the MXFP4 indexer kernels for this GPU."""
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+        or current_platform.is_device_capability_family(121)
+    )
+
+
 def quantize_to_mxfp4(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -139,11 +148,8 @@ def _reference(
         pytest.param(
             True,
             marks=pytest.mark.skipif(
-                not (
-                    current_platform.is_cuda()
-                    and current_platform.is_device_capability_family(100)
-                ),
-                reason="MXFP4 indexer cache requires an SM100-family GPU",
+                not mxfp4_indexer_cache_supported(),
+                reason="MXFP4 indexer cache needs an sm_10x/sm_12x GPU",
             ),
         ),
     ],
@@ -239,11 +245,8 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
         pytest.param(
             True,
             marks=pytest.mark.skipif(
-                not (
-                    current_platform.is_cuda()
-                    and current_platform.is_device_capability_family(100)
-                ),
-                reason="MXFP4 indexer cache requires an SM100-family GPU",
+                not mxfp4_indexer_cache_supported(),
+                reason="MXFP4 indexer cache needs an sm_10x/sm_12x GPU",
             ),
         ),
     ],
@@ -370,8 +373,8 @@ def test_indexer_k_inserts_only_valid_groups_into_padded_pages(
         indexer_k_norm_rope_store,
     )
 
-    if use_fp4 and not current_platform.is_device_capability_family(100):
-        pytest.skip("MXFP4 indexer cache requires an SM100-family GPU")
+    if use_fp4 and not mxfp4_indexer_cache_supported():
+        pytest.skip("MXFP4 indexer cache needs an sm_10x/sm_12x GPU")
     torch.manual_seed(17)
     device = "cuda"
     k_pre = torch.randn(num_tokens + 3, 128, device=device, dtype=torch.bfloat16)
@@ -453,8 +456,8 @@ def test_indexer_k_cuda_graph_replay_reads_current_projection(use_fp4):
         indexer_k_norm_rope_store,
     )
 
-    if use_fp4 and not current_platform.is_device_capability_family(100):
-        pytest.skip("MXFP4 indexer cache requires an SM100-family GPU")
+    if use_fp4 and not mxfp4_indexer_cache_supported():
+        pytest.skip("MXFP4 indexer cache needs an sm_10x/sm_12x GPU")
     torch.manual_seed(18)
     k_pre = torch.randn(19, 128, device="cuda", dtype=torch.bfloat16)
     norm_weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
@@ -571,10 +574,8 @@ def test_indexer_k_store_roundtrips_through_rocm_gather(block_size, compress_rat
 
 @pytest.mark.parametrize("use_cutedsl", [False, True])
 @pytest.mark.skipif(
-    not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(100)
-    ),
-    reason="MXFP4 indexer cache requires an SM100-family GPU",
+    not mxfp4_indexer_cache_supported(),
+    reason="MXFP4 indexer cache needs an sm_10x/sm_12x GPU",
 )
 @torch.inference_mode()
 def test_fused_indexer_q_rope_quant_writes_bf16_weights(use_cutedsl):
@@ -583,6 +584,8 @@ def test_fused_indexer_q_rope_quant_writes_bf16_weights(use_cutedsl):
     result rounded once, so the scoring kernel needs no cast."""
     if use_cutedsl and not has_cutedsl():
         pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and not current_platform.is_device_capability_family(100):
+        pytest.skip("the CuTe DSL FP4 epilogue is SM100-only")
 
     device = "cuda"
     torch.manual_seed(0)

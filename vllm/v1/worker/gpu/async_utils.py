@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+from collections import deque
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -41,10 +42,11 @@ def _timing_event() -> torch.cuda.Event:
 
 @dataclass
 class StepTimingEvents:
-    forward_start: torch.cuda.Event = field(default_factory=_timing_event)
-    forward_end: torch.cuda.Event = field(default_factory=_timing_event)
-    drafter_start: torch.cuda.Event = field(default_factory=_timing_event)
-    drafter_end: torch.cuda.Event = field(default_factory=_timing_event)
+    # Indirect so tests can stand in a CPU event implementation.
+    forward_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    forward_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    drafter_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    drafter_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
 
 
 class StepTimingCollector:
@@ -59,6 +61,21 @@ class StepTimingCollector:
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        # Continuous sampling for online cost estimation: one step every
+        # `_sample_interval`, resolved without synchronizing the stream.
+        self._sample_interval = 0
+        self._sample_countdown = 0
+        self._sampling = False
+        self._pending: deque[tuple[StepTimingEvents, tuple[bool, int, int]]] = deque()
+
+    def enable_sampling(self, interval: int) -> None:
+        """Time one step every `interval` forward calls; 0 disables it.
+
+        Samples are collected without a device sync and drained by
+        `poll_sampled`, which only reads steps whose events have completed.
+        """
+        self._sample_interval = max(interval, 0)
+        self._sample_countdown = 0
 
     @contextlib.contextmanager
     def collect(self) -> Generator[list[StepTimingSample]]:
@@ -90,13 +107,35 @@ class StepTimingCollector:
         )
 
     def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
-        """Costs from different execution modes must not share a cost curve."""
-        self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
+        """Costs from different execution modes must not share a cost curve.
 
-    def forward_start(self) -> None:
+        A step is keyed by the token count it runs, padding included: under DP
+        a rank replays the graph of the largest rank, so its own token count
+        would price that graph's cost on a smaller shape.
+        """
+        self._batch = (
+            full_cudagraph,
+            input_batch.num_tokens_after_padding,
+            input_batch.num_reqs,
+        )
+
+    def forward_start(self, sample: bool = True) -> None:
+        """Start timing a step; `sample=False` keeps it out of the continuous
+        samples (it is still timed inside `collect`)."""
         if self._collecting:
             self._step = StepTimingEvents()
+            self._sampling = False
             self._step.forward_start.record()
+            return
+        if not sample or self._sample_interval <= 0 or self._sampling:
+            return
+        if self._sample_countdown > 0:
+            self._sample_countdown -= 1
+            return
+        self._step = StepTimingEvents()
+        self._sampling = True
+        self._sample_countdown = self._sample_interval - 1
+        self._step.forward_start.record()
 
     def forward_end(self) -> None:
         if self._step is not None:
@@ -110,8 +149,70 @@ class StepTimingCollector:
         """Ends the step: only steps that reach here have a draft cost."""
         if self._step is not None:
             self._step.drafter_end.record()
-            self._timed.append((self._step, self._batch))
+            if self._sampling:
+                self._pending.append((self._step, self._batch))
+                self._sampling = False
+            else:
+                self._timed.append((self._step, self._batch))
             self._step = None
+
+    def poll_sampled(self) -> list[StepTimingSample]:
+        """Drain completed continuous samples without a device sync."""
+        samples: list[StepTimingSample] = []
+        while self._pending:
+            events, batch = self._pending[0]
+            if not events.drafter_end.query():
+                break
+            self._pending.popleft()
+            full_cudagraph, num_target_tokens, num_reqs = batch
+            samples.append(
+                StepTimingSample(
+                    events.forward_start.elapsed_time(events.forward_end),
+                    events.drafter_start.elapsed_time(events.drafter_end),
+                    num_target_tokens,
+                    num_reqs,
+                    full_cudagraph,
+                )
+            )
+        return samples
+
+
+def trim_sampled_token_ids(
+    sampled_token_ids: list[list[int]], num_sampled: list[int]
+) -> list[list[int]]:
+    """Keep only the accepted prefix of each sampled row.
+
+    A request samples ``num_sampled + num_rejected`` tokens per step
+    (``num_speculative_steps + 1`` with drafts), but the scheduler reserved
+    placeholders for the ``num_sampled`` accepted ones only, so the trailing
+    rejected slots must not reach it.
+
+    Args:
+        sampled_token_ids: One row per request, of the padded sample width.
+        num_sampled: Accepted tokens per row, including the bonus token.
+
+    Returns:
+        The rows truncated to ``num_sampled`` tokens.
+
+    Raises:
+        ValueError: If the rows and counts disagree. A row that is too short
+            silently keeps padding tokens and one that is too long loses
+            sampled tokens; either puts wrong tokens into a request's history.
+
+    """
+    if len(sampled_token_ids) != len(num_sampled):
+        raise ValueError(
+            f"{len(sampled_token_ids)} sampled rows for {len(num_sampled)} requests"
+        )
+    trimmed: list[list[int]] = []
+    for row, num_tokens in zip(sampled_token_ids, num_sampled):
+        if not 0 <= num_tokens <= len(row):
+            raise ValueError(
+                f"num_sampled={num_tokens} does not fit its sampled row of width "
+                f"{len(row)}; num_sampled + num_rejected must equal the sample width"
+            )
+        trimmed.append(row[:num_tokens])
+    return trimmed
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -184,9 +285,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # rather than Python lists.
         sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
         num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
-        for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
-            del token_ids[num_tokens:]
-        self.model_runner_output.sampled_token_ids = sampled_token_ids
+        self.model_runner_output.sampled_token_ids = trim_sampled_token_ids(
+            sampled_token_ids, num_sampled_tokens
+        )
 
         if self.sampling_mask_tensors is not None:
             self.model_runner_output.sampling_masks = (

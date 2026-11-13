@@ -154,6 +154,7 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
+from vllm.v1.worker.gpu.pp_step_profiler import pp_step_span
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.batch_shard import (
     BatchSharder,
@@ -347,6 +348,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
+                ring_depth=self.vllm_config.pp_num_microbatches,
             )
 
         # Samplers and decode_query_len created in load_model() after
@@ -596,6 +598,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_model(self) -> nn.Module:
         return self.model
 
+    @property
+    def pipeline_payload_keys(self) -> frozenset[str]:
+        return getattr(self.get_model(), "pipeline_payload_keys", frozenset())
+
     def get_draft_model(self) -> nn.Module | None:
         speculator = self.speculator
         if not isinstance(speculator, DraftModelSpeculator):
@@ -723,11 +729,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
-        # The speculator clears the flag at load time when the checkpoint has
-        # no confidence head, so it holds the effective value.
+        # Only the last PP rank has a speculator, but every stage trims its
+        # batch, so the flag comes from the config: the stages must agree on
+        # whether a manager exists before they relay confidences.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
-            enable_adaptive_verification=getattr(
-                self.speculator, "enable_adaptive_verification", False
+            enable_adaptive_verification=(
+                self.speculative_config is not None
+                and self.speculative_config.enable_adaptive_verification
             ),
             attn_groups=self.attn_groups,
             req_states=self.req_states,
@@ -738,7 +746,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
+            receives_remote_confidences=not self.is_last_pp_rank,
+            confidence_relay_lag=min(
+                envs.VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG,
+                self.vllm_config.pp_num_microbatches - 1,
+            ),
         )
+        if self.adaptive_verification is not None:
+            self.step_timing.enable_sampling(self.adaptive_verification.online_interval)
 
         self.block_tables = BlockTables(
             block_sizes=[g.block_size for g in kv_cache_groups],
@@ -971,6 +986,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            self._end_stage_timing()
             return None, None
 
         assert self.execute_model_state is not None
@@ -1121,6 +1137,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with self.eplb.suppress():
             return _profile_cudagraph_memory(self)
 
+    def _profile_capture_sizes(self) -> list[int]:
+        """Token counts of the cost-profiling dummy runs.
+
+        The profiling runs are pipeline steps of their own: every stage has to
+        replay the same batches, so the last rank decides them and the others
+        follow instead of trusting their own captured set.
+        """
+        assert self.cudagraph_manager is not None
+        capture_sizes = self.cudagraph_manager.captured_token_counts()
+        if self.use_pp:
+            pp_group = get_pp_group()
+            # broadcast_object takes the rank within the group; last_rank is
+            # global and only equals it on the first DP replica.
+            capture_sizes = pp_group.broadcast_object(
+                capture_sizes, src=pp_group.world_size - 1
+            )
+        return capture_sizes
+
     def needs_cudagraph_capture(self) -> bool:
         """Whether capture_model() has any CUDA graphs left to capture."""
         return (
@@ -1222,7 +1256,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.cudagraph_manager is not None
         with self.step_timing.collect() as timings:
             for batch in self.adaptive_verification.batches_to_profile(
-                self.cudagraph_manager.captured_token_counts()
+                self._profile_capture_sizes()
             ):
                 self._dummy_run(**batch, skip_eplb=True)
         self.adaptive_verification.set_initial_cost_curves(timings)
@@ -1828,6 +1862,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if self.adaptive_verification is not None:
+            # Non-last PP stages rank this step's drafts with the confidences
+            # the last rank relayed at the end of the previous one.
+            self.adaptive_verification.wait_for_remote_confidences()
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
@@ -1907,6 +1945,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+
+        if (
+            self.adaptive_verification is not None
+            and batch_req_state is not None
+            and batch_req_state.num_draft_tokens_np is not None
+            and self.pcp_manager is None
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc.num_ubatches == 1
+            and batch_desc.num_tokens > num_toks
+        ):
+            # The FULL graph runs its padded rows anyway (under DP, up to the
+            # largest rank): verify more drafts in them. Request count and
+            # per-request query lengths stay within the graph's bounds.
+            filled = self.adaptive_verification.fill_graph_padding(
+                batch_desc.num_tokens
+            )
+            if filled is not None:
+                num_toks = filled
+                batch_req_state = batch_req_state._replace(num_tokens=filled)
 
         cudagraph_stats = None
         if not dummy_run:
@@ -2115,7 +2172,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
-        self.step_timing.forward_start()
+        # Dummy steps (idle DP replicas, warmup) are padded to other ranks'
+        # sizes, so their timings would misprice the shapes they are keyed by.
+        self.step_timing.forward_start(sample=not dummy_run)
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2220,6 +2279,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )[: input_batch.num_tokens]
         return None
 
+    def _end_stage_timing(self) -> None:
+        """Close the step timing on a non-last PP stage.
+
+        These stages have no drafter, so their draft cost is zero, but the step
+        still has to end here: the collector only resolves steps that reach
+        `drafter_end`.
+        """
+        self.step_timing.forward_end()
+        self.step_timing.drafter_start()
+        self.step_timing.drafter_end()
+
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
@@ -2241,6 +2311,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
 
+        if self.adaptive_verification is not None:
+            # The online refresh is a blocking PP all_gather. Every stage calls
+            # sample_tokens once per served step and dummy runs never do, so
+            # the stages count alike. It must not sit in execute_model: there a
+            # later stage blocks receiving the step's PP metadata, which the
+            # first stage only sends after its own forward.
+            self.adaptive_verification.observe_timings(self.step_timing.poll_sampled())
+
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
             # IntermediateTensors instead of final hidden states. Receive the
@@ -2248,8 +2326,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.pcp_manager is not None:
                 input_batch = self.pcp_manager.global_batch
             assert self.pp_handler is not None
+            self._end_stage_timing()
             all_decode_next = self.pp_handler.receive(
-                input_batch, recv_drafts=num_spec_tokens > 0
+                input_batch,
+                recv_drafts=num_spec_tokens > 0,
+                adaptive_verification=self.adaptive_verification,
             )
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
@@ -2267,6 +2348,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Last rank: sample tokens
         assert hidden_states is not None
+        self.step_timing.forward_end()
         draft_hidden_states = hidden_states
         if self.pcp_manager is not None:
             hidden_states, aux_hidden_states, input_batch = (
@@ -2373,7 +2455,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             spec_hidden_states = get_drafter_hidden_states(
                 self.model, draft_hidden_states
             )
-            with self.draft_context():
+            if isinstance(self.sampler, GPUWatermarkSampler):
+                self.speculator.prepare_watermarking(
+                    self.sampler, input_batch.idx_mapping
+                )
+            self.step_timing.drafter_start()
+            with self.draft_context(), pp_step_span("draft"):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -2390,6 +2477,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dp_sync_state=dp_sync_state,
                     mm_inputs=mm_inputs,
                 )
+            self.step_timing.drafter_end()
             if self.pcp_manager is not None:
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
@@ -2412,6 +2500,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Drafts aren't used when none were proposed this step (e.g. skip_drafts).
             if self.pp_handler is not None and num_spec_tokens > 0:
                 self.pp_handler.broadcast_drafts(draft_tokens)
+
+        # After the drafts: the other stages receive both in one order.
+        if self.pp_handler is not None and self.adaptive_verification is not None:
+            self.pp_handler.broadcast_confidences(
+                self.adaptive_verification.confidences
+            )
 
         if defer_kv_finalize:
             self.kv_connector.finalize_step()

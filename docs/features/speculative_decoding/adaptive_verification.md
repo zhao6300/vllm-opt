@@ -55,8 +55,19 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
-- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
+- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries).
+- With pipeline parallelism, every stage trims the same batch and so needs the same inputs: a shape costs the slowest stage's forward time, and the last rank relays the drafter's per-slot confidences to the other stages on every step. The curves therefore price the slowest stage rather than the sum of the stages. A non-last stage trims its step with the relay `VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG` steps before the newest (default 1, capped at the decode stagger minus one), so its forward does not wait for the last stage to finish the previous step; `0` waits for the newest relay.
 - Without a confidence head, `use_local_argmax_reduction` is rejected. The estimator needs the full draft logits, which local argmax reduction never materializes.
+
+## Refreshing the cost profile during serving
+
+The startup profile can drift from what the server actually measures: another process can share the GPU, clocks change, and the served batch mix may not look like the profiled one. Setting `VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL` (in runner steps) times one step every N steps without synchronizing the device and folds the completed samples into the cost curves. Each batch shape keeps the median of its last `VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW` samples (default 256), and a shape needs at least four samples before it replaces the startup value. `0` (the default) keeps the startup profile only.
+
+```bash
+# Re-measure the cost tables every 64 steps.
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL=64
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
+```
 
 ## Tuning the cost profile
 

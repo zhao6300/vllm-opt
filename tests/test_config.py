@@ -360,6 +360,57 @@ def test_sampling_replay_config(config, message):
             VllmConfig._verify_sampling_replay_config(config)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_deepseek_v41_pp_sp_initializes_single_dp_communication(enabled):
+    import torch
+
+    from vllm.forward_context import DPMetadata
+    from vllm.model_executor.models.config import DeepseekV4ForCausalLMConfig
+
+    parallel = ParallelConfig(
+        tensor_parallel_size=2,
+        pipeline_parallel_size=2,
+        enable_expert_parallel=True,
+        is_moe_model=True,
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        ),
+        parallel_config=parallel,
+        attention_config=AttentionConfig(indexer_sparse_logits=False),
+        additional_config={"deepseek_v41_pp_sp": enabled},
+    )
+    DeepseekV4ForCausalLMConfig.verify_and_update_config(cast(VllmConfig, config))
+    assert parallel.use_sequence_parallel_moe == enabled
+    assert parallel.use_all2all == enabled
+    if enabled:
+        metadata = DPMetadata.make(parallel, 7, torch.tensor([7]))
+        with metadata.sp_local_sizes(2):
+            assert metadata.get_chunk_sizes_across_dp_rank() == [4, 4]
+
+
+def test_deepseek_v41_single_dp_pp_sp_rejects_unvalidated_collectives():
+    from vllm.model_executor.models.config import DeepseekV4ForCausalLMConfig
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        ),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=2,
+            pipeline_parallel_size=2,
+            enable_expert_parallel=True,
+            is_moe_model=True,
+            all2all_backend="deepep_high_throughput",
+        ),
+        attention_config=AttentionConfig(indexer_sparse_logits=False),
+        additional_config={"deepseek_v41_pp_sp": True},
+    )
+    with pytest.raises(ValueError, match="requires allgather_reducescatter"):
+        DeepseekV4ForCausalLMConfig.verify_and_update_config(cast(VllmConfig, config))
+
+
 def test_kda_recoverssm_derivation_is_revalidated():
     config = SimpleNamespace(
         cache_config=SimpleNamespace(
@@ -1375,6 +1426,20 @@ def test_adaptive_verification_requires_full_cudagraphs(graph_mode, should_raise
             VllmConfig._validate_adaptive_verification(config)
     else:
         VllmConfig._validate_adaptive_verification(config)
+
+
+def test_adaptive_verification_allows_pipeline_parallelism():
+    """Every PP stage trims the same batch, so the cost curves and confidences
+    are relayed across stages instead of rejecting pipeline parallelism."""
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enable_adaptive_verification=True),
+        lora_config=None,
+        compilation_config=CompilationConfig(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        ),
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2),
+    )
+    VllmConfig._validate_adaptive_verification(config)
 
 
 def test_batch_sharded_sampling_rejects_return_sampling_mask():
@@ -4496,3 +4561,28 @@ def test_layer_range_with_prefill_context_parallel(monkeypatch):
         for rank in range(8)
     ]
     assert ranges == [(0, 5)] * 4 + [(5, 12)] * 4
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "requested", "overlapped", "expected"),
+    [
+        (2, 0, True, 2),  # Default: one microbatch per stage.
+        (2, 3, True, 3),
+        (3, 3, True, 3),
+        (2, 3, False, 2),  # Only V2 + async staggers decodes.
+        (1, 3, True, 1),  # No PP: nothing to rotate through.
+        (1, 0, False, 1),
+    ],
+)
+def test_pp_num_microbatches(pp_size, requested, overlapped, expected):
+    assert (
+        vllm_config_module.resolve_pp_num_microbatches(
+            pp_size, requested, overlapped=overlapped
+        )
+        == expected
+    )
+
+
+def test_pp_num_microbatches_below_pp_size_is_rejected():
+    with pytest.raises(ValueError, match="below pipeline_parallel_size=3"):
+        vllm_config_module.resolve_pp_num_microbatches(3, 2, overlapped=True)

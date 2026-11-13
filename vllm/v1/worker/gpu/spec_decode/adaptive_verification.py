@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
@@ -11,7 +11,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
@@ -26,6 +26,8 @@ from vllm.v1.worker.gpu.attn_utils import (
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
+# Live buckets with fewer samples keep the startup profile value.
+_ONLINE_MIN_BUCKET_SAMPLES = 4
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -211,6 +213,40 @@ def build_cost_tables_from_curves(
     return draft_table, verify_table
 
 
+def _merge_cost_curves(
+    base: list[tuple[int, float]],
+    buckets: dict[int, deque[float]],
+    min_samples: int = _ONLINE_MIN_BUCKET_SAMPLES,
+) -> list[tuple[int, float]]:
+    """Replace startup cost-curve points with measured medians.
+
+    Keys with fewer than `min_samples` live samples keep the startup value,
+    so one noisy step cannot move a table.
+    """
+    merged = dict(base)
+    for key, values in buckets.items():
+        if len(values) >= min_samples:
+            merged[key] = float(np.median(values))
+    return sorted(merged.items())
+
+
+def _merge_rank_curves(
+    curves: Iterable[list[tuple[int, float]]],
+) -> list[tuple[int, float]]:
+    """Combine the per-rank cost curves of one step into its marginal cost.
+
+    Each PP stage times its own forward, and a step cannot finish before its
+    slowest stage does, so a shape costs the maximum across stages. Only the
+    last stage runs the drafter, so the other stages report a draft cost of 0
+    for every shape and the maximum keeps the drafter's curve.
+    """
+    merged: dict[int, float] = {}
+    for curve in curves:
+        for size, cost in curve:
+            merged[size] = max(cost, merged.get(size, cost))
+    return sorted(merged.items())
+
+
 class AdmittedDraftCounts:
     """Per-request admitted draft counts, in flight to the host."""
 
@@ -232,6 +268,8 @@ class AdaptiveVerificationManager:
         num_bonus_tokens: int,
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
+        receives_remote_confidences: bool = False,
+        confidence_relay_lag: int = 0,
     ):
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
@@ -247,7 +285,22 @@ class AdaptiveVerificationManager:
         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
         # Largest cudagraph-captured token count; above it nothing pads.
         self._cudagraph_limit = 0
+        # Live step timings refine the startup curves. The refresh cadence
+        # counts runner steps, not drained samples, so every TP rank rebuilds
+        # on the same step and set_cost_curves' broadcast stays in lockstep.
+        self._online_interval = envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL
+        window = max(envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW, 1)
+        self._online_draft: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=window)
+        )
+        self._online_verify: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=window)
+        )
+        self._online_steps = 0
+        self._base_draft_curve: list[tuple[int, float]] = []
+        self._base_verify_curve: list[tuple[int, float]] = []
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
+        self._batch_max_draft_budget = 0
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -288,6 +341,19 @@ class AdaptiveVerificationManager:
         self._stale_idx = 0
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+
+        # Only the last PP rank runs the drafter, so the other stages trim the
+        # batch with the confidences it relays. They land on the PP broadcast
+        # stream, hence the event the main stream waits on before the trim.
+        self._remote_confidences: torch.Tensor | None = None
+        self._relay_lag = max(confidence_relay_lag, 0)
+        self._relays_accepted = 0
+        self._relay_events: list[torch.cuda.Event] = []
+        if receives_remote_confidences:
+            self._remote_confidences = torch.empty_like(self._confidence_probs)
+            self._relay_events = [
+                torch.cuda.Event() for _ in range(self._relay_lag + 1)
+            ]
 
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
@@ -345,7 +411,45 @@ class AdaptiveVerificationManager:
         verify_curve = median_curve(
             (s.num_target_tokens, s.forward_ms) for s in samples
         )
+        self._base_draft_curve = draft_curve
+        self._base_verify_curve = verify_curve
         self.set_cost_curves(draft_curve, verify_curve)
+
+    @property
+    def online_interval(self) -> int:
+        """Runner steps between live cost-table refreshes; 0 disables them."""
+        return self._online_interval
+
+    @property
+    def confidences(self) -> torch.Tensor:
+        """Per (request, position) confidences, every stage's trim input."""
+        return self._confidence_probs
+
+    @property
+    def remote_confidences(self) -> torch.Tensor | None:
+        """Buffer a non-last PP stage receives the confidences into."""
+        return self._remote_confidences
+
+    def observe_timings(self, samples: list[StepTimingSample]) -> None:
+        """Fold live step timings into the startup cost curves.
+
+        Buckets with too few samples keep the startup value, so a rare batch
+        shape cannot rebuild a table from a single noisy measurement.
+        """
+        if self._online_interval <= 0 or self.cost_tables is None:
+            return
+        for sample in samples:
+            self._online_verify[sample.num_target_tokens].append(sample.forward_ms)
+            if sample.full_cudagraph:
+                self._online_draft[sample.num_reqs].append(sample.drafter_ms)
+        self._online_steps += 1
+        if self._online_steps < self._online_interval:
+            return
+        self._online_steps = 0
+        self.set_cost_curves(
+            _merge_cost_curves(self._base_draft_curve, self._online_draft),
+            _merge_cost_curves(self._base_verify_curve, self._online_verify),
+        )
 
     def set_cost_curves(
         self,
@@ -355,6 +459,20 @@ class AdaptiveVerificationManager:
         draft_curve, verify_curve = get_tp_group().broadcast_object(
             (draft_curve, verify_curve), src=0
         )
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            # Every stage trims the same batch, so every stage needs the cost
+            # of the slowest one, not just of its own share of the layers.
+            gathered: list[list[list[tuple[int, float]]]] = [
+                [] for _ in range(pp_group.world_size)
+            ]
+            torch.distributed.all_gather_object(
+                gathered,
+                [draft_curve, verify_curve],
+                group=pp_group.cpu_group,
+            )
+            draft_curve = _merge_rank_curves(curve[0] for curve in gathered)
+            verify_curve = _merge_rank_curves(curve[1] for curve in gathered)
         if not draft_curve or not verify_curve:
             raise RuntimeError(
                 "Adaptive verification could not profile step costs. Pass "
@@ -376,6 +494,19 @@ class AdaptiveVerificationManager:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
         num_reqs = input_batch.num_reqs
+        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+        write_idx = self._next_confidence_slot()
+        write_slot = self._stale_confidences[write_idx]
+        write_slot.gpu.copy_(self._confidence_probs)
+
+        current_stream = torch.cuda.current_stream(self.req_states.device)
+        self._copy_stream.wait_stream(current_stream)
+        with stream(self._copy_stream, current_stream):
+            write_slot.copy_to_cpu()
+            self._copy_events[write_idx].record()
+
+    def _next_confidence_slot(self) -> int:
+        """Retire the slot the previous budgets read, return the write slot."""
         ready_idx = self._stale_idx ^ 1
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
@@ -385,16 +516,43 @@ class AdaptiveVerificationManager:
         # Last step's copy has landed: budgets read it, this step overwrites the
         # slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
+        return write_idx
 
-        self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
+    def accept_remote_confidences(self) -> None:
+        """Publish the confidences the last PP rank relayed for this step.
+
+        Non-last stages have no drafter and no confidences of their own. Called
+        on the PP broadcast stream once the relay has landed, and mirrors
+        record_confidences so every stage reads the same stale slot.
+        """
+        assert self._remote_confidences is not None
+        self._confidence_probs.copy_(self._remote_confidences)
+        write_idx = self._next_confidence_slot()
         write_slot = self._stale_confidences[write_idx]
         write_slot.gpu.copy_(self._confidence_probs)
+        write_slot.copy_to_cpu()
+        self._copy_events[write_idx].record()
+        self._relay_events[self._relays_accepted % len(self._relay_events)].record()
+        self._relays_accepted += 1
 
-        current_stream = torch.cuda.current_stream(self.req_states.device)
-        self._copy_stream.wait_stream(current_stream)
-        with stream(self._copy_stream, current_stream):
-            write_slot.copy_to_cpu()
-            self._copy_events[write_idx].record()
+    def wait_for_remote_confidences(self) -> None:
+        """Order the main stream after a relay of the confidences.
+
+        The whole stage trims and ranks the batch on the main stream, and the
+        relayed buffer it reads was written on the PP broadcast stream. A
+        request's confidences are only rewritten when it is in a batch, and the
+        decode stagger keeps a request out of the next `lag + 1` batches, so the
+        trim of this step only needs the relay `lag` steps before the newest.
+        Waiting for the newest one would hold this stage's forward until the
+        last stage finished the previous step, drafter included, and stop the
+        stages from overlapping.
+        """
+        if self._relays_accepted <= self._relay_lag:
+            return
+        # Relay j is recorded in slot j % (lag + 1); the one wanted is the slot
+        # the next relay will reuse.
+        event = self._relay_events[self._relays_accepted % len(self._relay_events)]
+        torch.cuda.current_stream(self.req_states.device).wait_event(event)
 
     def get_num_tokens(
         self,
@@ -466,7 +624,34 @@ class AdaptiveVerificationManager:
             num_non_draft_tokens_per_req,
             draft_budget,
         )
+        self._batch_max_draft_budget = max_draft_budget
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+
+    def fill_graph_padding(self, num_padded_tokens: int) -> int | None:
+        """Admit the next-best drafts into rows the graph runs anyway.
+
+        The budget is chosen for this rank's token count, but under DP every
+        rank replays the graph of the largest rank, so the rows up to
+        ``num_padded_tokens`` cost nothing extra. Returns the new token count,
+        or None when the budget is unchanged.
+        """
+        batch_budget = self._batch_budget
+        if batch_budget is None:
+            return None
+        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        num_tokens = sum(num_non_draft_tokens_per_req.values()) + draft_budget
+        extra = min(
+            num_padded_tokens - num_tokens,
+            self._batch_max_draft_budget - draft_budget,
+        )
+        if extra <= 0:
+            return None
+        self._batch_budget = (
+            num_drafts_per_req,
+            num_non_draft_tokens_per_req,
+            draft_budget + extra,
+        )
+        return num_tokens + extra
 
     def compact_batch(
         self,
@@ -598,6 +783,8 @@ def maybe_create_adaptive_verification_manager(
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
     copy_admitted_drafts_to_host: bool = False,
+    receives_remote_confidences: bool = False,
+    confidence_relay_lag: int = 0,
 ) -> AdaptiveVerificationManager | None:
     if not enable_adaptive_verification:
         return None
@@ -647,4 +834,6 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
+        receives_remote_confidences=receives_remote_confidences,
+        confidence_relay_lag=confidence_relay_lag,
     )

@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -15,6 +16,12 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.pp_step_profiler import pp_step_span
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+        AdaptiveVerificationManager,
+    )
 
 logger = init_logger(__name__)
 
@@ -97,10 +104,27 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     return need_sampled_mask if need_sampled_mask.any() else None
 
 
+def invalid_sampled_rows(
+    idx_mapping_np: np.ndarray,
+    gen_at_receive_np: np.ndarray,
+    req_idx_gen_np: np.ndarray,
+    need_sampled_mask: np.ndarray,
+) -> np.ndarray:
+    """Rows whose sampled output must not be applied to a request.
+
+    A request index freed since the broadcast may already be serving another
+    request, whose tokens must not enter this row's history; the generation
+    counter tells them apart. Rows that needed no sample are skipped too, and
+    the post-update kernel ignores their -1 entries.
+    """
+    freed = req_idx_gen_np[idx_mapping_np] != gen_at_receive_np
+    return freed | ~need_sampled_mask
+
+
 class PPHandler:
     """Runs the PP sampled-token broadcast/recv on a side stream so the
     default stream isn't gated by the matching peer call. Step T's recv is
-    consumed at step T+pp_size via `get_prev_sampled_outputs`.
+    consumed at step T+ring_depth via `get_prev_sampled_outputs`.
 
     Uses a dedicated NCCL communicator (sibling of the PP `device_group`)
     for the broadcast so it does not serialize on the wire with the
@@ -108,8 +132,17 @@ class PPHandler:
     """
 
     def __init__(
-        self, max_num_reqs: int, num_speculative_steps: int, device: torch.device
+        self,
+        max_num_reqs: int,
+        num_speculative_steps: int,
+        device: torch.device,
+        ring_depth: int | None = None,
     ):
+        """Args:
+        ring_depth: Steps between a step's sampled-token receive and its
+            consumption, which must equal the scheduler's decode stagger.
+            Defaults to the PP world size.
+        """
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
@@ -123,7 +156,8 @@ class PPHandler:
         # with pp_size None placeholders so the first pp_size consumes are no-ops.
         # None means no postprocess is pending for that step (broadcast skipped).
         # Only XPU can disable microbatching via VLLM_XPU_PP_MICROBATCH.
-        ring_depth = get_pp_group().world_size
+        if ring_depth is None:
+            ring_depth = get_pp_group().world_size
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             ring_depth = 1
         self.queue: deque[PendingRecv | None] = (
@@ -233,10 +267,12 @@ class PPHandler:
         if slot is None:
             return None
 
-        # Skip requests which did not need sampled output and/or those already
-        # finished. The post_update kernel skips the -1 entries.
-        freed = self.req_idx_gen_np[slot.idx_mapping_np] != slot.gen_at_receive_np
-        exclude_mask = freed | ~slot.need_sampled_mask
+        exclude_mask = invalid_sampled_rows(
+            slot.idx_mapping_np,
+            slot.gen_at_receive_np,
+            self.req_idx_gen_np,
+            slot.need_sampled_mask,
+        )
         idx_mapping = slot.idx_mapping
         if exclude_mask.any():
             if exclude_mask.all():
@@ -246,7 +282,9 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_tensor_h2d(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
+        with pp_step_span("token_wait"):
+            self.main_stream.wait_event(slot.event)
+
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
@@ -266,7 +304,41 @@ class PPHandler:
                 )
                 draft_tokens.record_stream(self.broadcast_stream)
 
-    def receive(self, input_batch: InputBatch, recv_drafts: bool) -> bool:
+    def broadcast_confidences(self, confidences: torch.Tensor) -> None:
+        """Relay the adaptive verification confidences to the other stages.
+
+        Every stage trims the same batch with the drafter's per-slot
+        confidences, which only the last rank computes.
+        """
+        assert self.is_last_rank
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                confidences, src=self.last_rank, group=self.broadcast_group
+            )
+            confidences.record_stream(self.broadcast_stream)
+
+    def _relay_confidences(
+        self, adaptive_verification: "AdaptiveVerificationManager"
+    ) -> None:
+        confidences = adaptive_verification.remote_confidences
+        assert confidences is not None
+        with torch.cuda.stream(self.broadcast_stream):
+            # `accept_remote_confidences` overwrites the buffer the main stream
+            # read the previous step, so the relay must not overtake that read.
+            self.broadcast_stream.wait_stream(self.main_stream)
+            torch.distributed.broadcast(
+                confidences, src=self.last_rank, group=self.broadcast_group
+            )
+            confidences.record_stream(self.main_stream)
+            adaptive_verification.accept_remote_confidences()
+
+    def receive(
+        self,
+        input_batch: InputBatch,
+        recv_drafts: bool,
+        adaptive_verification: "AdaptiveVerificationManager | None" = None,
+    ) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*
         requests in the batch. `recv_drafts` must match whether the last rank
         calls `broadcast_drafts` for this step."""
@@ -274,6 +346,9 @@ class PPHandler:
         need_sampled_mask = compute_need_sampled_mask(input_batch)
         if need_sampled_mask is None:
             # Leave this step's reserved slot as None.
+            if adaptive_verification is not None:
+                # The batch is still trimmed on this stage, which needs them.
+                self._relay_confidences(adaptive_verification)
             return False
 
         # Snapshot the per-slot generation counter so a later free of any of
@@ -310,6 +385,8 @@ class PPHandler:
             combined.record_stream(self.main_stream)
             if draft_tokens is not None:
                 draft_tokens.record_stream(self.main_stream)
+        if adaptive_verification is not None:
+            self._relay_confidences(adaptive_verification)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,

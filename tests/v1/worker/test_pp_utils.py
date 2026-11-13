@@ -217,3 +217,55 @@ def test_warns_about_a_tensor_without_a_buffer(caplog_vllm):
 
     warnings = [r.getMessage() for r in caplog_vllm.records if r.levelname == "WARNING"]
     assert len(warnings) == 1 and "'ds_3'" in warnings[0]
+
+
+def test_keeps_rows_whose_request_index_is_unchanged():
+    """The common case: each row still belongs to the request that was
+    broadcast its sampled tokens."""
+    exclude = pp_utils.invalid_sampled_rows(
+        idx_mapping_np=np.array([3, 0, 7], dtype=np.int32),
+        gen_at_receive_np=np.array([2, 0, 5], dtype=np.int32),
+        req_idx_gen_np=np.array([0, 0, 2, 2, 0, 0, 0, 5], dtype=np.int32),
+        need_sampled_mask=np.ones(3, dtype=bool),
+    )
+
+    assert not exclude.any()
+
+
+def test_excludes_a_request_index_reused_by_another_request():
+    """A slot freed between broadcast and consume may already serve a new
+    request by the time the ring hands its tokens back. The generation
+    counter no longer matches, so the stale tokens are dropped instead of
+    being appended to the new request's history."""
+    exclude = pp_utils.invalid_sampled_rows(
+        idx_mapping_np=np.array([4, 6], dtype=np.int32),
+        gen_at_receive_np=np.array([0, 1], dtype=np.int32),
+        # Index 4 was freed (and then reused) after the broadcast.
+        req_idx_gen_np=np.array([0, 0, 0, 0, 1, 0, 1, 0], dtype=np.int32),
+        need_sampled_mask=np.ones(2, dtype=bool),
+    )
+
+    assert exclude.tolist() == [True, False]
+
+
+def test_excludes_rows_that_needed_no_sample():
+    exclude = pp_utils.invalid_sampled_rows(
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        gen_at_receive_np=np.zeros(2, dtype=np.int32),
+        req_idx_gen_np=np.zeros(2, dtype=np.int32),
+        need_sampled_mask=np.array([False, True]),
+    )
+
+    assert exclude.tolist() == [True, False]
+
+
+def test_excludes_every_row_when_all_requests_are_gone():
+    """The whole slot is dropped rather than applied to reused indices."""
+    exclude = pp_utils.invalid_sampled_rows(
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        gen_at_receive_np=np.zeros(2, dtype=np.int32),
+        req_idx_gen_np=np.array([1, 1], dtype=np.int32),
+        need_sampled_mask=np.ones(2, dtype=bool),
+    )
+
+    assert exclude.all()

@@ -126,6 +126,7 @@ def test_load_model_preserves_compiled_graphs_at_runtime(monkeypatch):
         _maybe_get_memory_pool_context=lambda **kwargs: nullcontext(),
         _scoped_allocator_max_split=lambda **kwargs: nullcontext(),
         _external_weight_charges=ExternalWeightCharges(),
+        _pp_transport=None,
     )
     original_threads = torch.get_num_threads()
     try:
@@ -608,6 +609,7 @@ def test_execute_model_waits_previous_pp_send_before_forward(
         annotate_profile=lambda scheduler_output: nullcontext(),
         _pp_send_work=[previous_tensor_send],
         _pp_transport=None,
+        _pp_send_ring=None,
     )
     scheduler_output = SimpleNamespace(
         total_num_scheduled_tokens=4, num_scheduled_tokens={"r0": 4}
@@ -673,6 +675,80 @@ def test_every_pp_rank_runs_a_forward_before_the_sync_check(
 
     sampler = ["sampler"] if is_last_rank else []
     assert log == ["forward", *sampler, "sync_check"]
+
+
+def test_execute_model_with_send_ring_skips_the_top_of_step_wait(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With VLLM_PP_SEND_BUFFERS the forward does not wait for the previous
+    send: the payload goes out of a ring slot, and only reusing that slot
+    waits for the send that last used it."""
+    import torch
+
+    from vllm.sequence import IntermediateTensors
+    from vllm.v1.worker.gpu.pp_send_ring import PPSendRing
+
+    log: list[str] = []
+    sent: list[dict] = []
+    values_at_send: list[float] = []
+
+    def isend_tensor_dict(tensors, all_gather_group=None, all_gather_tensors=None):
+        step = len(sent)
+        sent.append(tensors)
+        values_at_send.append(float(tensors["hidden_states"][0, 0]))
+        log.append(f"isend:{step}")
+        return [_OrderedHandle(log, f"meta{step}"), _OrderedHandle(log, f"t{step}")]
+
+    pp_group = SimpleNamespace(
+        is_first_rank=True, is_last_rank=False, isend_tensor_dict=isend_tensor_dict
+    )
+    monkeypatch.setattr(gpu_worker, "get_pp_group", lambda: pp_group)
+    monkeypatch.setattr(gpu_worker, "get_tp_group", lambda: SimpleNamespace())
+
+    # A static output buffer, as a FULL CUDA graph replay returns.
+    static_out = torch.zeros(4, 2)
+
+    def run_model(scheduler_output, intermediate_tensors):
+        log.append("forward")
+        static_out.add_(1)
+        return IntermediateTensors({"hidden_states": static_out[:3]})
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                pipeline_parallel_size=2, distributed_executor_backend="mp"
+            ),
+        ),
+        model_runner=SimpleNamespace(execute_model=run_model, is_pooling_model=False),
+        annotate_profile=lambda scheduler_output: nullcontext(),
+        _pp_send_work=[],
+        _pp_transport=None,
+        _pp_send_ring=PPSendRing(2, lambda: {"hidden_states": torch.empty(4, 2)}),
+    )
+    scheduler_output = SimpleNamespace(
+        total_num_scheduled_tokens=3, num_scheduled_tokens={"r0": 3}
+    )
+
+    for _ in range(3):
+        gpu_worker.Worker.execute_model(worker, scheduler_output)
+
+    # Step 2 reuses step 0's slot, so it waits for step 0's tensor send only;
+    # no step waits before its forward.
+    assert log == [
+        "forward",
+        "isend:0",
+        "forward",
+        "isend:1",
+        "forward",
+        "wait:t0",
+        "isend:2",
+    ]
+    assert values_at_send == [1.0, 2.0, 3.0]
+    # Sends read ring slots, never the model's reused output buffer.
+    ptrs = [s["hidden_states"].data_ptr() for s in sent]
+    assert static_out.data_ptr() not in ptrs
+    assert ptrs[0] == ptrs[2] != ptrs[1]
+    assert worker._pp_send_work == []
 
 
 def test_jit_monitor_activation_follows_enable_jit_warmup(

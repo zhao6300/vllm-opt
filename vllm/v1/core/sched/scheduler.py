@@ -256,6 +256,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Finished requests whose blocks are held by the connector until an
+        # async send completes. They must survive an earlier recv completion.
+        self.pending_kv_send_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -682,6 +685,10 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _prefill_token_cap(self) -> int | None:
+        """Most prefill tokens this step may carry, or None for no extra cap."""
+        return None
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -758,6 +765,8 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Prefill tokens this step may still take (None: no extra cap).
+        prefill_left = self._prefill_token_cap()
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -794,6 +803,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
+                prefill_left is not None
+                and request.is_prefill_chunk
+                and not prefill_left
+            ):
+                req_index += 1
+                continue
+
+            if (
                 self.ec_connector is not None
                 and request.mm_features
                 and not self.ec_connector.ensure_cache_available(
@@ -811,6 +828,8 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if prefill_left is not None and request.is_prefill_chunk:
+                num_new_tokens = min(num_new_tokens, prefill_left)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -919,6 +938,11 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if (
+                                prefill_left is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_left += restored
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -973,6 +997,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if prefill_left is not None and request.is_prefill_chunk:
+                prefill_left -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1302,6 +1328,7 @@ class Scheduler(SchedulerInterface):
                     take_async_kv = False
                     continue
 
+                prefill_work = num_computed_tokens < request.num_tokens - 1
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -1309,6 +1336,9 @@ class Scheduler(SchedulerInterface):
                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    break
+                elif prefill_left is not None and prefill_work and not prefill_left:
+                    # This step's prefill token cap is used up.
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1350,6 +1380,12 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if (
+                        prefill_left is not None
+                        and prefill_work
+                        and not pad_spec_decode
+                    ):
+                        num_new_tokens = min(num_new_tokens, prefill_left)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1597,6 +1633,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if prefill_left is not None and prefill_work:
+                    prefill_left -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -3143,6 +3181,8 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if connector_delay_free_blocks:
+            self.pending_kv_send_req_ids.add(request_id)
         if not delay_free_blocks:
             self._free_blocks(request)
 
@@ -3150,6 +3190,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self.pending_kv_send_req_ids.discard(request.request_id)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -3665,19 +3706,30 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was already freed, e.g. by a duplicate report or
+                # because its send completed first.
+                logger.debug("Ignoring finished recv for unknown request %s", req_id)
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._aborted_kv_loads.discard(req_id)
-                self._free_blocks(self.requests[req_id])
+                # Keep the blocks until the connector reports the pending send;
+                # freeing here would race the sender and leave its completion
+                # pointing at a removed request.
+                if req_id not in self.pending_kv_send_req_ids:
+                    self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.debug("Ignoring finished send for unknown request %s", req_id)
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

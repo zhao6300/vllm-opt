@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections import deque
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -14,10 +15,13 @@ import torch.multiprocessing as mp
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
-from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu import async_utils
+from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    _merge_cost_curves,
+    _merge_rank_curves,
     assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
@@ -455,3 +459,215 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
     survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
     assign_draft_token_budget(confidence_probs, idx_mapping, capacities, 800, survival)
     assert capacities.tolist() == [3] * 266 + [2] + [0] * 33
+
+
+def test_merge_rank_curves_keeps_the_slowest_stage_per_shape():
+    # Pipeline stages time their own layers, and a step cannot finish before
+    # its slowest stage: shape 8 costs 30 (stage 1), shape 16 costs 20 (stage
+    # 0). The stages without the drafter report 0 and must not erase its curve,
+    # and a shape only one stage profiled still has to appear.
+    assert _merge_rank_curves(
+        [
+            [(8, 10.0), (16, 20.0)],
+            [(8, 30.0), (16, 5.0), (32, 7.0)],
+        ]
+    ) == [(8, 30.0), (16, 20.0), (32, 7.0)]
+    assert _merge_rank_curves([[(8, 0.0)], [(8, 4.0)]]) == [(8, 4.0)]
+    assert _merge_rank_curves([[(8, 0.0)], []]) == [(8, 0.0)]
+    assert _merge_rank_curves([]) == []
+
+
+def test_merge_cost_curves_keeps_sparse_buckets_on_the_startup_point():
+    base = [(1, 10.0), (4, 40.0)]
+    buckets = {
+        4: deque([2.0, 6.0, 10.0, 14.0]),
+        8: deque([1.0, 2.0, 3.0]),
+    }
+    assert _merge_cost_curves(base, buckets) == [(1, 10.0), (4, 8.0)]
+
+
+class _FakeCudaEvent:
+    """CPU stand-in for a timing event: orders records on one stream."""
+
+    tick = 0.0
+    available = False
+
+    def record(self) -> None:
+        self.timestamp = _FakeCudaEvent.tick
+        _FakeCudaEvent.tick += 1.0
+
+    def query(self) -> bool:
+        return _FakeCudaEvent.available
+
+    def elapsed_time(self, end: "_FakeCudaEvent") -> float:
+        return end.timestamp - self.timestamp
+
+
+def test_step_timing_sampling_is_interval_gated_and_non_blocking(monkeypatch):
+    monkeypatch.setattr(async_utils, "_timing_event", _FakeCudaEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = False
+    collector = StepTimingCollector()
+    collector.enable_sampling(2)
+
+    def run_step() -> None:
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step()
+    run_step()
+    run_step()
+
+    # One sample per two steps, and none is resolved before its events finish.
+    assert collector.poll_sampled() == []
+    _FakeCudaEvent.available = True
+    samples = collector.poll_sampled()
+    assert [
+        (s.forward_ms, s.drafter_ms, s.num_target_tokens, s.num_reqs, s.full_cudagraph)
+        for s in samples
+    ] == [(1.0, 1.0, 0, 0, False), (1.0, 1.0, 0, 0, False)]
+    assert collector.poll_sampled() == []
+
+
+class _RelayEvent:
+    def __init__(self, log: list, name: int) -> None:
+        self.log, self.name = log, name
+
+    def record(self) -> None:
+        self.log.append(("record", self.name))
+
+
+class _RelayStream:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def wait_event(self, event: _RelayEvent) -> None:
+        self.log.append(("wait", event.name))
+
+
+def _relay_manager(monkeypatch, lag: int):
+    """A manager with the relay bookkeeping on CPU stand-ins."""
+    log: list = []
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(device="cpu")
+    manager._relay_lag = lag
+    manager._relays_accepted = 0
+    manager._relay_events = [_RelayEvent(log, i) for i in range(lag + 1)]
+    manager._remote_confidences = torch.ones(2, 3)
+    manager._confidence_probs = torch.zeros(2, 3)
+    slot = SimpleNamespace(gpu=torch.zeros(2, 3), copy_to_cpu=lambda: None)
+    manager._stale_confidences = [slot, slot]
+    manager._copy_events = [SimpleNamespace(record=lambda: None)] * 2
+    manager._next_confidence_slot = lambda: 0  # type: ignore[method-assign]
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: _RelayStream(log))
+    return manager, manager.accept_remote_confidences, log
+
+
+@pytest.mark.parametrize("lag", [0, 1, 2])
+def test_trim_waits_for_the_relay_lag_steps_before_the_newest(monkeypatch, lag):
+    manager, accept, log = _relay_manager(monkeypatch, lag)
+    latest_relay_in_slot: dict[int, int] = {}
+    for step in range(8):
+        # execute_model(step) waits, then sample_tokens(step) accepts a relay.
+        log.clear()
+        manager.wait_for_remote_confidences()
+        waits = [name for kind, name in log if kind == "wait"]
+        wanted = step - 1 - lag  # relay `lag` steps before the newest one
+        if wanted < 0:
+            assert waits == []
+        else:
+            # The waited event must still hold that relay, not a later one.
+            assert [latest_relay_in_slot[w] for w in waits] == [wanted]
+        log.clear()
+        accept()
+        (slot,) = [name for kind, name in log if kind == "record"]
+        latest_relay_in_slot[slot] = step
+
+
+def test_step_timing_sampling_skips_dummy_steps(monkeypatch):
+    # Dummy steps are padded to other ranks' sizes; sampling one would price a
+    # shape with another shape's cost.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    collector.enable_sampling(1)
+
+    def run_step(sample: bool) -> None:
+        collector.forward_start(sample=sample)
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step(sample=False)
+    assert collector.poll_sampled() == []
+    run_step(sample=True)
+    assert len(collector.poll_sampled()) == 1
+
+    # Profiling (collect) still times dummy steps.
+    with collector.collect() as timings:
+        run_step(sample=False)
+    assert len(timings) == 1
+
+
+def test_fill_graph_padding_admits_drafts_into_padded_rows():
+    # Verification past 3 tokens is 100x dearer, so the budget stops at one
+    # draft; a graph padded to 5 tokens (another DP rank's size) runs two more
+    # rows anyway, and they take the next-best drafts.
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+    )
+    num_tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    assert num_tokens == 3
+
+    assert manager.fill_graph_padding(5) == 5
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 3
+    # Never beyond the scheduled drafts, and no change without spare rows.
+    assert manager.fill_graph_padding(64) == 6
+    assert manager.fill_graph_padding(6) is None
+
+
+def test_fill_graph_padding_respects_the_rejection_sampler_chunk():
+    manager = make_manager(
+        np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32),
+        np.ones(7),
+    )
+    manager._max_total_logits = 3  # 2 bonus logits + at most 1 draft
+    num_tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    assert num_tokens == 3
+    assert manager.fill_graph_padding(6) is None
+
+
+def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):
+    # Under DP a rank replays the largest rank's graph; keying by its own
+    # token count would price that graph on a smaller shape.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(num_tokens=10, num_tokens_after_padding=64, num_reqs=5)
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+    assert [(s.num_target_tokens, s.num_reqs) for s in timings] == [(64, 5)]

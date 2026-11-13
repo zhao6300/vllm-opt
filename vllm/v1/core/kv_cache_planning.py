@@ -1202,8 +1202,11 @@ def _max_memory_usage_bytes_from_groups(
     bytes_per_block = _pool_bytes_per_block_from_builder(
         builder, vllm_config, kv_cache_groups
     )
+    # A PP stage holding none of a group's layers allocates nothing for it.
     total_blocks = sum(
-        group.max_allocated_blocks_per_request(vllm_config) for group in kv_cache_groups
+        group.max_allocated_blocks_per_request(vllm_config)
+        for group in kv_cache_groups
+        if group.layer_names
     )
 
     return bytes_per_block * total_blocks
