@@ -1852,11 +1852,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if self.adaptive_verification is not None and not dummy_run:
-            # Only served steps count toward the online refresh: the refresh is
-            # a PP collective, and dummy runs differ across stages (the last
-            # stage alone runs the sampler warmup after capture).
-            self.adaptive_verification.observe_timings(self.step_timing.poll_sampled())
         if self.adaptive_verification is not None:
             # Non-last PP stages rank this step's drafts with the confidences
             # the last rank relayed at the end of the previous one.
@@ -2271,6 +2266,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         cudagraph_stats = self.execute_model_state.cudagraph_stats
         num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
+
+        if self.adaptive_verification is not None:
+            # The online refresh is a blocking PP all_gather. Every stage calls
+            # sample_tokens once per served step and dummy runs never do, so
+            # the stages count alike. It must not sit in execute_model: there a
+            # later stage blocks receiving the step's PP metadata, which the
+            # first stage only sends after its own forward.
+            self.adaptive_verification.observe_timings(self.step_timing.poll_sampled())
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: hidden_states is None because this rank produced
