@@ -369,3 +369,31 @@ def test_kv_load_zeroing_respects_loaded_groups(is_async, loads_window):
             assert not new_ids & zeroed
         else:
             assert new_ids <= zeroed
+
+
+def test_replay_window_is_visible_on_the_spec():
+    """KV connectors classify groups from the specs alone, so the replay window
+    has to be on the spec, not only in the allocating manager's params."""
+    scheduler = _replay_scheduler()
+    swa = scheduler.kv_cache_config.kv_cache_groups[SWA]
+    assert swa.prefix_replay_tokens == WINDOW
+    assert next(iter(swa.kv_cache_specs.values())).prefix_replay_tokens == WINDOW
+
+    # Without bounded replay there is nothing to replay, and the spec says so.
+    plain = SlidingWindowManager.layer_config(
+        MLAAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=torch.bfloat16,
+        ),
+        sliding_window=WINDOW,
+    )
+    assert plain.spec.prefix_replay_tokens == 0
+
+    # A spec carries the window through the per-kernel-block re-viewing that
+    # allocation and cache planning perform on it.
+    reblocked = next(iter(swa.kv_cache_specs.values())).copy_with_new_block_size(
+        BLOCK_SIZE // 2
+    )
+    assert reblocked.prefix_replay_tokens == WINDOW

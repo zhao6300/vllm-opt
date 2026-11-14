@@ -4,7 +4,7 @@ import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from vllm.distributed.kv_events import MEDIUM_CPU
@@ -1052,6 +1052,19 @@ class RSWAManager(FullAttentionManager):
 
 
 class SlidingWindowManager(SingleTypeKVCacheManager):
+    @classmethod
+    def layer_config(cls, spec: KVCacheSpec, **params: Any) -> KVCacheLayerConfig:
+        """Mirror the bounded-replay window onto the spec.
+
+        KV connectors see groups only through their specs, so the replay window
+        has to be on the spec, not just in this manager's params.
+        """
+        config = cls.config(**params)
+        replay = cls.prefix_replay_tokens(config)
+        if replay and spec.prefix_replay_tokens != replay:
+            spec = replace(spec, prefix_replay_tokens=replay)
+        return KVCacheLayerConfig(config, spec)
+
     @dataclass(frozen=True)
     class Params(SingleTypeKVCacheManager.Params):
         sliding_window: int
