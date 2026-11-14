@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     get_flashinfer_dsv4_workspace,
     packed_block_span,
@@ -54,6 +55,8 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+logger = init_logger(__name__)
 
 # FlashInfer resolves its decode plan -- the only plan that carves scratch out
 # of the caller-owned workspace -- for at most this many rows; wider batches
@@ -857,6 +860,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             get_cake_sparse_mla_sm120_dsv41_mixed_module()
+            logger.info_once(
+                "Sparse MLA decode runs on FlashInfer's cake kernels "
+                "(VLLM_FLASHINFER_DSV41_SM120_CAKE): the V4.1 KV caches hold "
+                "page-footer scale records, so caches written by the default "
+                "inline records cannot be reused."
+            )
         # The workspace is per device and shared by every layer, so size it here
         # (outside CUDA graph capture) for the widest plan this layer can ask for.
         # Cake carves its split-K scratch from the same buffer.
