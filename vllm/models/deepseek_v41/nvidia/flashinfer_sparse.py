@@ -64,7 +64,7 @@ _FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64
 # fixed for the DeepSeek V4 family.
 _FLASHINFER_DSV4_VALUE_DIM = 512
 _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH = 64
-_sparse_mla_sm120_wrappers: dict[tuple[torch.device, bool], object] = {}
+_sparse_mla_sm120_wrappers: dict[tuple[torch.device, bool, str], object] = {}
 
 
 def _sparse_mla_sm120_paged_attention(
@@ -81,18 +81,19 @@ def _sparse_mla_sm120_paged_attention(
     extra_sparse_topk_lens: torch.Tensor | None,
     extra_kv_fp4: bool,
     prefill_impl: str | None,
+    kv_scale_format: str,
 ) -> None:
     """Run FlashInfer's SM120 sparse MLA wrapper in-place."""
     from flashinfer.mla._sparse_mla_sm120 import SparseMLASm120Wrapper
 
     has_extra_kv_cache = extra_kv_cache is not None
     extra_kv_flag = extra_kv_fp4 and has_extra_kv_cache
-    device_key = (query.device, extra_kv_flag)
+    device_key = (query.device, extra_kv_flag, kv_scale_format)
     wrapper = _sparse_mla_sm120_wrappers.get(device_key)
     if wrapper is None:
         wrapper = SparseMLASm120Wrapper(
             d_v=query.shape[-1],
-            kv_scale_format="ue8m0_g32_inline",
+            kv_scale_format=kv_scale_format,
             kv_cache_format="fp8",
             extra_kv_fp4=extra_kv_flag,
             compute_precision="fp8",
@@ -111,6 +112,42 @@ def _sparse_mla_sm120_paged_attention(
         extra_indices=extra_sparse_indices,
         extra_topk_length=extra_sparse_topk_lens,
         prefill_impl=prefill_impl,
+    )
+
+
+def _cake_dsv41_sm120_paged_attention(
+    query: torch.Tensor,
+    swa_kv_cache: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    output: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: torch.Tensor,
+    attn_sink: torch.Tensor | None,
+    extra_kv_cache: torch.Tensor | None,
+    extra_sparse_indices: torch.Tensor | None,
+    extra_sparse_topk_lens: torch.Tensor | None,
+    workspace: torch.Tensor,
+) -> None:
+    """Run FlashInfer's SM120 DSv4.1 `cake` mixed-cache decode in-place.
+
+    The split-K scratch is carved from the caller-owned workspace, so a captured
+    graph never re-allocates it.
+    """
+    from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import functional_run
+
+    functional_run(
+        query,
+        swa_kv_cache,
+        sparse_indices,
+        output,
+        workspace,
+        sm_scale,
+        lengths=topk_length,
+        sink=attn_sink,
+        extra=extra_kv_cache,
+        extra_indices=extra_sparse_indices,
+        extra_lengths=extra_sparse_topk_lens,
     )
 
 
@@ -147,7 +184,7 @@ def _flashinfer_dsv4_workspace_bytes(
     The plan sizes its partial and LSE scratch from the widest dense index row it
     resolves -- the SWA window plus the compressed top-k width -- times the
     number of rows, heads and candidate chunks. Every V4.1 layer that owns a
-    compressed cache gathers its top-k over the shared ``index_topk``-wide
+    compressed cache gathers its top-k over the shared `index_topk`-wide
     buffer, so a long-context model needs more than the 128 MiB floor even for a
     small decode batch.
     """
@@ -164,6 +201,35 @@ def _flashinfer_dsv4_workspace_bytes(
     scratch = slots * (_FLASHINFER_DSV4_VALUE_DIM * 2 + 4)
     metadata = _FLASHINFER_DSV4_DECODE_MAX_TOKENS * padded_heads * 4
     return scratch + metadata
+
+
+def _cake_dsv41_workspace_bytes(
+    vllm_config: VllmConfig,
+    *,
+    padded_heads: int,
+    window_size: int,
+    compress_ratio: int,
+) -> int:
+    """Split-K scratch FlashInfer's `cake` DSv4.1 decode needs for this layer.
+
+    Same shape of requirement as the sparse decode plan -- rows x candidate
+    chunks -- but with its own chunk width and merge buffers.
+    """
+    from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
+        cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes,
+    )
+
+    extra_topk = (
+        int(getattr(vllm_config.model_config.hf_config, "index_topk", 0))
+        if compress_ratio > 0
+        else 0
+    )
+    return cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes(
+        _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+        padded_heads,
+        required_sm120_sparse_topk(vllm_config, window_size),
+        extra_topk,
+    )
 
 
 class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
@@ -716,6 +782,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     def packed_kv_cache_dtype(cls) -> CacheDType:
         return "nvfp4_ds_mla"
 
+    @classmethod
+    def uses_footer_scale_layout(cls) -> bool:
+        """`cake` reads page-footer scale records; the sparse kernels do not."""
+        return envs.VLLM_FLASHINFER_DSV41_SM120_CAKE
+
     @staticmethod
     def _get_workspace(device: torch.device) -> torch.Tensor:
         return get_flashinfer_dsv4_workspace(device)
@@ -765,17 +836,52 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 "Install a FlashInfer build containing the DSV4.1 SM120 "
                 "dispatch specialization."
             )
+        self.kv_scale_format = (
+            "ue8m0_g32" if self.kv_footer_scale else "ue8m0_g32_inline"
+        )
+        if self.kv_footer_scale:
+            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_cake
+
+            if not has_flashinfer_sparse_mla_sm120_cake(self.padded_heads):
+                raise RuntimeError(
+                    "VLLM_FLASHINFER_DSV41_SM120_CAKE requires a FlashInfer "
+                    "build with the SM120 DeepSeek-V4.1 `cake` mixed-cache "
+                    f"decode kernel for {self.padded_heads} query heads, and "
+                    "it rewrites the KV cache into the layout that kernel "
+                    "reads. Unset it to keep the default inline-scale records."
+                )
+            # Load the kernel family now: it must not land inside a captured
+            # step.
+            from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
+                get_cake_sparse_mla_sm120_dsv41_mixed_module,
+            )
+
+            get_cake_sparse_mla_sm120_dsv41_mixed_module()
         # The workspace is per device and shared by every layer, so size it here
         # (outside CUDA graph capture) for the widest plan this layer can ask for.
-        get_flashinfer_dsv4_workspace(
-            torch.device("cuda", torch.accelerator.current_device_index()),
-            _flashinfer_dsv4_workspace_bytes(
-                vllm_config,
-                padded_heads=self.padded_heads,
-                window_size=self.window_size,
-                compress_ratio=self.compress_ratio,
-            ),
+        # Cake carves its split-K scratch from the same buffer.
+        workspace_bytes = _flashinfer_dsv4_workspace_bytes(
+            vllm_config,
+            padded_heads=self.padded_heads,
+            window_size=self.window_size,
+            compress_ratio=self.compress_ratio,
         )
+        if self.kv_footer_scale:
+            workspace_bytes = max(
+                workspace_bytes,
+                _cake_dsv41_workspace_bytes(
+                    vllm_config,
+                    padded_heads=self.padded_heads,
+                    window_size=self.window_size,
+                    compress_ratio=self.compress_ratio,
+                ),
+            )
+        workspace = get_flashinfer_dsv4_workspace(
+            torch.device("cuda", torch.accelerator.current_device_index()),
+            workspace_bytes,
+        )
+        if self.kv_footer_scale:
+            self._cake_workspace_tensor = workspace
         self.use_fp4_extra_kv = self.kv_cache_dtype == "nvfp4_ds_mla" and (
             current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability_family(121)
@@ -812,6 +918,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self._get_workspace(
             torch.device("cuda", torch.accelerator.current_device_index())
         )
+
+    def _cake_workspace(self) -> torch.Tensor:
+        # Resolved at init: growing the shared workspace inside a captured step
+        # would move a buffer an earlier graph already points at.
+        return self._cake_workspace_tensor
 
     def _forward_sparse_impl(
         self,
@@ -927,12 +1038,13 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     ) -> torch.Tensor | None:
         """Rewrite paged slot ids as flat cache rows for an inline-scale cache.
 
-        FlashInfer's DSv4.1 kernels address a record as ``row * row_pitch``, so
+        FlashInfer's DSv4.1 kernels address a record as `row * row_pitch`, so
         a page padded to whole rows (the interleaved V4.1 layout) or sharing its
         block with another layer needs storage-offset indices. Compact pages map
-        ids to themselves and keep the metadata's buffer.
+        ids to themselves and keep the metadata's buffer. Footer-scale pages are
+        addressed by paged slot id, so they keep the metadata's buffer too.
         """
-        if indices is None or cache is None:
+        if indices is None or cache is None or self.kv_footer_scale:
             return indices
         page_rows = _paged_cache_page_rows(cache)
         page_span = _packed_block_span(cache)
@@ -1008,6 +1120,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         extra_sparse_indices = self._storage_offset_indices(
             extra_sparse_indices, extra_cache, compressed_block_size, "extra"
         )
+        if self.kv_footer_scale and (
+            num_decode_tokens <= _FLASHINFER_DSV4_DECODE_MAX_TOKENS
+        ):
+            _cake_dsv41_sm120_paged_attention(
+                query=q,
+                swa_kv_cache=swa_cache,
+                sparse_indices=swa_indices,
+                output=output,
+                sm_scale=self.scale,
+                topk_length=swa_lens,
+                attn_sink=self.attn_sink,
+                extra_kv_cache=extra_cache,
+                extra_sparse_indices=extra_sparse_indices,
+                extra_sparse_topk_lens=extra_sparse_lengths,
+                workspace=self._cake_workspace(),
+            )
+            return
         _sparse_mla_sm120_paged_attention(
             query=q,
             swa_kv_cache=swa_cache,
@@ -1021,6 +1150,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             extra_sparse_topk_lens=extra_sparse_lengths,
             extra_kv_fp4=self.use_fp4_extra_kv,
             prefill_impl=None,
+            kv_scale_format=self.kv_scale_format,
         )
 
     def _forward_prefill(
@@ -1150,4 +1280,5 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
                 extra_kv_fp4=self.use_fp4_extra_kv,
                 prefill_impl=envs.VLLM_FLASHINFER_SM120_PREFILL_IMPL,
+                kv_scale_format=self.kv_scale_format,
             )

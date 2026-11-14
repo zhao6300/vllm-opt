@@ -583,6 +583,29 @@ def has_flashinfer_sparse_mla_sm120_config(
 
 
 @functools.cache
+def has_flashinfer_sparse_mla_sm120_cake(num_q_heads: int) -> bool:
+    """Return whether FlashInfer ships the SM120 DSv4.1 `cake` decode kernel.
+
+    That kernel is the only consumer of the footer-scale V4.1 KV layout, so a
+    build without it cannot serve a cache written in that layout.
+    """
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed")
+    supported_heads = (
+        getattr(mod, "cake_sparse_mla_sm120_dsv41_mixed_supported_heads", None)
+        if mod
+        else None
+    )
+    if not callable(supported_heads):
+        return False
+    try:
+        return int(num_q_heads) in supported_heads()
+    except (TypeError, ValueError):
+        return False
+
+
+@functools.cache
 def has_flashinfer_topk_varlen_gvr2() -> bool:
     """Return `True` if FlashInfer ships the `gvr_2` varlen top-k backend
     (self-sampling GVR V2, `flashinfer.top_k_varlen(backend="gvr_2")`).

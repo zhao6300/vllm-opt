@@ -428,7 +428,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "fused_deepseek_v4_kv_rope_insert("
       "Tensor kv, Tensor! k_cache, Tensor slot_mapping, Tensor position_ids, "
       "Tensor cos_sin_cache, int cache_block_size, Tensor? fp8_scale=None, "
-      "bool kv_mxfp8=False) -> "
+      "bool kv_mxfp8=False, bool kv_footer_scale=False) -> "
       "()");
   ops.def(
       "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert("
@@ -436,7 +436,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor slot_mapping, Tensor position_ids, Tensor cos_sin_cache, "
       "int q_head_padded, float eps, int cache_block_size, "
       "bool apply_q_norm=True, bool kv_mxfp8=False, bool apply_q_rope=True, "
-      "bool is_q_interleaved=False) -> Tensor");
+      "bool is_q_interleaved=False, bool kv_footer_scale=False) -> Tensor");
 
   // FlashInfer V4 full-cache variants: write Q in place (bf16) or to a separate
   // FP8 tensor, and KV into a contiguous 512-wide token-strided cache.

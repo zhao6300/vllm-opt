@@ -15,6 +15,8 @@ The kernel is imported via
 `torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -27,6 +29,7 @@ from vllm.models.deepseek_v4.common.ops import (
     quantize_and_insert_k_cache,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 
 # ── Constants matching the kernel ────────────────────────────────────────────
 HEAD_DIM = 512
@@ -530,6 +533,75 @@ def test_kv_path_mxfp8_record_matches_reference(num_tokens: int, block_size: int
     torch.testing.assert_close(
         fused_rows[..., :NOPE_DIM], ref_rows[..., :NOPE_DIM], rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 64])
+@pytest.mark.parametrize("block_size", [32, 64])
+def test_kv_path_mxfp8_footer_scale_regroups_inline_records(
+    num_tokens: int, block_size: int
+):
+    """`kv_footer_scale=True` writes the same quantization in `cake`'s page
+    layout: `block_size` value rows, then the page's UE8M0 scales.
+
+    The two layouts hold the same numbers, so regrouping the inline records
+    must reproduce the footer cache byte for byte, with the page's tail padding
+    left untouched.
+    """
+    torch.manual_seed(7)
+    device = "cuda"
+    dtype = torch.bfloat16
+    # vLLM rounds each page up to whole rows of both V4.1 caches.
+    page_bytes = block_size * V41_HEAD_BYTES
+    page_stride = round_up(page_bytes, math.lcm(V41_HEAD_BYTES, 288))
+
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    num_blocks = (num_tokens + block_size - 1) // block_size + 1
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    q_dummy = torch.zeros(num_tokens, 1, HEAD_DIM, dtype=dtype, device=device)
+
+    def _paged() -> torch.Tensor:
+        backing = torch.zeros(
+            num_blocks * page_stride, dtype=torch.uint8, device=device
+        )
+        return backing.as_strided(
+            (num_blocks, block_size, V41_HEAD_BYTES),
+            (page_stride, V41_HEAD_BYTES, 1),
+        )
+
+    inline = _paged()
+    footer = _paged()
+    for cache, footer_scale in ((inline, False), (footer, True)):
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+            q_dummy,
+            kv,
+            cache.view(num_blocks, -1),
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            0,
+            1e-6,
+            block_size,
+            False,
+            True,  # kv_mxfp8
+            True,
+            False,
+            footer_scale,
+        )
+
+    inline_rows = inline
+    for block in range(num_blocks):
+        page = footer[block].view(-1)
+        for token in range(block_size):
+            row = inline_rows[block, token]
+            assert torch.equal(
+                page[token * HEAD_DIM : (token + 1) * HEAD_DIM], row[:HEAD_DIM]
+            )
+            scale_at = block_size * HEAD_DIM + token * 16
+            assert torch.equal(page[scale_at : scale_at + 16], row[HEAD_DIM:])
+        # Nothing but the two payloads is written.
+        assert not page[page_bytes:].any()
 
 
 # ── Test 2d: mega-attention Q layout (is_q_interleaved) ──────────────────────

@@ -88,6 +88,7 @@ def test_dspark_context_kv_matches_query_insert(
         eps=1e-20,
         swa_cache_layer=SimpleNamespace(kv_cache=cache, block_size=block_size),
         kv_mxfp8=kv_mxfp8,
+        kv_footer_scale=False,
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin),
         _flashinfer_fp8_kv_scale=scale,
         _flashinfer_fp8_q_scale_inv=scale,
@@ -244,6 +245,7 @@ def test_v41_pcp_swa_cache_matches_non_pcp_writer(kv_mxfp8, monkeypatch):
         rotary_emb=SimpleNamespace(cos_sin_cache=cos_sin),
         _flashinfer_fp8_kv_scale=None,
         kv_mxfp8=kv_mxfp8,
+        kv_footer_scale=False,
         accepts_unnormed_unroped_query=False,
         _pads_q_by_copy=False,
         n_local_heads=num_heads,
@@ -1354,6 +1356,7 @@ def test_v41_attention_joins_cache_writes_before_consumption(use_aux, use_graph)
     )
     compressor.state_cache = SimpleNamespace(prefix="state", kv_cache=state)
     compressor.k_cache_prefix = "main"
+    compressor.footer_scale = False
     compressor._static_forward_context = {"main": SimpleNamespace(kv_cache=main)}
     indexer_weight = torch.randn(128, 512, dtype=torch.bfloat16, device="cuda")
     indexer = SimpleNamespace(
@@ -3313,8 +3316,8 @@ def test_v41_indexer_forward_q(quant_tuple):
 def test_v41_fp4_insert_lands_on_padded_page_rows(compress_ratio: int) -> None:
     """The V4.1 FP4 record is addressed as a flat row of the whole cache.
 
-    FlashInfer's writer takes a row index, so writing a packed page (``page_rows``
-    rows inside a ``page_span`` stride) at its dense row would land inside the
+    FlashInfer's writer takes a row index, so writing a packed page (`page_rows`
+    rows inside a `page_span` stride) at its dense row would land inside the
     previous page and every reader would see the wrong latent. A padded cache
     must therefore hold the same bytes a dense cache does.
     """

@@ -310,6 +310,7 @@ def rope_quant_insert(
     slot_mapping: torch.Tensor,
     compress_ratio: int,
     fp8_scale: torch.Tensor | None = None,
+    footer_scale: bool = False,
 ) -> None:
     """Apply GPT-J RoPE and publish a latent to the compressed KV cache.
 
@@ -321,7 +322,9 @@ def rope_quant_insert(
     (512 MXFP8 value bytes covering the RoPE dims too, then 16 UE8M0 scales of
     32 dims each), or 288 B for V4.1 NVFP4 (256 bytes of e2m1 pairs then 32
     e4m3 scales of 16 dims each), which only the compressed cache uses. The
-    two V4.1 records keep each token's scales right after its own values.
+    two V4.1 records keep each token's scales right after its own values,
+    unless `footer_scale` asks for the page-footer layout (`page_size` value
+    rows, then the page's scales), which only the SM120 `cake` backend reads.
     `bfloat16` and `float8_e4m3fn` are the plain [448 NoPE | 64 RoPE] rows
     read by FlashInfer, the latter scaled by the per-tensor `fp8_scale`.
     """
@@ -351,6 +354,7 @@ def rope_quant_insert(
             kv_cache,
             positions,
             compress_ratio,
+            footer_scale=footer_scale,
         )
         return
     if kv_cache.dtype == torch.uint8:
@@ -362,6 +366,14 @@ def rope_quant_insert(
         assert kernel is not None, (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
         )
+        kernel_kwargs = {}
+        if kernel is _rope_quant_insert_mxfp8_kernel:
+            kernel_kwargs["FOOTER_SCALE"] = footer_scale
+        else:
+            assert not footer_scale, (
+                f"the page-footer layout covers V4.1 records only, not "
+                f"{kv_cache.shape[-1]}-byte ones"
+            )
         kernel[(num_tokens,)](
             latent,
             positions,
@@ -374,10 +386,12 @@ def rope_quant_insert(
             COMPRESS_RATIO=compress_ratio,
             SANITIZE_CACHE_NANS=_ON_GFX950,
             num_warps=4,
+            **kernel_kwargs,
             **launch_kwargs,
         )
         return
 
+    assert not footer_scale, "the page-footer layout covers V4.1 records only"
     assert kv_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
     assert kv_cache.shape[-1] == 512 and kv_cache.stride(-1) == 1
     store_fp8 = kv_cache.dtype == torch.float8_e4m3fn
@@ -408,6 +422,7 @@ def _insert_fp4_packed_or_append(
     kv_cache: torch.Tensor,
     positions: torch.Tensor,
     compress_ratio: int,
+    footer_scale: bool = False,
 ) -> None:
     """Use page packing only for whole consecutive pages, otherwise append."""
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
@@ -419,11 +434,16 @@ def _insert_fp4_packed_or_append(
         slot_mapping = slot_mapping.masked_fill(
             (positions + 1) % compress_ratio != 0, -1
         )
-    # FlashInfer's writer addresses a record as a flat row of the whole cache,
-    # so padded pages need the slot rewritten to the row the token occupies.
+    # FlashInfer's writer addresses an inline-scale record as a flat row of the
+    # whole cache, so padded pages need the slot rewritten to the row the token
+    # occupies. Footer-scale pages are addressed by paged slot id.
     page_tokens = paged_cache_page_rows(kv_cache)
-    append_slots = paged_slots_to_cache_rows(
-        slot_mapping, page_tokens, paged_cache_block_span(kv_cache)
+    append_slots = (
+        slot_mapping
+        if footer_scale
+        else paged_slots_to_cache_rows(
+            slot_mapping, page_tokens, paged_cache_block_span(kv_cache)
+        )
     )
     if (
         slot_mapping.dim() != 1
@@ -432,7 +452,7 @@ def _insert_fp4_packed_or_append(
         or BreakableCUDAGraphCapture.is_active()
     ):
         flashinfer_dsv41_fp4_quantize_append(
-            roped_latent, append_slots, kv_cache, inline_scale=True
+            roped_latent, append_slots, kv_cache, inline_scale=not footer_scale
         )
         return
 
@@ -452,7 +472,7 @@ def _insert_fp4_packed_or_append(
         packed = flashinfer_dsv41_fp4_quantize_pack(
             roped_latent[start:end].view(-1, page_tokens, 512),
             kv_layout="NHD",
-            inline_scale=True,
+            inline_scale=not footer_scale,
         )
         kv_cache.index_copy_(
             0,
@@ -467,14 +487,14 @@ def _insert_fp4_packed_or_append(
             roped_latent[append_rows_t],
             append_slots[append_rows_t],
             kv_cache,
-            inline_scale=True,
+            inline_scale=not footer_scale,
         )
 
 
 def _whole_page_runs(slots: np.ndarray, page_tokens: int) -> list[tuple[int, int]]:
-    """Token ranges ``[start, end)`` made only of complete, in-order pages.
+    """Token ranges `[start, end)` made only of complete, in-order pages.
 
-    A page qualifies when it starts on a page boundary and its ``page_tokens``
+    A page qualifies when it starts on a page boundary and its `page_tokens`
     slots are consecutive, so one pack call can write it whole. Every slot of
     the page is checked: a batch holding several requests, or decode tokens next
     to a prefill, can have a page-aligned slot followed by slots of another
@@ -568,11 +588,14 @@ def _rope_quant_insert_mxfp8_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FOOTER_SCALE: tl.constexpr = False,
 ):
     """V4.1 record: RoPE first, then MXFP8-quantize all 512 dims.
 
     The RoPE dims are quantized here too, so unlike the V4 kernel the rotation
-    has to happen before the scales are picked.
+    has to happen before the scales are picked. The record is either one token
+    (data then its own scales) or, with `FOOTER_SCALE`, a page of value rows
+    followed by the page's scale rows.
     """
     t = tl.program_id(0)
     slot = tl.load(cache_slots + t)
@@ -595,8 +618,12 @@ def _rope_quant_insert_mxfp8_kernel(
         rotated = tl.where(rotated == rotated, rotated, 0.0)
 
     page = cache + (slot // CACHE_BLOCK).to(tl.int64) * CACHE_STRIDE
-    values = page + (slot % CACHE_BLOCK) * 528
-    scales = values + 512
+    if FOOTER_SCALE:
+        values = page + (slot % CACHE_BLOCK) * 512
+        scales = page + CACHE_BLOCK * 512 + (slot % CACHE_BLOCK) * 16
+    else:
+        values = page + (slot % CACHE_BLOCK) * 528
+        scales = values + 512
 
     quant = tl.reshape(rotated, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)

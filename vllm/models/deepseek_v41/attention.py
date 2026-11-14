@@ -256,7 +256,7 @@ class DeepseekV41MLAAttentionSpec(MLAAttentionSpec):
     kernel_block_states: ClassVar[int] = 64
     """Compressed states a DSv4.1 kernel page must hold. The sparse-MLA and
     indexer kernels both read 64-state pages, so the kernel block size is
-    ``kernel_block_states * tokens_per_state`` tokens (capped by the manager
+    `kernel_block_states * tokens_per_state` tokens (capped by the manager
     block size)."""
 
 
@@ -424,6 +424,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         an NVFP4 compressed cache.
         """
         return "fp8_ds_mla"
+
+    @classmethod
+    def uses_footer_scale_layout(cls) -> bool:
+        """Whether this layer writes and reads V4.1 page-footer scale records.
+
+        The page footer groups a page's scales after its value rows instead of
+        keeping each token's scales beside its own values. Only FlashInfer's
+        SM120 `cake` kernels read it; every other backend needs the default
+        inline records.
+        """
+        return False
 
     @classmethod
     @abstractmethod
@@ -708,6 +719,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.packed_kv_cache_dtype(),
         )
         self.kv_mxfp8 = _use_v41_mxfp8_kv_record()
+        # Page-footer scale layout of the V4.1 packed caches. Off for every
+        # backend but SM120 FlashInfer's opt-in `cake` decode.
+        self.kv_footer_scale = self.uses_footer_scale_layout()
+
         self.swa_bytes_per_token = _swa_bytes_per_token_for_cache_dtype(
             self.kv_cache_dtype,
             self.kv_mxfp8,
@@ -784,6 +799,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 rotate=True,
                 prefix=f"{prefix}.compressor",
                 k_cache_prefix=self.prefix,
+                footer_scale=self.kv_footer_scale,
             )
         # Prefix of the attention layer owning this layer's compressed KV
         # cache (self for kv sources).
@@ -937,6 +953,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 if cache.dtype == torch.float8_e4m3fn
                 else None,
                 self.kv_mxfp8,
+                kv_footer_scale=self.kv_footer_scale,
             )
         if self.compressor is not None:
             latent = self.compressor(kv_score, positions)
@@ -1294,6 +1311,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 if cache_dtype == torch.float8_e4m3fn
                 else None,
                 self.kv_mxfp8,
+                kv_footer_scale=self.kv_footer_scale,
             )
             # The fused op now only prepares the rank-local queries.
             slot_mapping = slot_mapping[:0]
@@ -1334,6 +1352,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.kv_mxfp8,
                 not self.accepts_unnormed_unroped_query,  # apply_q_rope
                 self.accepts_unnormed_unroped_query,  # is_q_interleaved
+                self.kv_footer_scale,
             )
             if copy_q:
                 out = q.new_empty((q.shape[0], self.padded_heads, q.shape[2]))

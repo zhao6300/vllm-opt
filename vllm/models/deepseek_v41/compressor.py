@@ -293,6 +293,7 @@ class DeepseekCompressor(nn.Module):
         rotate: bool = False,
         prefix: str = "",
         k_cache_prefix="",
+        footer_scale: bool = False,
     ):
         super().__init__()
         if compress_ratio not in (1, 2):
@@ -307,6 +308,8 @@ class DeepseekCompressor(nn.Module):
         self.rotate = rotate
         self.prefix = prefix
         self.k_cache_prefix = k_cache_prefix
+        # Page-footer scale layout, selected by the SM120 `cake` backend.
+        self.footer_scale = footer_scale
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
         # Ratio 1 pools single tokens, so the checkpoint carries no gate.
@@ -445,4 +448,5 @@ class DeepseekCompressor(nn.Module):
             k_cache_metadata.slot_mapping,
             self.compress_ratio,
             fp8_scale=fp8_scale,
+            footer_scale=self.footer_scale,
         )

@@ -300,6 +300,7 @@ def _insert_context_kv(
         attn.swa_cache_layer.block_size,
         attn._flashinfer_fp8_kv_scale if cache.dtype == torch.float8_e4m3fn else None,
         attn.kv_mxfp8,
+        kv_footer_scale=attn.kv_footer_scale,
     )
 
 
