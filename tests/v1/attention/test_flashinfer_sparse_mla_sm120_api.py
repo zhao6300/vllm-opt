@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
@@ -764,6 +765,7 @@ def _footer_decode_attention(monkeypatch, monkeypatch_env=None):
     attn.max_num_batched_tokens = 128
     attn.kv_footer_scale = True
     attn.kv_scale_format = "ue8m0_g32"
+    attn.cake_max_tokens = envs.VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS
     attn._cake_workspace_tensor = torch.zeros(1 << 20, dtype=torch.uint8)
     return attn
 
@@ -837,9 +839,20 @@ def test_sm120_footer_decode_keeps_paged_slots_and_dispatches_cake(
     assert cake_calls[0]["swa_kv_cache"].shape == (4, 32, 1, 528)
 
 
-def test_sm120_footer_decode_above_cake_limit_stays_on_sparse(monkeypatch) -> None:
-    """Cake decodes at most 64 rows; a wider step falls back to the sparse
-    kernels, which read the same footer-scale cache."""
+@pytest.mark.parametrize(
+    ("num_tokens", "cap", "expected_rows"),
+    [
+        (64, 64, [64]),
+        (65, 64, [64, 1]),
+        (130, 64, [64, 64, 2]),
+        (300, 256, [256, 44]),
+    ],
+)
+def test_sm120_footer_decode_chunks_wider_steps_on_cake(
+    monkeypatch, num_tokens, cap, expected_rows
+) -> None:
+    """One cake launch takes `cap` rows; a wider step keeps running cake,
+    one launch per cap, instead of falling back to the sparse kernels."""
     cake_calls = []
     monkeypatch.setattr(
         nvidia.flashinfer_sparse,
@@ -854,7 +867,7 @@ def test_sm120_footer_decode_above_cake_limit_stays_on_sparse(monkeypatch) -> No
     )
 
     attn = _footer_decode_attention(monkeypatch)
-    num_tokens = 65
+    attn.cake_max_tokens = cap
     metadata = SimpleNamespace(
         num_decodes=num_tokens,
         num_decode_tokens=num_tokens,
@@ -875,9 +888,41 @@ def test_sm120_footer_decode_above_cake_limit_stays_on_sparse(monkeypatch) -> No
         output=output,
     )
 
-    assert cake_calls == []
-    assert len(sparse_calls) == 1
-    assert sparse_calls[0]["kv_scale_format"] == "ue8m0_g32"
+    assert sparse_calls == []
+    assert [call["query"].shape[0] for call in cake_calls] == expected_rows
+    # Consecutive launches cover the step once, in order, and each kernel gets
+    # the step's own rows (a slice of the metadata's buffer, not a copy).
+    start = 0
+    for call, rows in zip(cake_calls, expected_rows):
+        assert call["query"].shape[0] == rows
+        assert call["sparse_indices"].data_ptr() == (
+            metadata.decode_swa_indices[start : start + 1].data_ptr()
+        )
+        assert call["output"].data_ptr() == output[start : start + 1].data_ptr()
+        start += rows
+    assert start == num_tokens
+
+
+def test_cake_workspace_covers_the_launch_cap(monkeypatch) -> None:
+    """One launch is what the shared decode scratch has to hold, so a larger
+    cap buys memory up front instead of inside a captured step."""
+    monkeypatch.setenv("VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS", "256")
+    assert envs.VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS == 256
+
+    config = _dsv41_workspace_config()
+
+    def scratch(max_tokens: int) -> int:
+        return nvidia.flashinfer_sparse._cake_dsv41_workspace_bytes(
+            config,
+            padded_heads=64,
+            window_size=128,
+            compress_ratio=1,
+            max_tokens=max_tokens,
+        )
+
+    assert scratch(64) < scratch(256) < scratch(512)
+    # Four times the rows of the default 64 is four times the scratch.
+    assert scratch(256) == 4 * scratch(64) - 3 * 48
 
 
 # ── Footer-scale KV layout: write path and decode ────────────────────────────
@@ -996,12 +1041,14 @@ def _dequant_extra(cache: torch.Tensor, sel: torch.Tensor) -> torch.Tensor:
     return (values * scales).reshape(-1, 512)
 
 
-def _decode_selection():
-    keys = torch.randint(0, _PAGES * _BLOCK, (2, 512), dtype=torch.int32, device="cuda")
-    extra = torch.randint(
-        0, _PAGES * _BLOCK, (2, 512), dtype=torch.int32, device="cuda"
+def _decode_selection(rows: int = 2):
+    keys = torch.randint(
+        0, _PAGES * _BLOCK, (rows, 512), dtype=torch.int32, device="cuda"
     )
-    lens = torch.full((2,), 512, dtype=torch.int32, device="cuda")
+    extra = torch.randint(
+        0, _PAGES * _BLOCK, (rows, 512), dtype=torch.int32, device="cuda"
+    )
+    lens = torch.full((rows,), 512, dtype=torch.int32, device="cuda")
     return keys, extra, lens
 
 
@@ -1070,6 +1117,7 @@ def test_cake_decode_matches_footer_dequant_reference() -> None:
             padded_heads=64,
             window_size=128,
             compress_ratio=1,
+            max_tokens=2,
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -1141,3 +1189,61 @@ def test_footer_scale_extra_records_cover_partial_pages() -> None:
         )
         scale_at = _BLOCK * 256 + offset * 32
         assert torch.equal(footer_rows[page, scale_at : scale_at + 32], record[256:])
+
+
+@pytest.mark.parametrize(
+    ("rows", "cuts"),
+    [
+        (96, (0, 64, 96)),
+        (130, (0, 64, 130)),
+        (90, (0, 64, 90)),
+        (300, (0, 64, 128, 192, 256, 300)),
+    ],
+)
+@pytest.mark.skipif(not _requires_cake(), reason="needs SM120 and FlashInfer cake")
+def test_cake_launch_splits_are_row_independent(rows, cuts) -> None:
+    """A step wider than one launch must equal the same rows run per launch,
+    which is what `_forward_decode` relies on when it chunks.
+
+    Each launch resolves its own split plan, so the merge of the split-K
+    partials can round differently: at most one bf16 step of the output (3.9e-3
+    measured against a 0.57 peak), like any split-K reduction.
+    """
+    cos_sin, kv, positions, slots = _v41_inputs()
+    main, extra = _write_v41_caches(cos_sin, kv, positions, slots, footer_scale=True)
+
+    torch.manual_seed(1)
+    query = torch.randn(rows, 64, 512, dtype=torch.bfloat16, device="cuda")
+    keys, extra_keys, lens = _decode_selection(rows=rows)
+    workspace = torch.zeros(
+        nvidia.flashinfer_sparse._cake_dsv41_workspace_bytes(
+            _dsv41_workspace_config(),
+            padded_heads=64,
+            window_size=128,
+            compress_ratio=1,
+            max_tokens=rows,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    def run(lo: int, hi: int) -> torch.Tensor:
+        out = torch.zeros_like(query[lo:hi])
+        nvidia.flashinfer_sparse._cake_dsv41_sm120_paged_attention(
+            query=query[lo:hi],
+            swa_kv_cache=main.unsqueeze(-2),
+            sparse_indices=keys[lo:hi, None, :],
+            output=out,
+            sm_scale=512**-0.5,
+            topk_length=lens[lo:hi],
+            attn_sink=None,
+            extra_kv_cache=extra.unsqueeze(-2),
+            extra_sparse_indices=extra_keys[lo:hi, None, :],
+            extra_sparse_topk_lens=lens[lo:hi],
+            workspace=workspace,
+        )
+        return out
+
+    whole = run(0, rows)
+    split = torch.cat([run(lo, hi) for lo, hi in zip(cuts, cuts[1:])])
+    torch.testing.assert_close(whole, split, rtol=0, atol=8e-3)

@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_FLASHINFER_DSV41_SM120_CAKE: bool = False
+    VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS: int = 256
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1255,6 +1256,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # KV cache layout, so the two settings cannot share a cache.
     "VLLM_FLASHINFER_DSV41_SM120_CAKE": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE", "0"))
+    ),
+    # Decode rows one cake launch takes (default 256). A wider step runs the
+    # cake kernels in several launches of this size, so cake still covers it.
+    # The split-K scratch of one launch is held per device and grows with this
+    # value (about 0.67 GB per 256 rows at 64 heads, main topk 512 + extra
+    # topk 2048).
+    "VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS", "256")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

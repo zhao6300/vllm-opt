@@ -212,11 +212,13 @@ def _cake_dsv41_workspace_bytes(
     padded_heads: int,
     window_size: int,
     compress_ratio: int,
+    max_tokens: int,
 ) -> int:
     """Split-K scratch FlashInfer's `cake` DSv4.1 decode needs for this layer.
 
     Same shape of requirement as the sparse decode plan -- rows x candidate
-    chunks -- but with its own chunk width and merge buffers.
+    chunks -- but with its own chunk width and merge buffers. `max_tokens` is
+    the rows one launch takes, so the buffer covers the widest step.
     """
     from flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed import (
         cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes,
@@ -228,7 +230,7 @@ def _cake_dsv41_workspace_bytes(
         else 0
     )
     return cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes(
-        _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+        max_tokens,
         padded_heads,
         required_sm120_sparse_topk(vllm_config, window_size),
         extra_topk,
@@ -860,14 +862,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             get_cake_sparse_mla_sm120_dsv41_mixed_module()
+            self.cake_max_tokens = envs.VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS
+            if self.cake_max_tokens < 1:
+                raise ValueError(
+                    "VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS must be a "
+                    f"positive decode row count, got {self.cake_max_tokens}"
+                )
             logger.info_once(
                 "Sparse MLA decode runs on FlashInfer's cake kernels "
-                "(VLLM_FLASHINFER_DSV41_SM120_CAKE) for decode steps of up to "
-                "%d tokens; wider steps and prefill use the sparse kernels on "
-                "the same cache. The V4.1 KV caches hold page-footer scale "
-                "records, so caches written by the default inline records "
-                "cannot be reused.",
-                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+                "(VLLM_FLASHINFER_DSV41_SM120_CAKE), %d decode rows per "
+                "launch; wider steps take several launches of the same cache, "
+                "and prefill stays on the sparse kernels. The V4.1 KV caches "
+                "hold page-footer scale records, so caches written by the "
+                "default inline records cannot be reused.",
+                self.cake_max_tokens,
             )
         # The workspace is per device and shared by every layer, so size it here
         # (outside CUDA graph capture) for the widest plan this layer can ask for.
@@ -886,6 +894,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                     padded_heads=self.padded_heads,
                     window_size=self.window_size,
                     compress_ratio=self.compress_ratio,
+                    max_tokens=self.cake_max_tokens,
                 ),
             )
         workspace = get_flashinfer_dsv4_workspace(
@@ -1132,35 +1141,43 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         extra_sparse_indices = self._storage_offset_indices(
             extra_sparse_indices, extra_cache, compressed_block_size, "extra"
         )
-        if self.kv_footer_scale and (
-            num_decode_tokens <= _FLASHINFER_DSV4_DECODE_MAX_TOKENS
-        ):
-            logger.info_once(
-                "A decode step of at most %d tokens runs on the cake kernels.",
-                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
-            )
-            _cake_dsv41_sm120_paged_attention(
-                query=q,
-                swa_kv_cache=swa_cache,
-                sparse_indices=swa_indices,
-                output=output,
-                sm_scale=self.scale,
-                topk_length=swa_lens,
-                attn_sink=self.attn_sink,
-                extra_kv_cache=extra_cache,
-                extra_sparse_indices=extra_sparse_indices,
-                extra_sparse_topk_lens=extra_sparse_lengths,
-                workspace=self._cake_workspace(),
-            )
-            return
         if self.kv_footer_scale:
+            # One cake launch takes as many rows as the shared split-K scratch
+            # covers; a wider step splits into launches of that size, which
+            # still beats the sparse kernels (~2x at 512 rows). Each launch
+            # resolves its own split plan, so a chunked step can differ from a
+            # single wide launch by one rounding step of the split merge.
+            cap = self.cake_max_tokens
             logger.info_once(
-                "A decode step of more than %d tokens runs on the sparse "
-                "kernels, not cake: the cake kernels take at most %d decode "
-                "tokens per step.",
-                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
-                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+                "A decode step of at most %d tokens runs on the cake kernels; "
+                "wider steps take one launch per %d tokens.",
+                cap,
+                cap,
             )
+            for lo in range(0, num_decode_tokens, cap):
+                hi = min(lo + cap, num_decode_tokens)
+                _cake_dsv41_sm120_paged_attention(
+                    query=q[lo:hi],
+                    swa_kv_cache=swa_cache,
+                    sparse_indices=cast(torch.Tensor, swa_indices)[lo:hi],
+                    output=output[lo:hi],
+                    sm_scale=self.scale,
+                    topk_length=swa_lens[lo:hi],
+                    attn_sink=self.attn_sink,
+                    extra_kv_cache=extra_cache,
+                    extra_sparse_indices=(
+                        extra_sparse_indices[lo:hi]
+                        if extra_sparse_indices is not None
+                        else None
+                    ),
+                    extra_sparse_topk_lens=(
+                        extra_sparse_lengths[lo:hi]
+                        if extra_sparse_lengths is not None
+                        else None
+                    ),
+                    workspace=self._cake_workspace(),
+                )
+            return
         _sparse_mla_sm120_paged_attention(
             query=q,
             swa_kv_cache=swa_cache,
