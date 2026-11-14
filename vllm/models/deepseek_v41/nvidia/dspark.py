@@ -19,7 +19,7 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_pp_group
+from vllm.distributed import in_single_pp_stage
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -316,12 +316,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         assert vllm_config.speculative_config is not None
-        # The drafter runs on the last PP stage. Past the first stage the
+        # The drafter runs whole on the last PP stage, built in `single_pp_stage()`
+        # where `get_pp_group()` is that one rank: only `in_single_pp_stage()` tells
+        # that the target's pipeline has other stages. Past the first stage the
         # target has no input embedding to alias, so load the checkpoint's.
-        pp_group = get_pp_group()
-        self.has_own_embed_tokens = (
-            pp_group.world_size > 1 and not pp_group.is_first_rank
-        )
+        self.has_own_embed_tokens = in_single_pp_stage()
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = self.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
