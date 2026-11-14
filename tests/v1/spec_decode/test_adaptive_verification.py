@@ -32,8 +32,7 @@ def make_manager(
     confidences: np.ndarray,
     verify_cost_ms: np.ndarray,
     fill_padding: bool = True,
-    fill_min_survival: float = 0.0,
-    fill_min_rows: int = 1,
+    fill_cost_ratio: float = 0.0,
 ) -> AdaptiveVerificationManager:
     num_reqs, num_steps = confidences.shape
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
@@ -49,8 +48,7 @@ def make_manager(
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
     manager._fill_padding = fill_padding
-    manager._fill_min_survival = fill_min_survival
-    manager._fill_min_rows = fill_min_rows
+    manager._fill_cost_ratio = fill_cost_ratio
     return manager
 
 
@@ -623,34 +621,12 @@ def test_step_timing_sampling_skips_dummy_steps(monkeypatch):
     assert len(timings) == 1
 
 
-def test_fill_graph_padding_admits_drafts_into_padded_rows():
-    # Verification past 3 tokens is 100x dearer, so the budget stops at one
-    # draft; a graph padded to 5 tokens (another DP rank's size) runs two more
-    # rows anyway, and they take the next-best drafts.
-    manager = make_manager(
-        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
-    )
-    num_tokens = manager.get_num_tokens(
-        {"low": 3, "high": 3},
-        {"low": [1, 2], "high": [3, 4]},
-    )
-    assert num_tokens == 3
-
-    assert manager.fill_graph_padding(5) == 5
-    assert manager._batch_budget is not None
-    assert manager._batch_budget[2] == 3
-    # Never beyond the scheduled drafts, and no change without spare rows.
-    assert manager.fill_graph_padding(64) == 6
-    assert manager.fill_graph_padding(6) is None
-
-
 def _fill_manager(**kwargs) -> AdaptiveVerificationManager:
-    # Survival probabilities, best first: 0.9, 0.81, 0.1, 0.01. The budget stops
-    # at one draft because verification past 3 tokens is 100x dearer.
+    # Survival probabilities, best first: 0.9, 0.81, 0.1, 0.01. Accepted tokens
+    # per ms peak at one draft (2.9), and each further row costs 0.4 ms.
     manager = make_manager(
         np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+        np.array([1.0, 1.0, 1.0, 1.0, 1.4, 1.8, 2.2]),
         **kwargs,
     )
     assert (
@@ -667,24 +643,29 @@ def test_fill_graph_padding_is_off_unless_enabled():
     assert manager._batch_budget[2] == 1
 
 
-def test_fill_graph_padding_skips_unlikely_drafts():
-    # Two padded rows are free, but only the 0.81 draft clears the 0.5 floor.
-    manager = _fill_manager(fill_min_survival=0.5)
+def test_fill_graph_padding_admits_drafts_that_pay_for_their_row():
+    # A row is worth it while survival >= ratio * 2.9 * 0.4. At 0.5 that is
+    # 0.58: the 0.81 draft qualifies, the 0.1 one does not.
+    manager = _fill_manager(fill_cost_ratio=0.5)
     assert manager.fill_graph_padding(5) == 4
     assert manager._batch_budget is not None
     assert manager._batch_budget[2] == 2
-    # Nothing left above the floor.
     assert manager.fill_graph_padding(64) is None
 
-    manager = _fill_manager(fill_min_survival=0.95)
-    assert manager.fill_graph_padding(64) is None
+    # At 0.05 the bar is 0.058, so 0.81 and 0.1 qualify and 0.01 does not.
+    manager = _fill_manager(fill_cost_ratio=0.05)
+    assert manager.fill_graph_padding(64) == 5
 
 
-def test_fill_graph_padding_needs_the_minimum_number_of_rows():
-    manager = _fill_manager(fill_min_survival=0.5, fill_min_rows=2)
-    assert manager.fill_graph_padding(5) is None
-    manager = _fill_manager(fill_min_survival=0.05, fill_min_rows=2)
+def test_fill_graph_padding_at_full_price_admits_nothing_here():
+    # Pricing a padded row like a real one is the budget's own stopping rule.
+    assert _fill_manager(fill_cost_ratio=1.0).fill_graph_padding(64) is None
+
+
+def test_fill_graph_padding_at_zero_cost_fills_every_spare_row():
+    manager = _fill_manager(fill_cost_ratio=0.0)
     assert manager.fill_graph_padding(5) == 5
+    assert manager.fill_graph_padding(64) == 6
 
 
 def test_fill_graph_padding_respects_the_rejection_sampler_chunk():

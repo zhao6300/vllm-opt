@@ -71,16 +71,15 @@ export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
 
 ## Filling padded rows with drafts
 
-Under data parallelism every rank replays the FULL cudagraph of the largest rank, so a smaller rank's graph has padded rows beyond the draft budget it chose. Setting `VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1` admits the next-best drafts into those rows, which can raise the accepted length without lengthening the graph. Padded rows are cheaper than real ones (real rows read the KV cache, route to experts and are sampled), so the fill is limited:
+Under data parallelism every rank replays the FULL cudagraph of the largest rank, so a smaller rank's graph has padded rows beyond the draft budget it chose. Setting `VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1` admits the next-best drafts into those rows, which can raise the accepted length without lengthening the graph. Padded rows are cheaper than real ones (real rows read the KV cache, route to experts and are sampled), so the fill is priced rather than unconditional.
 
-- `VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL` (default 0.1): only drafts whose estimated survival probability, the cumulative product of their confidences, reaches this value are admitted.
-- `VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS` (default 1): skip the fill when fewer rows than this would be added.
+The threshold comes from the cost tables, so there is no survival floor to tune. A draft is admitted into a padded row while its survival probability (the cumulative product of its confidences) is at least `VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO` times the cost tables' price of that row, multiplied by the step's best accepted tokens per millisecond. The ratio is what a padded row costs as a fraction of a real row (default 0.5): `0` fills every spare row, and `1` prices padded rows like real ones, which is the rule the budget already stopped at, so almost nothing is admitted.
 
 The fill applies only to FULL cudagraph steps without microbatching or prefill context parallelism. It is off by default; compare throughput and mean accepted length (`1 + accepted / drafts`) with it on and off before enabling it.
 
 ```bash
 export VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1
-export VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL=0.2
+export VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO=0.5
 ```
 
 ## Tuning the cost profile

@@ -301,11 +301,13 @@ class AdaptiveVerificationManager:
         self._base_verify_curve: list[tuple[int, float]] = []
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
         self._batch_max_draft_budget = 0
-        # Survival probabilities of this step's draft candidates, best first.
+        # This step's draft candidates (survival probabilities, best first), the
+        # step cost at each draft budget, and the best accepted tokens per ms.
         self._batch_scores = np.empty(0, dtype=np.float64)
+        self._batch_costs = np.empty(0, dtype=np.float64)
+        self._batch_best_rate = 0.0
         self._fill_padding = envs.VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING
-        self._fill_min_survival = envs.VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL
-        self._fill_min_rows = max(envs.VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS, 1)
+        self._fill_cost_ratio = max(envs.VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO, 0)
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -622,7 +624,10 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        rates = num_tokens_to_estimated_accepted_tokens / costs
+        draft_budget = int(np.argmax(rates))
+        self._batch_costs = costs
+        self._batch_best_rate = float(rates[draft_budget])
         # Rank-local confidences must not select different TP execution sizes.
         draft_budget = get_tp_group().broadcast_object(draft_budget, src=0)
         self._batch_budget = (
@@ -638,10 +643,11 @@ class AdaptiveVerificationManager:
 
         The budget is chosen for this rank's token count, but under DP every
         rank replays the graph of the largest rank, so the rows up to
-        ``num_padded_tokens`` are cheaper than real rows but not free, so only
-        drafts with a survival probability of at least the configured minimum
-        are admitted. Returns the new token count, or None when the budget is
-        unchanged or filling is disabled.
+        ``num_padded_tokens`` are cheaper than real rows. They are not free, so
+        a draft is admitted only while its survival probability is at least
+        the padded-row cost ratio times the cost tables' price of its row at
+        the step's best accepted tokens per ms. Returns the new token count,
+        or None when the budget is unchanged or filling is disabled.
         """
         batch_budget = self._batch_budget
         if not self._fill_padding or batch_budget is None:
@@ -654,10 +660,14 @@ class AdaptiveVerificationManager:
         )
         if extra <= 0:
             return None
-        # Scores are sorted best first, so the qualifying ones are a prefix.
-        candidates = self._batch_scores[draft_budget : draft_budget + extra]
-        extra = int(np.count_nonzero(candidates >= self._fill_min_survival))
-        if extra < self._fill_min_rows:
+        # Scores are sorted best first; take the prefix whose rows pay off.
+        end = draft_budget + extra
+        row_prices = np.diff(self._batch_costs[draft_budget : end + 1])
+        pays_off = self._batch_scores[draft_budget:end] >= (
+            self._fill_cost_ratio * self._batch_best_rate * row_prices
+        )
+        extra = extra if pays_off.all() else int(np.argmin(pays_off))
+        if extra <= 0:
             return None
         self._batch_budget = (
             num_drafts_per_req,

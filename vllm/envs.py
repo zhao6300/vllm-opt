@@ -69,8 +69,7 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
     VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
     VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING: bool = False
-    VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL: float = 0.1
-    VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS: int = 1
+    VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO: float = 0.5
     VLLM_DP_LB_TOKEN_AWARE: bool = False
     VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
     VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
@@ -1294,14 +1293,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING": lambda: bool(
         int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING", "0"))
     ),
-    # With FILL_PADDING: only drafts whose estimated survival probability
-    # (cumulative confidence) is at least this are admitted into padded rows.
-    "VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL": lambda: float(
-        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL", "0.1")
-    ),
-    # With FILL_PADDING: skip the fill when fewer rows than this would be added.
-    "VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS": lambda: int(
-        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS", "1")
+    # With FILL_PADDING: what a padded row costs, as a fraction of a real row at
+    # the cost tables' marginal price. A draft is admitted while its survival
+    # probability is at least this fraction of the price of a row at the
+    # current accepted-tokens-per-ms. 0 fills every spare row; 1 prices padded
+    # rows like real ones, which admits almost nothing.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO": lambda: float(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO", "0.5")
     ),
     "VLLM_DP_LB_TOKEN_AWARE": lambda: bool(
         int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
