@@ -86,7 +86,7 @@ When deploying large DP sizes using this method, the API server process can beco
 
 By default the API server sends a new request to the DP rank with the lowest load, counted in waiting and running requests. A long prompt weighs the same as a short one, although it keeps its rank busy for several steps, and every step of an MoE deployment waits for the slowest rank.
 
-Set `VLLM_DP_LB_TOKEN_AWARE=1` to add the prompt tokens a rank has not finished prefilling to its score. Each engine reports its own remainder with the load snapshot it publishes every 100 ms, and that remainder already excludes the tokens a prefix cache or KV connector supplied, so a cached prompt weighs only what it still has to compute (a request that has not been scheduled yet counts in full). `VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST` (default 2048) sets how many pending tokens weigh as much as one request. It is off by default, and the default weight has not been tuned.
+Set `VLLM_DP_LB_TOKEN_AWARE=1` to add the prompt tokens a rank has not finished prefilling to its score. Each engine reports its own remainder with the load snapshot it publishes every 100 ms, and that remainder already excludes the tokens a prefix cache or KV connector supplied, so a cached prompt weighs only what it still has to compute (a request that has not been scheduled yet counts in full). `VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST` (default 2048) sets how many pending tokens weigh as much as one request, and one rank's pending prefill counts for at most four requests, so a single long prompt cannot leave that rank unroutable while its prefill runs. It is off by default, and the default weight has not been tuned.
 
 ### Sizing prefill chunks by a step time budget
 

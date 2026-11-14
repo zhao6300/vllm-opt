@@ -453,6 +453,29 @@ def test_dplb_token_aware_weighs_tokens_against_requests():
     assert chosen == client.core_engines[1]
 
 
+def test_dplb_token_aware_caps_the_pending_prefill_weight():
+    """An engine already prefilling several requests' worth of tokens is just
+    busy: weighing its whole backlog would leave it unroutable for the length
+    of that prefill while the other engines pile up."""
+    client = _make_dplb_client(
+        num_engines=2, token_aware=True, prefill_tokens_per_request=1000
+    )
+    # Engine 0 runs one request with a 100-request backlog, engine 1 six
+    # requests with none. The backlog counts as four requests, so 1 + 4 < 6
+    # and engine 0 wins; uncapped it would score 101 and lose.
+    client.lb_engines = [[0, 1, 0.0, 100_000], [0, 6, 0.0, 0]]
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+
+    # Past the cap the backlog stops mattering: equal scores again.
+    client.lb_engines = [[0, 4, 0.0, 100_000], [0, 8, 0.0, 0]]
+    client.eng_start_index = 0
+    assert (
+        client.get_core_engine_for_request(make_request(SamplingParams()))
+        == client.core_engines[0]
+    )
+
+
 def test_dplb_token_aware_uses_the_engine_reported_remainder():
     """The engine reports the prefill tokens it still has to compute, so a
     request served from cache does not count against the engine it lands on;

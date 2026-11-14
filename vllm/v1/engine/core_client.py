@@ -83,6 +83,16 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
 
+# Token-aware DP routing weighs an engine's unfinished prefill against its
+# request count, at VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens per request.
+# The weight is capped at this many requests: an engine already prefilling
+# several prompts' worth of tokens is simply busy, and scaling the score with
+# its whole backlog keeps it unroutable for the length of that prefill, so
+# every other engine piles up instead (measured in simulation: uncapped, a
+# staggered 32 x 16K run skews 10/8/7/7 and takes 25% longer than routing
+# without the term; capped, it stays 8/8/8/8 at the uncapped-off time).
+_DP_LB_MAX_PENDING_REQUESTS = 4.0
+
 
 def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
     """Copy of request with its prompt token ids as an int32 ndarray, which is
@@ -1874,11 +1884,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # tokens as are left, however few requests that is. The
                     # engine reports the remainder itself, with cache hits
                     # already taken out. Scale this client's share by the
-                    # clients, like the in-flight count.
-                    score += (
+                    # clients, like the in-flight count, and count at most
+                    # `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    score += min(
                         self.client_count
                         * pending_prefill_tokens
-                        / self.lb_prefill_tokens_per_request
+                        / self.lb_prefill_tokens_per_request,
+                        _DP_LB_MAX_PENDING_REQUESTS,
                     )
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache

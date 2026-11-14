@@ -1316,7 +1316,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
     ),
     # With VLLM_DP_LB_TOKEN_AWARE: how many pending prefill tokens weigh as much
-    # as one waiting/running request in an engine's score.
+    # as one waiting/running request in an engine's score. One engine's pending
+    # prefill counts for at most four requests, so a single long prompt cannot
+    # make it unroutable for the length of that prefill.
     "VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST": lambda: int(
         os.getenv("VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST", "2048")
     ),
