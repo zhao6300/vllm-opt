@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import logging
 import queue
 import sys
 import uuid
@@ -1847,6 +1848,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_engines = len(current_counts)
             min_score: float = sys.maxsize
             eng_index = 0
+            trace: list[tuple[int, int, int, float] | None] | None = None
+            if logger.isEnabledFor(logging.DEBUG):
+                trace = [None] * num_engines
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
@@ -1884,6 +1888,8 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # the penalty stays off, preserving exact round-robin.
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+                if trace is not None:
+                    trace[idx] = (waiting, running, pending_prefill_tokens, score)
                 if score < min_score:
                     min_score = score
                     eng_index = idx
@@ -1896,6 +1902,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             # fixed tie-break bias without affecting load-aware decisions when
             # scores actually differ.
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
+            if trace is not None:
+                logger.debug(
+                    "DP route %s (%d prompt tokens) -> engine %d: "
+                    "[waiting, running, pending prefill, score] %s",
+                    request.request_id,
+                    len(request.prompt_token_ids or ()),
+                    eng_index,
+                    trace,
+                )
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
