@@ -530,9 +530,9 @@ bounded-pool-executor==0.0.3 \
     --hash=sha256:6f164d64919db1e6a5c187cce281f62bc559a5fed4ce064942e650c227aef190 \
     --hash=sha256:e092221bc38ade555e1064831f9ed800580fa34a4b6d8e9dd3cd961549627f6e
     # via pqdm
-buildkite-test-collector==0.1.9 \
-    --hash=sha256:541d3dcbe8f6c69121ce2a12d61fbae0ae38243b666b380c8d48670a194e1ec5 \
-    --hash=sha256:d6437cfff5f9208b9786fbe0f67103dce11b3e6482769dc5e9deac8f050d2488
+buildkite-test-collector==1.9.1 \
+    --hash=sha256:586a40cc97540d3c45f5796d5e3b4f15d3174405425c9f19e403fca829e395c9 \
+    --hash=sha256:b22561c37c68589b6413107049117b4e41af0f1f1dc08d64d7f9fb598f4aadad
     # via -r requirements/test/cuda.in
 cachetools==5.5.2 \
     --hash=sha256:1a661caa9175d26759571b2e19580f9d6393969e5dfca11fdb1f947a23e640d4 \
