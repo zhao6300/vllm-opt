@@ -722,6 +722,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Page-footer scale layout of the V4.1 packed caches. Off for every
         # backend but SM120 FlashInfer's opt-in `cake` decode.
         self.kv_footer_scale = self.uses_footer_scale_layout()
+        if not self.kv_footer_scale and envs.VLLM_FLASHINFER_DSV41_SM120_CAKE:
+            logger.warning_once(
+                "VLLM_FLASHINFER_DSV41_SM120_CAKE is set but %s keeps the "
+                "inline-scale KV records; only the SM120/SM121 FlashInfer "
+                "sparse-MLA layer reads the page-footer layout.",
+                type(self).__name__,
+            )
 
         self.swa_bytes_per_token = _swa_bytes_per_token_for_cache_dtype(
             self.kv_cache_dtype,
