@@ -2757,6 +2757,25 @@ class DPEngineCoreProc(EngineCoreProc):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    def _align_prefill_cap_over_dp(self) -> None:
+        """Agree on the DP group's smallest prefill chunk.
+
+        Every MoE step waits for its slowest rank, so a rank whose budget
+        admits a long chunk makes the others idle. Taking the MIN keeps the
+        prefill work of a step equal across ranks. Runs with the DP state sync
+        (every `dp_sync_interval` steps), so the agreed cap can trail the local
+        one by that many steps.
+        """
+        scheduler = self.scheduler
+        if scheduler.prefill_cost_model is None or self.dp_group is None:
+            return
+        cap = scheduler.time_budget_prefill_cap()
+        if cap is None:
+            return
+        from vllm.distributed.utils import all_reduce_int
+
+        scheduler.set_prefill_cap_override(all_reduce_int(self.dp_group, cap))
+
     def _should_throttle_prefills(self) -> bool:
         # Throttle new prefills to cadence-aligned steps for DP balancing.
         # step_counter is identical across DP ranks. On a fresh wave the
@@ -2868,6 +2887,9 @@ class DPEngineCoreProc(EngineCoreProc):
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
         )
+        # Same cadence as the sync above: one more small collective per DP
+        # interval, not per step.
+        self._align_prefill_cap_over_dp()
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

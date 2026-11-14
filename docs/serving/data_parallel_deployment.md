@@ -98,7 +98,7 @@ Set `VLLM_PREFILL_STEP_BUDGET_MS` to a positive number of milliseconds to cap th
 fixed + per_token * (decode + prefill) + per_token_context * prefill * (context + prefill / 2)
 ```
 
-with the coefficients `VLLM_PREFILL_COST_FIXED_MS`, `VLLM_PREFILL_COST_MS_PER_TOKEN` (required) and `VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT` (default 0, a cost independent of the context). They have no defaults: fit them on the deployment from step times at several token counts. A step still carries at least `VLLM_PREFILL_MIN_CHUNK_TOKENS` (default 256) prefill tokens so a prefill advances under a heavy decode load, and chunks are rounded down to a block multiple. Each rank sizes its own chunks; ranks do not agree on a common budget. The budget combines with `--max-num-batched-tokens` and the other prefill caps by taking the tightest. It is off by default.
+with the coefficients `VLLM_PREFILL_COST_FIXED_MS`, `VLLM_PREFILL_COST_MS_PER_TOKEN` (required) and `VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT` (default 0, a cost independent of the context). They have no defaults: fit them on the deployment from step times at several token counts. A step still carries at least `VLLM_PREFILL_MIN_CHUNK_TOKENS` (default 256) prefill tokens so a prefill advances under a heavy decode load, and chunks are rounded down to a block multiple. Ranks agree on the group's smallest chunk (re-agreed with the DP state sync, every `VLLM_DP_SYNC_INTERVAL` steps), so a step does not wait on one rank's longer prefill while the others idle; each rank still prices its own decodes and context. The budget combines with `--max-num-batched-tokens` and the other prefill caps by taking the tightest. It is off by default.
 
 ## Hybrid Load Balancing
 

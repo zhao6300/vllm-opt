@@ -1348,7 +1348,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0")
     ),
     # Fewest prefill tokens a step with a time budget still carries, so a
-    # prefill advances when decodes alone fill the budget.
+    # prefill advances when decodes alone fill the budget. Across data parallel
+    # ranks the chunk size is the group's smallest, agreed with the DP state
+    # sync, so a step does not wait on one rank's longer chunk.
     "VLLM_PREFILL_MIN_CHUNK_TOKENS": lambda: int(
         os.getenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "256")
     ),

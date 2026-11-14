@@ -398,6 +398,9 @@ class Scheduler(SchedulerInterface):
         # Optional time budget per step (VLLM_PREFILL_STEP_BUDGET_MS): caps the
         # prefill tokens a step carries by a cost model instead of by tokens.
         self.prefill_cost_model = PrefillCostModel.from_env()
+        # Set by the DP engine core to the group's MIN cap, so every rank's
+        # step carries the same prefill work.
+        self.prefill_cap_override: int | None = None
         if self.prefill_cost_model is not None:
             logger.info(
                 "Prefill chunks are sized by a step time budget: %s",
@@ -698,7 +701,16 @@ class Scheduler(SchedulerInterface):
         """Most prefill tokens this step may carry, or None for no extra cap."""
         return self._time_budget_prefill_cap()
 
-    def _time_budget_prefill_cap(self) -> int | None:
+    def time_budget_prefill_cap(self) -> int | None:
+        """Prefill tokens this rank's time budget allows, ignoring the DP
+        group's agreement."""
+        return self._time_budget_prefill_cap(local_only=True)
+
+    def set_prefill_cap_override(self, cap: int | None) -> None:
+        """Use `cap` (the DP group's MIN) for this step, or compute locally."""
+        self.prefill_cap_override = cap
+
+    def _time_budget_prefill_cap(self, local_only: bool = False) -> int | None:
         """Prefill tokens that keep the step within its time budget.
 
         The step carries one token run per decoding request that is eligible
@@ -708,6 +720,8 @@ class Scheduler(SchedulerInterface):
         model = self.prefill_cost_model
         if model is None:
             return None
+        if self.prefill_cap_override is not None and not local_only:
+            return self.prefill_cap_override
         decode_tokens = 0
         context = 0
         for request in self.running:

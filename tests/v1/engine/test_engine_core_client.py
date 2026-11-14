@@ -1805,3 +1805,32 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
     # The pending tokens alone make the snapshot new, so a chunked prefill
     # advancing between steps is still published.
     assert core.last_counts == (2, 3, 4096, 1200)
+
+
+def test_dp_prefill_cap_is_agreed_over_the_group(monkeypatch):
+    """Each DP rank takes the group's smallest time-budget prefill chunk before
+    stepping, so no rank idles waiting for another's longer chunk."""
+    from vllm.v1.engine.core import DPEngineCoreProc
+
+    core = object.__new__(DPEngineCoreProc)
+    core.dp_group = object()  # any non-None group
+    calls = []
+
+    def fake_all_reduce_int(group, value, op=None):
+        calls.append((group, value))
+        return 64  # the group's MIN
+
+    monkeypatch.setattr("vllm.distributed.utils.all_reduce_int", fake_all_reduce_int)
+    core.scheduler = SimpleNamespace(
+        prefill_cost_model=object(),
+        time_budget_prefill_cap=lambda: 112,
+        set_prefill_cap_override=lambda cap: calls.append(("override", cap)),
+    )
+    core._align_prefill_cap_over_dp()
+    assert calls == [(core.dp_group, 112), ("override", 64)]
+
+    # No budget configured: no collective, no override.
+    calls.clear()
+    core.scheduler.prefill_cost_model = None
+    core._align_prefill_cap_over_dp()
+    assert calls == []

@@ -9297,3 +9297,28 @@ def test_pending_prefill_ms_prices_the_remainder_with_the_cost_model(monkeypatch
     plain.add_request(other)
     plain.schedule()
     assert plain.get_pending_prefill_ms() == 0.0
+
+
+def test_prefill_cap_override_is_the_dp_group_minimum(monkeypatch):
+    """The DP engine core hands the scheduler the group's MIN prefill chunk, so
+    every rank's step carries the same prefill work; the local computation is
+    still reachable for that agreement."""
+    monkeypatch.setenv("VLLM_PREFILL_STEP_BUDGET_MS", "1120")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "10")
+    monkeypatch.setenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "16")
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    local = scheduler.time_budget_prefill_cap()
+    assert local == 112
+    assert scheduler._prefill_token_cap() == local
+
+    scheduler.set_prefill_cap_override(48)
+    assert scheduler.time_budget_prefill_cap() == local
+    assert scheduler._prefill_token_cap() == 48
+    assert scheduler.schedule().num_scheduled_tokens["p0"] == 48
+
+    # No override: back to this rank's own budget.
+    scheduler.set_prefill_cap_override(None)
+    assert scheduler._prefill_token_cap() == local
