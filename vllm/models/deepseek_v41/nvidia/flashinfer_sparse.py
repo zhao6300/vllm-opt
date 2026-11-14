@@ -862,9 +862,12 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             get_cake_sparse_mla_sm120_dsv41_mixed_module()
             logger.info_once(
                 "Sparse MLA decode runs on FlashInfer's cake kernels "
-                "(VLLM_FLASHINFER_DSV41_SM120_CAKE): the V4.1 KV caches hold "
-                "page-footer scale records, so caches written by the default "
-                "inline records cannot be reused."
+                "(VLLM_FLASHINFER_DSV41_SM120_CAKE) for decode steps of up to "
+                "%d tokens; wider steps and prefill use the sparse kernels on "
+                "the same cache. The V4.1 KV caches hold page-footer scale "
+                "records, so caches written by the default inline records "
+                "cannot be reused.",
+                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
             )
         # The workspace is per device and shared by every layer, so size it here
         # (outside CUDA graph capture) for the widest plan this layer can ask for.
@@ -1132,6 +1135,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         if self.kv_footer_scale and (
             num_decode_tokens <= _FLASHINFER_DSV4_DECODE_MAX_TOKENS
         ):
+            logger.info_once(
+                "A decode step of at most %d tokens runs on the cake kernels.",
+                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+            )
             _cake_dsv41_sm120_paged_attention(
                 query=q,
                 swa_kv_cache=swa_cache,
@@ -1146,6 +1153,14 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 workspace=self._cake_workspace(),
             )
             return
+        if self.kv_footer_scale:
+            logger.info_once(
+                "A decode step of more than %d tokens runs on the sparse "
+                "kernels, not cake: the cake kernels take at most %d decode "
+                "tokens per step.",
+                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+                _FLASHINFER_DSV4_DECODE_MAX_TOKENS,
+            )
         _sparse_mla_sm120_paged_attention(
             query=q,
             swa_kv_cache=swa_cache,
