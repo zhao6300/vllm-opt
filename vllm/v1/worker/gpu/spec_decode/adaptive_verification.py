@@ -301,6 +301,11 @@ class AdaptiveVerificationManager:
         self._base_verify_curve: list[tuple[int, float]] = []
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
         self._batch_max_draft_budget = 0
+        # Survival probabilities of this step's draft candidates, best first.
+        self._batch_scores = np.empty(0, dtype=np.float64)
+        self._fill_padding = envs.VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING
+        self._fill_min_survival = envs.VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL
+        self._fill_min_rows = max(envs.VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS, 1)
         max_num_reqs = req_states.max_num_reqs
         # Current per-slot confidences
         self._confidence_probs = torch.empty(
@@ -592,6 +597,7 @@ class AdaptiveVerificationManager:
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
         scores = scores[:max_draft_budget]
+        self._batch_scores = scores
         draft_cost_ms, verify_cost_ms = self.cost_tables
         num_sampling_requests = np.count_nonzero(
             self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
@@ -632,11 +638,13 @@ class AdaptiveVerificationManager:
 
         The budget is chosen for this rank's token count, but under DP every
         rank replays the graph of the largest rank, so the rows up to
-        ``num_padded_tokens`` cost nothing extra. Returns the new token count,
-        or None when the budget is unchanged.
+        ``num_padded_tokens`` are cheaper than real rows but not free, so only
+        drafts with a survival probability of at least the configured minimum
+        are admitted. Returns the new token count, or None when the budget is
+        unchanged or filling is disabled.
         """
         batch_budget = self._batch_budget
-        if batch_budget is None:
+        if not self._fill_padding or batch_budget is None:
             return None
         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
         num_tokens = sum(num_non_draft_tokens_per_req.values()) + draft_budget
@@ -645,6 +653,11 @@ class AdaptiveVerificationManager:
             self._batch_max_draft_budget - draft_budget,
         )
         if extra <= 0:
+            return None
+        # Scores are sorted best first, so the qualifying ones are a prefix.
+        candidates = self._batch_scores[draft_budget : draft_budget + extra]
+        extra = int(np.count_nonzero(candidates >= self._fill_min_survival))
+        if extra < self._fill_min_rows:
             return None
         self._batch_budget = (
             num_drafts_per_req,

@@ -69,6 +69,20 @@ export VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL=64
 export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
 ```
 
+## Filling padded rows with drafts
+
+Under data parallelism every rank replays the FULL cudagraph of the largest rank, so a smaller rank's graph has padded rows beyond the draft budget it chose. Setting `VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1` admits the next-best drafts into those rows, which can raise the accepted length without lengthening the graph. Padded rows are cheaper than real ones (real rows read the KV cache, route to experts and are sampled), so the fill is limited:
+
+- `VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL` (default 0.1): only drafts whose estimated survival probability, the cumulative product of their confidences, reaches this value are admitted.
+- `VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS` (default 1): skip the fill when fewer rows than this would be added.
+
+The fill applies only to FULL cudagraph steps without microbatching or prefill context parallelism. It is off by default; compare throughput and mean accepted length (`1 + accepted / drafts`) with it on and off before enabling it.
+
+```bash
+export VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1
+export VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL=0.2
+```
+
 ## Tuning the cost profile
 
 Step costs are profiled against a synthetic KV context, 8192 tokens by default. Deployments serving much longer contexts may want to raise it so the profiled step reads a more realistic amount of cache (this matters a bit less for sparse attention models like DeepSeek-v4 since the cheap indexer is the main cost that scales with context length).

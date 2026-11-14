@@ -29,7 +29,11 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 
 
 def make_manager(
-    confidences: np.ndarray, verify_cost_ms: np.ndarray
+    confidences: np.ndarray,
+    verify_cost_ms: np.ndarray,
+    fill_padding: bool = True,
+    fill_min_survival: float = 0.0,
+    fill_min_rows: int = 1,
 ) -> AdaptiveVerificationManager:
     num_reqs, num_steps = confidences.shape
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
@@ -44,6 +48,9 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager._fill_padding = fill_padding
+    manager._fill_min_survival = fill_min_survival
+    manager._fill_min_rows = fill_min_rows
     return manager
 
 
@@ -636,6 +643,48 @@ def test_fill_graph_padding_admits_drafts_into_padded_rows():
     # Never beyond the scheduled drafts, and no change without spare rows.
     assert manager.fill_graph_padding(64) == 6
     assert manager.fill_graph_padding(6) is None
+
+
+def _fill_manager(**kwargs) -> AdaptiveVerificationManager:
+    # Survival probabilities, best first: 0.9, 0.81, 0.1, 0.01. The budget stops
+    # at one draft because verification past 3 tokens is 100x dearer.
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+        **kwargs,
+    )
+    assert (
+        manager.get_num_tokens({"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]})
+        == 3
+    )
+    return manager
+
+
+def test_fill_graph_padding_is_off_unless_enabled():
+    manager = _fill_manager(fill_padding=False)
+    assert manager.fill_graph_padding(64) is None
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 1
+
+
+def test_fill_graph_padding_skips_unlikely_drafts():
+    # Two padded rows are free, but only the 0.81 draft clears the 0.5 floor.
+    manager = _fill_manager(fill_min_survival=0.5)
+    assert manager.fill_graph_padding(5) == 4
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 2
+    # Nothing left above the floor.
+    assert manager.fill_graph_padding(64) is None
+
+    manager = _fill_manager(fill_min_survival=0.95)
+    assert manager.fill_graph_padding(64) is None
+
+
+def test_fill_graph_padding_needs_the_minimum_number_of_rows():
+    manager = _fill_manager(fill_min_survival=0.5, fill_min_rows=2)
+    assert manager.fill_graph_padding(5) is None
+    manager = _fill_manager(fill_min_survival=0.05, fill_min_rows=2)
+    assert manager.fill_graph_padding(5) == 5
 
 
 def test_fill_graph_padding_respects_the_rejection_sampler_chunk():

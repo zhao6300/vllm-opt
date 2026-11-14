@@ -68,6 +68,9 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
     VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
+    VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING: bool = False
+    VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL: float = 0.1
+    VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS: int = 1
     VLLM_DP_LB_TOKEN_AWARE: bool = False
     VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
     VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
@@ -1285,6 +1288,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With this set, the prompt tokens an engine has not finished prefilling
     # (this API server's requests, until their first output) add to its score,
     # so a long prompt avoids an engine already busy prefilling.
+    # Admit extra drafts into the rows a FULL cudagraph pads anyway (under DP,
+    # up to the largest rank's size). Off by default: padded rows are cheaper
+    # than real ones, so the extra drafts are not free.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING": lambda: bool(
+        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING", "0"))
+    ),
+    # With FILL_PADDING: only drafts whose estimated survival probability
+    # (cumulative confidence) is at least this are admitted into padded rows.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL": lambda: float(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_SURVIVAL", "0.1")
+    ),
+    # With FILL_PADDING: skip the fill when fewer rows than this would be added.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_MIN_ROWS", "1")
+    ),
     "VLLM_DP_LB_TOKEN_AWARE": lambda: bool(
         int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
     ),
