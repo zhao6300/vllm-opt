@@ -9262,3 +9262,38 @@ def test_pending_prefill_tokens_skip_the_prefix_cache_hit():
     assert scheduler.get_pending_prefill_tokens() == (
         second.num_prompt_tokens - second.num_computed_tokens
     )
+
+
+def test_pending_prefill_ms_prices_the_remainder_with_the_cost_model(monkeypatch):
+    """DP routing weighs an engine's backlog by modelled time when a step time
+    budget is configured: what is left of a prompt is priced by the context it
+    still attends over."""
+    monkeypatch.setenv("VLLM_PREFILL_STEP_BUDGET_MS", "600")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "0.02")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.000004")
+    scheduler = create_scheduler(max_num_batched_tokens=64, block_size=16)
+    model = scheduler.prefill_cost_model
+    assert model is not None
+
+    (request,) = create_requests(num_requests=1, num_tokens=200, block_size=16)
+    scheduler.add_request(request)
+    scheduler.schedule()
+    remaining = request.num_prompt_tokens - request.num_computed_tokens
+    assert remaining > 0
+    assert scheduler.get_pending_prefill_ms() == pytest.approx(
+        model.work_ms(remaining, request.num_computed_tokens)
+    )
+    # The same work priced linearly still ignores the context term.
+    assert model.work_ms(remaining, 0) < scheduler.get_pending_prefill_ms()
+
+    # Done prefilling: nothing left to price.
+    request.num_computed_tokens = request.num_prompt_tokens
+    assert scheduler.get_pending_prefill_ms() == 0.0
+
+    # Without a budget there is no cost model, so no ms price either.
+    monkeypatch.delenv("VLLM_PREFILL_STEP_BUDGET_MS")
+    plain = create_scheduler(max_num_batched_tokens=64, block_size=16)
+    (other,) = create_requests(num_requests=1, num_tokens=200, block_size=16)
+    plain.add_request(other)
+    plain.schedule()
+    assert plain.get_pending_prefill_ms() == 0.0

@@ -73,6 +73,17 @@ class PrefillCostModel:
             * (context + prefill_tokens / 2)
         )
 
+    def work_ms(self, prefill_tokens: int, context: int) -> float:
+        """Modelled time of prefilling `prefill_tokens` over `context`.
+
+        The per-step `fixed_ms` is left out: this prices work still owed by a
+        request, which DP load balancing compares across engines however the
+        engine batches it.
+        """
+        return self.ms_per_token * prefill_tokens + self.ms_per_token_context * (
+            prefill_tokens * (context + prefill_tokens / 2)
+        )
+
     def max_prefill_tokens(
         self, decode_tokens: int, context: int, align: int = 1
     ) -> int:

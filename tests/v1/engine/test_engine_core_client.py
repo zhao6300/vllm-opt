@@ -222,6 +222,7 @@ def _make_dplb_client(
     client.engine_inflight = Counter()
     client.token_aware_lb = token_aware
     client.lb_prefill_tokens_per_request = prefill_tokens_per_request
+    client.lb_step_budget_ms = 0.0
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
     # [waiting, running, kv_cache_usage, pending_prefill_tokens]
     client.lb_engines = [[0, 0, 0.0, 0] for _ in range(num_engines)]
@@ -498,6 +499,37 @@ def test_dplb_token_aware_uses_the_engine_reported_remainder():
         )
         == client.core_engines[1]
     )
+
+
+def test_dplb_token_aware_prices_the_backlog_in_budget_steps():
+    """With a prefill step time budget, the engine reports its backlog in
+    modelled ms and it is measured in steps of that budget: ten tokens left of
+    a long-context prompt can cost a whole step, while the token count reads as
+    nearly free."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_step_budget_ms = 600.0
+    # Engine 0 needs one more step of prefill (600 ms) and runs three
+    # requests; engine 1 runs four requests with nothing pending. Priced in
+    # steps: 3 + 1 == 4 ties with 4, and the rotating scan start decides.
+    client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
+    client.eng_start_index = 1
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
+
+    # The same snapshot without a budget prices the ten tokens as nothing:
+    # engine 0 scores 3 against 4 and wins.
+    client.lb_step_budget_ms = 0.0
+    client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
+    client.eng_start_index = 1
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+
+    # Three steps of pending work behind a single request lose to two requests.
+    client.lb_step_budget_ms = 600.0
+    client.lb_engines = [[0, 1, 0.0, 10, 1800.0], [0, 2, 0.0, 0, 0.0]]
+    client.eng_start_index = 0
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
 
 
 def test_dplb_without_token_aware_ignores_the_remainder():
@@ -1754,6 +1786,7 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
     core.scheduler = SimpleNamespace(
         get_request_counts=lambda: (2, 3),
         get_pending_prefill_tokens=lambda: 4096,
+        get_pending_prefill_ms=lambda: 1200.0,
         get_kv_cache_usage=lambda: 0.5,
     )
 
@@ -1762,6 +1795,7 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
     _, outputs = core.output_queue.get_nowait()
     stats = outputs.scheduler_stats
     assert stats.pending_prefill_tokens == 4096
+    assert stats.pending_prefill_ms == 1200.0
     assert stats.num_running_reqs == 2
     assert stats.num_waiting_reqs == 3
     assert stats.num_skipped_waiting_reqs == 0
@@ -1770,4 +1804,4 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
         assert (stats.step_counter, stats.current_wave) == (7, 3)
     # The pending tokens alone make the snapshot new, so a chunked prefill
     # advancing between steps is still published.
-    assert core.last_counts == (2, 3, 4096)
+    assert core.last_counts == (2, 3, 4096, 1200)

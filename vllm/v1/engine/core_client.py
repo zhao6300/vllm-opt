@@ -84,7 +84,11 @@ _R = TypeVar("_R")  # Return type for collective_rpc
 EngineIdentity = bytes
 
 # Token-aware DP routing weighs an engine's unfinished prefill against its
-# request count, at VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens per request.
+# request count. With a prefill step time budget configured, the engine reports
+# that backlog in modelled milliseconds and it is measured in steps of that
+# budget (`VLLM_PREFILL_STEP_BUDGET_MS`): a request that still has to attend
+# over a long context costs what it costs, not what it counts. Without a
+# budget, VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens weigh as one request.
 # The weight is capped at this many requests: an engine already prefilling
 # several prompts' worth of tokens is simply busy, and scaling the score with
 # its whole backlog keeps it unroutable for the length of that prefill, so
@@ -1818,6 +1822,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.lb_prefill_tokens_per_request = max(
             envs.VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST, 1
         )
+        # The engine prices its backlog in ms when a prefill step time budget
+        # is configured; the budget turns that into a number of steps.
+        self.lb_step_budget_ms = max(envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
 
         super().__init__(
             vllm_config,
@@ -1867,9 +1874,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 idx = (self.eng_start_index + i) % num_engines
                 counts = current_counts[idx]
                 waiting, running, kv_cache_usage = counts[:3]
-                # Snapshot tuples from before the prefill-token stat carry no
-                # fourth field.
+                # Snapshot tuples from before the prefill stats carry neither
+                # of the extra fields.
                 pending_prefill_tokens = counts[3] if len(counts) > 3 else 0
+                pending_prefill_ms = counts[4] if len(counts) > 4 else 0.0
                 # Estimate engine load as the greater of the coordinator's
                 # latest (waiting + running) snapshot and this client's own
                 # in-flight count (scaled by the number of clients). The
@@ -1880,17 +1888,20 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 inflight = self.engine_inflight[self.core_engines[idx]]
                 score: float = max(self.client_count * inflight, waiting + running)
                 if self.token_aware_lb:
-                    # Unfinished prefill occupies the engine's steps for as many
-                    # tokens as are left, however few requests that is. The
+                    # Unfinished prefill occupies the engine's steps for as
+                    # long as it takes, however few requests that is. The
                     # engine reports the remainder itself, with cache hits
                     # already taken out. Scale this client's share by the
                     # clients, like the in-flight count, and count at most
                     # `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    if self.lb_step_budget_ms > 0 and pending_prefill_ms > 0:
+                        pending_load = pending_prefill_ms / self.lb_step_budget_ms
+                    else:
+                        pending_load = (
+                            pending_prefill_tokens / self.lb_prefill_tokens_per_request
+                        )
                     score += min(
-                        self.client_count
-                        * pending_prefill_tokens
-                        / self.lb_prefill_tokens_per_request,
-                        _DP_LB_MAX_PENDING_REQUESTS,
+                        self.client_count * pending_load, _DP_LB_MAX_PENDING_REQUESTS
                     )
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache
@@ -1901,7 +1912,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
                 if trace is not None:
-                    trace[idx] = (waiting, running, pending_prefill_tokens, score)
+                    trace[idx] = (
+                        waiting,
+                        running,
+                        round(pending_prefill_ms, 1),
+                        score,
+                    )
                 if score < min_score:
                     min_score = score
                     eng_index = idx
@@ -1917,7 +1933,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             if trace is not None:
                 logger.debug(
                     "DP route %s (%d prompt tokens) -> engine %d: "
-                    "[waiting, running, pending prefill, score] %s",
+                    "[waiting, running, pending prefill ms, score] %s",
                     request.request_id,
                     len(request.prompt_token_ids or ()),
                     eng_index,

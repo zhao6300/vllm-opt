@@ -1390,7 +1390,7 @@ class EngineCoreProc(EngineCore):
             # Only publish request queue stats to coordinator for "internal"
             # and "hybrid" LB modes.
             self.publish_dp_lb_stats = internal_dp_balancing
-            self.last_counts = (0, 0, 0)
+            self.last_counts = (0, 0, 0, 0)
 
             self.addresses = addresses
             self.process_input_queue_block = True
@@ -1821,6 +1821,7 @@ class EngineCoreProc(EngineCore):
         counts = (
             *self.scheduler.get_request_counts(),
             self.scheduler.get_pending_prefill_tokens(),
+            round(self.scheduler.get_pending_prefill_ms()),
         )
         if counts != self.last_counts:
             self.last_counts = counts
@@ -1828,6 +1829,7 @@ class EngineCoreProc(EngineCore):
                 num_running_reqs=counts[0],
                 num_waiting_reqs=counts[1],
                 pending_prefill_tokens=counts[2],
+                pending_prefill_ms=float(counts[3]),
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
@@ -2740,6 +2742,7 @@ class DPEngineCoreProc(EngineCoreProc):
         counts = (
             *self.scheduler.get_request_counts(),
             self.scheduler.get_pending_prefill_tokens(),
+            round(self.scheduler.get_pending_prefill_ms()),
         )
         if counts != self.last_counts:
             self.last_counts = counts
@@ -2747,6 +2750,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 num_running_reqs=counts[0],
                 num_waiting_reqs=counts[1],
                 pending_prefill_tokens=counts[2],
+                pending_prefill_ms=float(counts[3]),
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,

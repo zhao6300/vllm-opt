@@ -3070,6 +3070,27 @@ class Scheduler(SchedulerInterface):
             + len(self.async_kv_waiting)
         )
 
+    def get_pending_prefill_ms(self) -> float:
+        """Modelled time of the prefill this engine has not finished.
+
+        Priced with the step time budget's cost model, so a request whose
+        remaining tokens attend over a long context weighs by its cost rather
+        than by its token count.
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return 0.0
+        total = 0.0
+        for request in itertools.chain(
+            self.running, self.waiting, self.kv_holding_waiting
+        ):
+            if request.is_finished():
+                continue
+            remaining = request.num_prompt_tokens - request.num_computed_tokens
+            if remaining > 0:
+                total += model.work_ms(remaining, request.num_computed_tokens)
+        return total
+
     def get_pending_prefill_tokens(self) -> int:
         """Prompt tokens this engine has not finished prefilling.
 
@@ -3458,6 +3479,7 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
             pending_prefill_tokens=self.get_pending_prefill_tokens(),
+            pending_prefill_ms=self.get_pending_prefill_ms(),
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,

@@ -1293,11 +1293,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Data-parallel load balancing by pending prefill work. By default a new
     # request goes to the engine with the fewest waiting + running requests.
-    # With this set, the prompt tokens an engine reports it has not finished
-    # prefilling add to its score, so a long prompt avoids an engine already
-    # busy prefilling. The engine reports the remainder after cache hits, so a
-    # cached prompt costs only the tokens it still has to compute; a request
-    # that has not been scheduled yet counts in full.
+    # With this set, the prefill an engine reports it has not finished adds to
+    # its score, so a long prompt avoids an engine already busy prefilling. The
+    # engine reports the remainder after cache hits, so a cached prompt costs
+    # only what it still has to compute (a request that has not been scheduled
+    # yet counts in full). With VLLM_PREFILL_STEP_BUDGET_MS set, that remainder
+    # is priced in modelled milliseconds and measured in steps of the budget,
+    # so what is left of a long-context prompt weighs by its cost; without a
+    # budget it is priced in VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens.
     # Admit extra drafts into the rows a FULL cudagraph pads anyway (under DP,
     # up to the largest rank's size). Off by default: padded rows are cheaper
     # than real ones, so the extra drafts are not free.
