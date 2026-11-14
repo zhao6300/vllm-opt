@@ -235,6 +235,15 @@ class SchedulerStats:
     step_counter: int = 0
     current_wave: int = 0
 
+    pending_prefill_tokens: int = 0
+    """Prompt tokens this engine has not finished prefilling.
+
+    The remainder of every waiting or running request, so a request served
+    from a prefix cache or a KV connector counts only the tokens left to
+    compute. Internal DP load balancing scores an engine by it: a long prompt
+    occupies the steps of whoever prefills it, however few requests that is.
+    """
+
     kv_cache_usage: float = 0.0
     iteration_details: SchedulerIterationDetails | None = None
 

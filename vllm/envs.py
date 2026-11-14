@@ -1293,9 +1293,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Data-parallel load balancing by pending prefill work. By default a new
     # request goes to the engine with the fewest waiting + running requests.
-    # With this set, the prompt tokens an engine has not finished prefilling
-    # (this API server's requests, until their first output) add to its score,
-    # so a long prompt avoids an engine already busy prefilling.
+    # With this set, the prompt tokens an engine reports it has not finished
+    # prefilling add to its score, so a long prompt avoids an engine already
+    # busy prefilling. The engine reports the remainder after cache hits, so a
+    # cached prompt costs only the tokens it still has to compute; a request
+    # that has not been scheduled yet counts in full.
     # Admit extra drafts into the rows a FULL cudagraph pads anyway (under DP,
     # up to the largest rank's size). Off by default: padded rows are cheaper
     # than real ones, so the extra drafts are not free.

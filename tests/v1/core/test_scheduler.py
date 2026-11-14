@@ -9213,3 +9213,52 @@ def test_step_time_budget_is_off_by_default(monkeypatch):
     output = scheduler.schedule()
 
     assert output.num_scheduled_tokens["p0"] == 3000
+
+
+def test_pending_prefill_tokens_track_the_unfinished_remainder():
+    """The engine reports what it still has to compute, for DP load balancing:
+    chunk by chunk down to zero once the prompt is done."""
+    scheduler = create_scheduler(max_num_batched_tokens=64, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=200, block_size=16)
+    assert scheduler.get_pending_prefill_tokens() == 0
+
+    scheduler.add_request(request)
+    out = scheduler.schedule()
+    computed = out.num_scheduled_tokens[request.request_id]
+    assert computed < 200
+    assert scheduler.get_pending_prefill_tokens() == 200 - computed
+    # The load snapshot the DP coordinator forwards carries the same number.
+    assert scheduler.make_stats().pending_prefill_tokens == 200 - computed
+
+    scheduler.update_from_output(
+        out, ModelRunnerOutput(req_ids=[request.request_id], sampled_token_ids=[[]])
+    )
+    out = scheduler.schedule()
+    assert scheduler.get_pending_prefill_tokens() == 200 - request.num_computed_tokens
+
+    # Prefill done: the request decodes and carries no pending prefill.
+    request.num_computed_tokens = request.num_prompt_tokens
+    assert scheduler.get_pending_prefill_tokens() == 0
+
+
+def test_pending_prefill_tokens_skip_the_prefix_cache_hit():
+    """A cached prefix is not work the engine still owes, so a request served
+    from the cache is charged only for its uncached tail."""
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, enable_prefix_caching=True
+    )
+    first, second = create_requests(
+        num_requests=2, num_tokens=200, same_prompt=True, block_size=16
+    )
+    scheduler.add_request(first)
+    out = scheduler.schedule()
+    scheduler.update_from_output(
+        out, ModelRunnerOutput(req_ids=[first.request_id], sampled_token_ids=[[]])
+    )
+
+    scheduler.add_request(second)
+    out = scheduler.schedule()
+    assert second.num_computed_tokens > 0  # hit the cached prefix
+    assert scheduler.get_pending_prefill_tokens() == (
+        second.num_prompt_tokens - second.num_computed_tokens
+    )

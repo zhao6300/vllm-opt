@@ -1390,7 +1390,7 @@ class EngineCoreProc(EngineCore):
             # Only publish request queue stats to coordinator for "internal"
             # and "hybrid" LB modes.
             self.publish_dp_lb_stats = internal_dp_balancing
-            self.last_counts = (0, 0)
+            self.last_counts = (0, 0, 0)
 
             self.addresses = addresses
             self.process_input_queue_block = True
@@ -1815,12 +1815,20 @@ class EngineCoreProc(EngineCore):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
-        counts = self.scheduler.get_request_counts()
+        # Publish our request counts (if they've changed). The pending prefill
+        # tokens change on their own while a chunked prefill advances, so they
+        # are part of the change key.
+        counts = (
+            *self.scheduler.get_request_counts(),
+            self.scheduler.get_pending_prefill_tokens(),
+        )
         if counts != self.last_counts:
             self.last_counts = counts
             stats = SchedulerStats(
-                *counts, kv_cache_usage=self.scheduler.get_kv_cache_usage()
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                pending_prefill_tokens=counts[2],
+                kv_cache_usage=self.scheduler.get_kv_cache_usage(),
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
@@ -2726,12 +2734,19 @@ class DPEngineCoreProc(EngineCoreProc):
             return
 
         # Publish our request counts (if they've changed), stamped with the
-        # lockstep-synchronized step counter and wave number.
-        counts = self.scheduler.get_request_counts()
+        # lockstep-synchronized step counter and wave number. The pending
+        # prefill tokens change on their own while a chunked prefill advances,
+        # so they are part of the change key.
+        counts = (
+            *self.scheduler.get_request_counts(),
+            self.scheduler.get_pending_prefill_tokens(),
+        )
         if counts != self.last_counts:
             self.last_counts = counts
             stats = SchedulerStats(
-                *counts,
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                pending_prefill_tokens=counts[2],
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,

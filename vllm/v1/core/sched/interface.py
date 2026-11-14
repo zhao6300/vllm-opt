@@ -253,6 +253,14 @@ class SchedulerInterface(ABC):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return 0.0
 
+    def get_pending_prefill_tokens(self) -> int:
+        """Prompt tokens this engine has not finished prefilling.
+
+        Published with the request counts so internal DP load balancing can
+        score an engine by the work its prefills still carry.
+        """
+        return 0
+
     @abstractmethod
     def make_stats(self) -> "SchedulerStats | None":
         """Make a SchedulerStats object for logging.

@@ -3070,6 +3070,21 @@ class Scheduler(SchedulerInterface):
             + len(self.async_kv_waiting)
         )
 
+    def get_pending_prefill_tokens(self) -> int:
+        """Prompt tokens this engine has not finished prefilling.
+
+        `num_computed_tokens` counts what a prefix cache or KV connector
+        already supplied, so a request served from cache carries only its
+        remainder; a decoding request carries none.
+        """
+        return sum(
+            max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            for request in itertools.chain(
+                self.running, self.waiting, self.kv_holding_waiting
+            )
+            if not request.is_finished()
+        )
+
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
@@ -3442,6 +3457,7 @@ class Scheduler(SchedulerInterface):
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
+            pending_prefill_tokens=self.get_pending_prefill_tokens(),
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
