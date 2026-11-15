@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
     VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING: bool = False
     VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO: float = 0.5
@@ -1280,6 +1281,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tables from measured timings. 0 keeps the startup profile only.
     "VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL", "0")
+    ),
+    # Runner steps between the timed steps that feed that refresh; 0 takes a
+    # 64th of the refresh interval. Each size needs a few timings before it
+    # replaces its startup cost, so a long interval wants a short sampling one.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL", "0")
     ),
     # Timed samples kept per (request count / token count) bucket when
     # refreshing the tables. Larger windows track slower drift but react less

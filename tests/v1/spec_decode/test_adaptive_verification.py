@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import deque
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -20,7 +19,6 @@ from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
-    _merge_cost_curves,
     _merge_rank_curves,
     assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
@@ -309,6 +307,7 @@ def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
         )
         for batch in manager.batches_to_profile([8, 1024])
     ]
+    manager._online_interval = 0
     manager.set_initial_cost_curves(timings)
 
     # Tail beyond the last capture size: 1.5x then doubling to the max.
@@ -480,15 +479,6 @@ def test_merge_rank_curves_keeps_the_slowest_stage_per_shape():
     assert _merge_rank_curves([[(8, 0.0)], [(8, 4.0)]]) == [(8, 4.0)]
     assert _merge_rank_curves([[(8, 0.0)], []]) == [(8, 0.0)]
     assert _merge_rank_curves([]) == []
-
-
-def test_merge_cost_curves_keeps_sparse_buckets_on_the_startup_point():
-    base = [(1, 10.0), (4, 40.0)]
-    buckets = {
-        4: deque([2.0, 6.0, 10.0, 14.0]),
-        8: deque([1.0, 2.0, 3.0]),
-    }
-    assert _merge_cost_curves(base, buckets) == [(1, 10.0), (4, 8.0)]
 
 
 class _FakeCudaEvent:
@@ -666,6 +656,108 @@ def test_fill_graph_padding_at_zero_cost_fills_every_spare_row():
     manager = _fill_manager(fill_cost_ratio=0.0)
     assert manager.fill_graph_padding(5) == 5
     assert manager.fill_graph_padding(64) == 6
+
+
+def _staircase_manager(fill_cost_ratio: float, num_reqs: int = 16):
+    """16 requests with 5 drafts each on a cost table that grows 4 ms per 16-token
+    graph, as the cost tables do below the capture limit."""
+    num_steps = 5
+    confidences = np.random.default_rng(1).uniform(
+        0.35, 0.75, size=(num_reqs, num_steps)
+    )
+    confidences = confidences.astype(np.float32)
+    sizes = np.arange(600)
+    verify_cost_ms = 10.0 + np.ceil(np.maximum(sizes, 1) / 16.0) * 4.0
+    manager = make_manager(confidences, verify_cost_ms, fill_cost_ratio=fill_cost_ratio)
+    manager.req_states = SimpleNamespace(
+        req_id_to_index={f"r{i}": i for i in range(num_reqs)},
+        num_computed_tokens_np=np.ones(num_reqs, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.ones(num_reqs, dtype=np.int32)),
+    )
+    manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
+    tokens = {f"r{i}": 1 + num_steps for i in range(num_reqs)}
+    drafts = {f"r{i}": list(range(num_steps)) for i in range(num_reqs)}
+    return manager, manager.get_num_tokens(tokens, drafts)
+
+
+@pytest.mark.parametrize("padded_rows", [8, 16, 32, 64])
+def test_fill_graph_padding_is_not_blocked_by_the_cost_table_staircase(padded_rows):
+    # Past the graph the budget stopped at, the next row of the table jumps by a
+    # whole graph step; charged to that one row it would refuse every fill even
+    # though the rows after it cost nothing more.
+    baseline, own_tokens = _staircase_manager(fill_cost_ratio=0.0)
+    manager, _ = _staircase_manager(fill_cost_ratio=0.05)
+
+    filled = manager.fill_graph_padding(own_tokens + padded_rows)
+
+    assert filled is not None
+    assert own_tokens < filled <= own_tokens + padded_rows
+    assert filled <= baseline.fill_graph_padding(own_tokens + padded_rows)
+
+
+def test_fill_graph_padding_admits_fewer_drafts_as_padded_rows_cost_more():
+    rows = []
+    for ratio in (0.0, 0.05, 0.5, 1.0, 100.0):
+        manager, own_tokens = _staircase_manager(fill_cost_ratio=ratio)
+        filled = manager.fill_graph_padding(own_tokens + 64)
+        rows.append(0 if filled is None else filled - own_tokens)
+
+    assert rows == sorted(rows, reverse=True)
+    assert rows[0] == 64  # every draft that is left
+    assert rows[-1] == 0  # a row priced at 100x admits nothing
+
+
+def fill_consensus_worker(rank: int, world_size: int, store: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{store}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    parallel_state._TP = parallel_state.GroupCoordinator(
+        group_ranks=[list(range(world_size))],
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        use_device_communicator=False,
+        group_name="tp",
+    )
+    # Rank 0 sees confident drafts, the others hopeless ones, so ranks would
+    # count different drafts worth a padded row if each decided for itself.
+    confidence = 0.9 if rank == 0 else 0.02
+    confidences = np.full((8, 4), confidence, dtype=np.float32)
+    sizes = np.arange(200)
+    manager = make_manager(
+        confidences,
+        10.0 + np.ceil(np.maximum(sizes, 1) / 16.0) * 4.0,
+        fill_cost_ratio=0.5,
+    )
+    manager.req_states = SimpleNamespace(
+        req_id_to_index={f"r{i}": i for i in range(8)},
+        num_computed_tokens_np=np.ones(8, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.ones(8, dtype=np.int32)),
+    )
+    manager.cost_tables = (np.zeros(9), manager.cost_tables[1])
+    tokens = {f"r{i}": 5 for i in range(8)}
+    drafts = {f"r{i}": [0, 1, 2, 3] for i in range(8)}
+    manager.get_num_tokens(tokens, drafts)
+    fills = manager.fill_graph_padding(160)
+    gathered: list = [None] * world_size
+    dist.all_gather_object(gathered, fills)
+    parallel_state._TP.destroy()
+    dist.destroy_process_group()
+    assert all(fill == gathered[0] for fill in gathered), gathered
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_tp_ranks_agree_on_how_many_drafts_fill_the_padding(world_size, tmp_path):
+    """Each TP rank reads its own confidences, so the count of drafts worth a
+    padded row travels with the budget and every rank fills the same rows."""
+    mp.spawn(
+        fill_consensus_worker,
+        args=(world_size, str(tmp_path / "store")),
+        nprocs=world_size,
+    )
 
 
 def test_fill_graph_padding_respects_the_rejection_sampler_chunk():

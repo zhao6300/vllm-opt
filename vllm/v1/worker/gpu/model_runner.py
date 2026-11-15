@@ -753,7 +753,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ),
         )
         if self.adaptive_verification is not None:
-            self.step_timing.enable_sampling(self.adaptive_verification.online_interval)
+            self.step_timing.enable_sampling(self.adaptive_verification.sample_interval)
 
         self.block_tables = BlockTables(
             block_sizes=[g.block_size for g in kv_cache_groups],

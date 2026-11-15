@@ -61,11 +61,14 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 ## Refreshing the cost profile during serving
 
-The startup profile can drift from what the server actually measures: another process can share the GPU, clocks change, and the served batch mix may not look like the profiled one. Setting `VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL` (in runner steps) times one step every N steps without synchronizing the device and folds the completed samples into the cost curves. Each batch shape keeps the median of its last `VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW` samples (default 256), and a shape needs at least four samples before it replaces the startup value. `0` (the default) keeps the startup profile only.
+The startup profile can drift from what the server actually measures: another process can share the GPU, clocks change, and the served batch mix may not look like the profiled one. Setting `VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL` (in runner steps) rebuilds the cost curves from live timings every N steps. One step in every `VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL` is timed without synchronizing the device (default a 64th of the rebuild interval, at least 1). Each batch shape keeps the median of its last `VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW` samples (default 256), and a shape needs at least four samples before it replaces the startup value, so the sampling interval has to be short enough for a shape to collect four between rebuilds, or across a few of them. `0` (the default) keeps the startup profile only.
+
+The refresh never stops the step loop. The medians and the table build run on a worker thread. The ranks exchange their curves with asynchronous CPU collectives that the loop only issues, on a schedule counted in served steps: TP ranks take rank 0's curves, then PP stages take the slowest stage's cost per shape. The new tables are installed on a fixed step, at most `3 * 8` steps after the rebuild began, so every rank switches together. The loop waits only if a stage has not finished by its step, which is rare with a lag of several steps.
 
 ```bash
-# Re-measure the cost tables every 64 steps.
-export VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL=64
+# Rebuild the cost tables every 1024 steps, timing one step in 16.
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL=1024
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL=16
 export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
 ```
 
@@ -73,7 +76,7 @@ export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
 
 Under data parallelism every rank replays the FULL cudagraph of the largest rank, so a smaller rank's graph has padded rows beyond the draft budget it chose. Setting `VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1` admits the next-best drafts into those rows, which can raise the accepted length without lengthening the graph. Padded rows are cheaper than real ones (real rows read the KV cache, route to experts and are sampled), so the fill is priced rather than unconditional.
 
-The threshold comes from the cost tables, so there is no survival floor to tune. A draft is admitted into a padded row while its survival probability (the cumulative product of its confidences) is at least `VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO` times the cost tables' price of that row, multiplied by the step's best accepted tokens per millisecond. The ratio is what a padded row costs as a fraction of a real row (default 0.5): `0` fills every spare row, and `1` prices padded rows like real ones, which is the rule the budget already stopped at, so almost nothing is admitted.
+The threshold comes from the cost tables, so there is no survival floor to tune. A draft is admitted into a padded row while its survival probability (the cumulative product of its confidences) is at least `VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO` times the average price of a row among the drafts left, multiplied by the step's best accepted tokens per millisecond. The average price is used because the cost tables are staircases (cost changes only between graph sizes), so the price of one row alone would be a whole graph step. The ratio is what a padded row costs as a fraction of a real row (default 0.5): `0` fills every spare row, and a large ratio admits nothing. The number of drafts that qualify is chosen with the draft budget and agreed across TP ranks with it, so every rank fills the same rows.
 
 The fill applies only to FULL cudagraph steps without microbatching or prefill context parallelism. It is off by default; compare throughput and mean accepted length (`1 + accepted / drafts`) with it on and off before enabling it.
 

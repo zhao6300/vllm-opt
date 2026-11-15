@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
 
@@ -23,11 +23,12 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_query_lens_mismatch_unsupported_backend,
     get_varlen_cudagraph_unsupported_backend,
 )
+from vllm.v1.worker.gpu.spec_decode.cost_refresh import CostRefresher
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
-# Live buckets with fewer samples keep the startup profile value.
-_ONLINE_MIN_BUCKET_SAMPLES = 4
+# Timed steps per rebuild when the sampling interval is not set.
+_SAMPLES_PER_REBUILD = 64
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -213,23 +214,6 @@ def build_cost_tables_from_curves(
     return draft_table, verify_table
 
 
-def _merge_cost_curves(
-    base: list[tuple[int, float]],
-    buckets: dict[int, deque[float]],
-    min_samples: int = _ONLINE_MIN_BUCKET_SAMPLES,
-) -> list[tuple[int, float]]:
-    """Replace startup cost-curve points with measured medians.
-
-    Keys with fewer than `min_samples` live samples keep the startup value,
-    so one noisy step cannot move a table.
-    """
-    merged = dict(base)
-    for key, values in buckets.items():
-        if len(values) >= min_samples:
-            merged[key] = float(np.median(values))
-    return sorted(merged.items())
-
-
 def _merge_rank_curves(
     curves: Iterable[list[tuple[int, float]]],
 ) -> list[tuple[int, float]]:
@@ -289,23 +273,16 @@ class AdaptiveVerificationManager:
         # counts runner steps, not drained samples, so every TP rank rebuilds
         # on the same step and set_cost_curves' broadcast stays in lockstep.
         self._online_interval = envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL
-        window = max(envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW, 1)
-        self._online_draft: dict[int, deque[float]] = defaultdict(
-            lambda: deque(maxlen=window)
+        self._sample_interval = (
+            envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL
+            or max(self._online_interval // _SAMPLES_PER_REBUILD, 1)
         )
-        self._online_verify: dict[int, deque[float]] = defaultdict(
-            lambda: deque(maxlen=window)
-        )
-        self._online_steps = 0
-        self._base_draft_curve: list[tuple[int, float]] = []
-        self._base_verify_curve: list[tuple[int, float]] = []
+        self._refresher: CostRefresher | None = None
         self._batch_budget: tuple[dict[str, int], dict[str, int], int] | None = None
         self._batch_max_draft_budget = 0
-        # This step's draft candidates (survival probabilities, best first), the
-        # step cost at each draft budget, and the best accepted tokens per ms.
-        self._batch_scores = np.empty(0, dtype=np.float64)
-        self._batch_costs = np.empty(0, dtype=np.float64)
-        self._batch_best_rate = 0.0
+        # Drafts beyond the budget that are worth a padded row (see
+        # `get_num_tokens`); agreed across TP ranks with the budget.
+        self._batch_fill_candidates = 0
         self._fill_padding = envs.VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING
         self._fill_cost_ratio = max(envs.VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO, 0)
         max_num_reqs = req_states.max_num_reqs
@@ -418,14 +395,29 @@ class AdaptiveVerificationManager:
         verify_curve = median_curve(
             (s.num_target_tokens, s.forward_ms) for s in samples
         )
-        self._base_draft_curve = draft_curve
-        self._base_verify_curve = verify_curve
         self.set_cost_curves(draft_curve, verify_curve)
+        if self._online_interval > 0:
+            max_batch_tokens = self.req_states.max_num_batched_tokens
+            max_num_reqs = self.req_states.max_num_reqs
+            self._refresher = CostRefresher(
+                draft_curve,
+                verify_curve,
+                max_num_reqs,
+                max_batch_tokens,
+                self._online_interval,
+                max(envs.VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW, 1),
+                lambda draft, verify: build_cost_tables_from_curves(
+                    draft, verify, max_num_reqs, max_batch_tokens, self._cudagraph_limit
+                ),
+                self.install_cost_tables,
+                get_tp_group(),
+                get_pp_group(),
+            )
 
     @property
-    def online_interval(self) -> int:
-        """Runner steps between live cost-table refreshes; 0 disables them."""
-        return self._online_interval
+    def sample_interval(self) -> int:
+        """Runner steps between timed steps; 0 when live refreshes are off."""
+        return self._sample_interval if self._online_interval > 0 else 0
 
     @property
     def confidences(self) -> torch.Tensor:
@@ -438,25 +430,21 @@ class AdaptiveVerificationManager:
         return self._remote_confidences
 
     def observe_timings(self, samples: list[StepTimingSample]) -> None:
-        """Fold live step timings into the startup cost curves.
+        """Count a served step and hand it the timings of the finished ones.
 
-        Buckets with too few samples keep the startup value, so a rare batch
-        shape cannot rebuild a table from a single noisy measurement.
+        The live cost refresh never runs here: the refresher exchanges the
+        ranks' curves with asynchronous collectives on a fixed schedule and
+        builds the tables on a worker thread, so this only queues the samples.
         """
-        if self._online_interval <= 0 or self.cost_tables is None:
+        if self._refresher is None:
             return
-        for sample in samples:
-            self._online_verify[sample.num_target_tokens].append(sample.forward_ms)
-            if sample.full_cudagraph:
-                self._online_draft[sample.num_reqs].append(sample.drafter_ms)
-        self._online_steps += 1
-        if self._online_steps < self._online_interval:
-            return
-        self._online_steps = 0
-        self.set_cost_curves(
-            _merge_cost_curves(self._base_draft_curve, self._online_draft),
-            _merge_cost_curves(self._base_verify_curve, self._online_verify),
-        )
+        self._refresher.observe(samples)
+        self._refresher.tick()
+
+    def install_cost_tables(self, tables: tuple[np.ndarray, np.ndarray]) -> None:
+        """Use new cost tables from the next step on."""
+        self.cost_tables = tables
+        logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def set_cost_curves(
         self,
@@ -599,7 +587,6 @@ class AdaptiveVerificationManager:
             max(0, self._max_total_logits - num_reqs * self.num_bonus_tokens),
         )
         scores = scores[:max_draft_budget]
-        self._batch_scores = scores
         draft_cost_ms, verify_cost_ms = self.cost_tables
         num_sampling_requests = np.count_nonzero(
             self.req_states.num_computed_tokens_np[slots] + num_non_draft_tokens
@@ -626,10 +613,16 @@ class AdaptiveVerificationManager:
         }
         rates = num_tokens_to_estimated_accepted_tokens / costs
         draft_budget = int(np.argmax(rates))
-        self._batch_costs = costs
-        self._batch_best_rate = float(rates[draft_budget])
+        fill_candidates = 0
+        if self._fill_padding:
+            fill_candidates = self._count_fill_candidates(
+                scores, costs, draft_budget, float(rates[draft_budget])
+            )
         # Rank-local confidences must not select different TP execution sizes.
-        draft_budget = get_tp_group().broadcast_object(draft_budget, src=0)
+        draft_budget, fill_candidates = get_tp_group().broadcast_object(
+            (draft_budget, fill_candidates), src=0
+        )
+        self._batch_fill_candidates = fill_candidates
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -644,10 +637,9 @@ class AdaptiveVerificationManager:
         The budget is chosen for this rank's token count, but under DP every
         rank replays the graph of the largest rank, so the rows up to
         ``num_padded_tokens`` are cheaper than real rows. They are not free, so
-        a draft is admitted only while its survival probability is at least
-        the padded-row cost ratio times the cost tables' price of its row at
-        the step's best accepted tokens per ms. Returns the new token count,
-        or None when the budget is unchanged or filling is disabled.
+        only the drafts `get_num_tokens` found worth a padded row are admitted.
+        Returns the new token count, or None when the budget is unchanged or
+        filling is disabled.
         """
         batch_budget = self._batch_budget
         if not self._fill_padding or batch_budget is None:
@@ -657,16 +649,8 @@ class AdaptiveVerificationManager:
         extra = min(
             num_padded_tokens - num_tokens,
             self._batch_max_draft_budget - draft_budget,
+            self._batch_fill_candidates,
         )
-        if extra <= 0:
-            return None
-        # Scores are sorted best first; take the prefix whose rows pay off.
-        end = draft_budget + extra
-        row_prices = np.diff(self._batch_costs[draft_budget : end + 1])
-        pays_off = self._batch_scores[draft_budget:end] >= (
-            self._fill_cost_ratio * self._batch_best_rate * row_prices
-        )
-        extra = extra if pays_off.all() else int(np.argmin(pays_off))
         if extra <= 0:
             return None
         self._batch_budget = (
@@ -674,7 +658,42 @@ class AdaptiveVerificationManager:
             num_non_draft_tokens_per_req,
             draft_budget + extra,
         )
+        self._batch_fill_candidates -= extra
         return num_tokens + extra
+
+    def _count_fill_candidates(
+        self,
+        scores: np.ndarray,
+        costs: np.ndarray,
+        draft_budget: int,
+        best_rate: float,
+    ) -> int:
+        """Count the drafts beyond the budget that are worth a padded row.
+
+        A draft pays for its row when its survival probability reaches the
+        padded-row cost ratio times the price of a row at the step's best
+        accepted tokens per ms. The price is the average over the remaining
+        candidates, not the jump at the next graph size: the cost tables are
+        staircases, so a per-row price would charge a whole graph step to one
+        row. Depends only on values every TP rank agrees on after the
+        broadcast of this count together with the budget.
+
+        Args:
+            scores: Survival probabilities of the candidates, best first.
+            costs: Step cost for each draft budget, from none to all.
+            draft_budget: The budget chosen for this rank's own token count.
+            best_rate: Accepted tokens per ms at that budget.
+
+        Returns:
+            How many of the candidates after the budget qualify.
+
+        """
+        remaining = len(scores) - draft_budget
+        if remaining <= 0:
+            return 0
+        price = max(float(costs[len(scores)] - costs[draft_budget]), 0.0) / remaining
+        floor = self._fill_cost_ratio * best_rate * price
+        return int(np.count_nonzero(scores[draft_budget:] >= floor))
 
     def compact_batch(
         self,
