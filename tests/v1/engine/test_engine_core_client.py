@@ -1823,11 +1823,19 @@ def test_dp_prefill_cap_is_agreed_over_the_group(monkeypatch):
     monkeypatch.setattr("vllm.distributed.utils.all_reduce_int", fake_all_reduce_int)
     core.scheduler = SimpleNamespace(
         prefill_cost_model=object(),
+        prefill_target=None,
         time_budget_prefill_cap=lambda: 112,
         set_prefill_cap_override=lambda cap: calls.append(("override", cap)),
     )
     core._align_prefill_cap_over_dp()
     assert calls == [(core.dp_group, 112), ("override", 64)]
+
+    # A shared token target already equalizes the ranks: no collective.
+    calls.clear()
+    core.scheduler.prefill_target = object()
+    core._align_prefill_cap_over_dp()
+    assert calls == []
+    core.scheduler.prefill_target = None
 
     # No budget configured: no collective, no override.
     calls.clear()

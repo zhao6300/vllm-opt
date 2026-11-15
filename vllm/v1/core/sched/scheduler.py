@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -50,6 +51,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.prefill_budget import PrefillCostModel
+from vllm.v1.core.sched.prefill_target import PrefillTarget
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -85,6 +87,9 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # The shared prefill token target; None unless VLLM_PREFILL_FILL_TARGET.
+    prefill_target: PrefillTarget | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -405,6 +410,28 @@ class Scheduler(SchedulerInterface):
             logger.info(
                 "Prefill chunks are sized by a step time budget: %s",
                 self.prefill_cost_model,
+            )
+        # Optional shared token target (VLLM_PREFILL_FILL_TARGET): the prefill
+        # chunk fills the step to it, and a background thread adapts it to the
+        # measured step period.
+        self.prefill_target: PrefillTarget | None = None
+        if envs.VLLM_PREFILL_FILL_TARGET:
+            if self.prefill_cost_model is None:
+                raise ValueError(
+                    "VLLM_PREFILL_FILL_TARGET needs VLLM_PREFILL_STEP_BUDGET_MS "
+                    "as the step period to steer toward"
+                )
+            self.prefill_target = PrefillTarget.from_env(
+                self.prefill_cost_model.budget_ms,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
+            logger.info(
+                "Prefill chunks fill each step to a shared token target "
+                "(now %d, at most %d) that follows a %s ms step period",
+                self.prefill_target.tokens,
+                self.prefill_target.max_tokens,
+                self.prefill_cost_model.budget_ms,
             )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -731,6 +758,10 @@ class Scheduler(SchedulerInterface):
                 context = max(context, request.num_computed_tokens)
             elif request.next_decode_eligible_step <= self.current_step:
                 decode_tokens += 1 + self.num_spec_tokens
+        if self.prefill_target is not None:
+            return self.prefill_target.max_prefill_tokens(
+                decode_tokens, model.min_chunk_tokens, align=self.block_size
+            )
         return model.max_prefill_tokens(decode_tokens, context, align=self.block_size)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
@@ -811,6 +842,7 @@ class Scheduler(SchedulerInterface):
 
         # Prefill tokens this step may still take (None: no extra cap).
         prefill_left = self._prefill_token_cap()
+        num_prefill_tokens_scheduled = 0
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -982,6 +1014,8 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if preempted_req.is_prefill_chunk:
+                                num_prefill_tokens_scheduled -= restored
                             if (
                                 prefill_left is not None
                                 and preempted_req.is_prefill_chunk
@@ -1041,6 +1075,8 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if request.is_prefill_chunk:
+                num_prefill_tokens_scheduled += num_new_tokens
             if prefill_left is not None and request.is_prefill_chunk:
                 prefill_left -= num_new_tokens
             req_index += 1
@@ -1677,6 +1713,8 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if prefill_work:
+                    num_prefill_tokens_scheduled += num_new_tokens
                 if prefill_left is not None and prefill_work:
                     prefill_left -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1822,6 +1860,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             iteration_details=iteration_details,
+            num_prefill_tokens=num_prefill_tokens_scheduled,
             preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
@@ -2329,6 +2368,12 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self.prefill_target is not None:
+            self.prefill_target.record_output(
+                time.perf_counter(),
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.num_prefill_tokens,
+            )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -3527,6 +3572,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.prefill_target is not None:
+            self.prefill_target.stop()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

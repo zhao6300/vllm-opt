@@ -288,6 +288,10 @@ class SchedulerOutput:
     # Optional scheduling-time snapshot, before worker-side token adjustments.
     iteration_details: IterationDetails | None = None
 
+    # Prefill tokens in this step: the part of the scheduled tokens that is not
+    # decode. Read when the step's output arrives.
+    num_prefill_tokens: int = 0
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None

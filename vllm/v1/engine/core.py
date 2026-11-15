@@ -2767,7 +2767,12 @@ class DPEngineCoreProc(EngineCoreProc):
         one by that many steps.
         """
         scheduler = self.scheduler
-        if scheduler.prefill_cost_model is None or self.dp_group is None:
+        # A shared token target already equalizes the ranks' steps.
+        if (
+            scheduler.prefill_cost_model is None
+            or scheduler.prefill_target is not None
+            or self.dp_group is None
+        ):
             return
         cap = scheduler.time_budget_prefill_cap()
         if cap is None:

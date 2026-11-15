@@ -9299,6 +9299,112 @@ def test_pending_prefill_ms_prices_the_remainder_with_the_cost_model(monkeypatch
     assert plain.get_pending_prefill_ms() == 0.0
 
 
+def _set_fill_target(monkeypatch, init_tokens: int = 1024) -> None:
+    _set_prefill_budget(monkeypatch, 600, 0.01)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_TARGET", "1")
+    monkeypatch.setenv("VLLM_PREFILL_TARGET_INIT_TOKENS", str(init_tokens))
+    # The test drives updates itself; the thread must not race it.
+    monkeypatch.setenv("VLLM_PREFILL_TARGET_UPDATE_MS", "3600000")
+    # The prompts below are longer than the test model's position limit.
+    monkeypatch.setenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+
+
+def test_fill_target_needs_a_step_time_budget(monkeypatch):
+    monkeypatch.delenv("VLLM_PREFILL_STEP_BUDGET_MS", raising=False)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_TARGET", "1")
+    with pytest.raises(ValueError, match="VLLM_PREFILL_STEP_BUDGET_MS"):
+        create_scheduler(max_num_batched_tokens=8192, block_size=16)
+
+
+def test_fill_target_fills_the_step_around_its_decodes(monkeypatch):
+    """Four decodes and a prefill make a step of the target's size, and the
+    prefill alone reports its own share."""
+    _set_fill_target(monkeypatch, 1024)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    try:
+        decoding = create_requests(
+            num_requests=4,
+            num_tokens=8,
+            max_tokens=100,
+            req_ids=[f"d{i}" for i in range(4)],
+        )
+        for request in decoding:
+            scheduler.add_request(request)
+        output = scheduler.schedule()
+        assert output.num_prefill_tokens == 32
+        _decode_one(scheduler, output, [f"d{i}" for i in range(4)])
+        (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+        scheduler.add_request(request)
+
+        output = scheduler.schedule()
+
+        assert output.num_scheduled_tokens["p0"] == 1008
+        assert output.num_prefill_tokens == 1008
+        assert output.total_num_scheduled_tokens == 1012
+    finally:
+        scheduler.shutdown()
+
+
+def test_fill_target_chunks_do_not_shrink_with_the_context(monkeypatch):
+    _set_fill_target(monkeypatch, 512)
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.01")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, max_model_len=4096
+    )
+    try:
+        (request,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["p0"])
+        scheduler.add_request(request)
+        chunks = []
+        while request.num_computed_tokens < request.num_prompt_tokens:
+            output = scheduler.schedule()
+            chunks.append(output.num_scheduled_tokens["p0"])
+            done = request.num_computed_tokens >= request.num_prompt_tokens
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=["p0"],
+                    sampled_token_ids=[[0] if done else []],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+        assert chunks == [512, 512, 512, 464]
+    finally:
+        scheduler.shutdown()
+
+
+def test_fill_target_grows_from_the_outputs_it_sees(monkeypatch):
+    """Steps that fill the target and finish far inside the budget raise it, and
+    the next chunk is sized with the new value."""
+    _set_fill_target(monkeypatch, 512)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, max_model_len=4096
+    )
+    try:
+        (request,) = create_requests(num_requests=1, num_tokens=4000, req_ids=["p0"])
+        scheduler.add_request(request)
+        for _ in range(5):
+            output = scheduler.schedule()
+            assert output.num_scheduled_tokens["p0"] == 512
+            scheduler.update_from_output(
+                output,
+                ModelRunnerOutput(
+                    req_ids=["p0"],
+                    sampled_token_ids=[[]],
+                    logprobs=None,
+                    prompt_logprobs_dict={},
+                    pooler_output=[],
+                ),
+            )
+        assert scheduler.prefill_target is not None
+        assert scheduler.prefill_target.update() == 640
+
+        assert scheduler.schedule().num_scheduled_tokens["p0"] == 640
+    finally:
+        scheduler.shutdown()
+
+
 def test_prefill_cap_override_is_the_dp_group_minimum(monkeypatch):
     """The DP engine core hands the scheduler the group's MIN prefill chunk, so
     every rank's step carries the same prefill work; the local computation is

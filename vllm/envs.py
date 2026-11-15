@@ -78,6 +78,9 @@ if TYPE_CHECKING:
     VLLM_PREFILL_COST_MS_PER_TOKEN: float = 0.0
     VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT: float = 0.0
     VLLM_PREFILL_MIN_CHUNK_TOKENS: int = 256
+    VLLM_PREFILL_FILL_TARGET: bool = False
+    VLLM_PREFILL_TARGET_INIT_TOKENS: int = 0
+    VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1353,6 +1356,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sync, so a step does not wait on one rank's longer chunk.
     "VLLM_PREFILL_MIN_CHUNK_TOKENS": lambda: int(
         os.getenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "256")
+    ),
+    # With VLLM_PREFILL_STEP_BUDGET_MS: size every step's prefill chunk to fill
+    # the step to a shared token target instead of pricing it with the cost
+    # model. A rank takes `target - its decode tokens` of prefill, so ranks end
+    # their steps together and a rank with few decodes fills the room it would
+    # pad. The budget is then the step period the target steers toward, and the
+    # chunk does not shrink with the context.
+    "VLLM_PREFILL_FILL_TARGET": lambda: bool(
+        int(os.getenv("VLLM_PREFILL_FILL_TARGET", "0"))
+    ),
+    # Starting value of that target in tokens; 0 is a quarter of
+    # --max-num-batched-tokens.
+    "VLLM_PREFILL_TARGET_INIT_TOKENS": lambda: int(
+        os.getenv("VLLM_PREFILL_TARGET_INIT_TOKENS", "0")
+    ),
+    # How often a background thread moves the target toward the budget, in
+    # milliseconds. The scheduler only reads the current value.
+    "VLLM_PREFILL_TARGET_UPDATE_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_TARGET_UPDATE_MS", "200")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
