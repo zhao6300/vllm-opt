@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_FLASHINFER_DSV41_SM120_CAKE: bool = False
     VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS: int = 256
+    VLLM_DRAFT_CAPTURE_STAGE_SYNC: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1268,6 +1269,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # topk 2048).
     "VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS", "256")
+    ),
+    # Debug aid for a CUDA fault while capturing a draft model's graphs. The
+    # eager warmup that precedes each capture synchronizes after every draft
+    # stage (context K/V store, each layer's attention and FFN, the sampling) and
+    # logs it, so an asynchronous fault is raised at the stage that caused it.
+    # Stages are only synchronized outside stream capture, at startup. Default:
+    # off.
+    "VLLM_DRAFT_CAPTURE_STAGE_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DRAFT_CAPTURE_STAGE_SYNC", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -24,7 +25,10 @@ from vllm.v1.worker.gpu.cp_utils import cp_local_slot
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import (
+    DFlashCudaGraphManager,
+    stage_sync_hooks,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
@@ -184,17 +188,28 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Capture must not write context K/V.
         self._context_slot_mappings.fill_(PAD_SLOT_ID)
         assert self.query_cudagraph_manager is not None
-        self.query_cudagraph_manager.capture(
-            self._generate_draft,
-            self.input_buffers,
-            self.block_tables,
-            self.attn_groups,
-            self.kv_cache_config,
-            self.max_model_len,
-            causal=self._group_causal,
-            prepare_forward=self._prepare_graph_forward,
-            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+        hooks = (
+            stage_sync_hooks(self.model, self._speculator_name)
+            if envs.VLLM_DRAFT_CAPTURE_STAGE_SYNC
+            else []
         )
+        try:
+            self.query_cudagraph_manager.capture(
+                self._generate_draft,
+                self.input_buffers,
+                self.block_tables,
+                self.attn_groups,
+                self.kv_cache_config,
+                self.max_model_len,
+                causal=self._group_causal,
+                prepare_forward=self._prepare_graph_forward,
+                progress_bar_desc=(
+                    f"Capturing {self._speculator_name.lower()} CUDA graphs"
+                ),
+            )
+        finally:
+            for handle in hooks:
+                handle.remove()
 
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None

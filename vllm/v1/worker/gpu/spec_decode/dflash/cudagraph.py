@@ -4,8 +4,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
+import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -20,6 +23,37 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+
+def stage_sync_hooks(model: nn.Module, name: str):
+    """Hooks that synchronize after every submodule of `model` runs eagerly.
+
+    Used with `VLLM_DRAFT_CAPTURE_STAGE_SYNC`: a CUDA fault is reported by the
+    first synchronization after the kernel that caused it, so syncing after each
+    module names that module. Captured passes are skipped, as a synchronize
+    is illegal during stream capture. Returns the hook handles to remove.
+    """
+    handles = []
+
+    def make_hook(module_name: str):
+        def hook(module, args, output):
+            if torch.cuda.is_current_stream_capturing():
+                return
+            try:
+                torch.accelerator.synchronize()
+            except Exception:
+                logger.error("CUDA fault after %s.%s", name, module_name)
+                raise
+            logger.info("%s.%s ok", name, module_name)
+
+        return hook
+
+    for module_name, module in model.named_modules():
+        if module_name:
+            handles.append(module.register_forward_hook(make_hook(module_name)))
+    return handles
 
 
 def _prepare_dflash_inputs_to_capture(
@@ -117,6 +151,17 @@ class DFlashCudaGraphManager(CudaGraphManager):
 
             def forward(cg_mode: CUDAGraphMode) -> None:
                 prepare_forward(num_reqs, attn_metadata)
+                if (
+                    envs.VLLM_DRAFT_CAPTURE_STAGE_SYNC
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    torch.accelerator.synchronize()
+                    logger.info(
+                        "prepare_forward ok: mode=%s num_reqs=%d num_tokens=%d",
+                        desc.cg_mode.name,
+                        num_reqs,
+                        num_tokens,
+                    )
                 forward_fn(
                     num_reqs,
                     num_tokens,
