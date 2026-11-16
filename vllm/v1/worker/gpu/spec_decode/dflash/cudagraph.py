@@ -27,6 +27,26 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def debug_sync(stage: str) -> None:
+    """Under `VLLM_DRAFT_CAPTURE_STAGE_SYNC`, synchronize and log `stage`.
+
+    A CUDA fault is reported by the first synchronization after the kernel that
+    caused it, so the stage whose sync fails, or the last one logged before the
+    fault, brackets the faulting kernel. A no-op inside stream capture, where a
+    synchronize is illegal, and when the switch is off.
+    """
+    if not envs.VLLM_DRAFT_CAPTURE_STAGE_SYNC:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    try:
+        torch.accelerator.synchronize()
+    except Exception:
+        logger.error("CUDA fault found at the sync after: %s", stage)
+        raise
+    logger.info("%s ok", stage)
+
+
 def stage_sync_hooks(model: nn.Module, name: str):
     """Hooks that synchronize after every submodule of `model` runs eagerly.
 
@@ -39,14 +59,7 @@ def stage_sync_hooks(model: nn.Module, name: str):
 
     def make_hook(module_name: str):
         def hook(module, args, output):
-            if torch.cuda.is_current_stream_capturing():
-                return
-            try:
-                torch.accelerator.synchronize()
-            except Exception:
-                logger.error("CUDA fault after %s.%s", name, module_name)
-                raise
-            logger.info("%s.%s ok", name, module_name)
+            debug_sync(f"{name}.{module_name}")
 
         return hook
 
@@ -148,20 +161,15 @@ class DFlashCudaGraphManager(CudaGraphManager):
                 causal=causal,
             )
             attn_metadata, slot_mappings = attn_state
+            label = (
+                f"mode={desc.cg_mode.name} num_reqs={num_reqs} "
+                f"num_tokens={num_tokens} warmup={warmup}"
+            )
+            debug_sync(f"inputs and attention metadata: {label}")
 
             def forward(cg_mode: CUDAGraphMode) -> None:
                 prepare_forward(num_reqs, attn_metadata)
-                if (
-                    envs.VLLM_DRAFT_CAPTURE_STAGE_SYNC
-                    and not torch.cuda.is_current_stream_capturing()
-                ):
-                    torch.accelerator.synchronize()
-                    logger.info(
-                        "prepare_forward ok: mode=%s num_reqs=%d num_tokens=%d",
-                        desc.cg_mode.name,
-                        num_reqs,
-                        num_tokens,
-                    )
+                debug_sync(f"prepare_forward: {label}")
                 forward_fn(
                     num_reqs,
                     num_tokens,
@@ -170,6 +178,7 @@ class DFlashCudaGraphManager(CudaGraphManager):
                     num_tokens_across_dp,
                     cg_mode,
                 )
+                debug_sync(f"forward and sampling: {label}")
 
             return forward
 
