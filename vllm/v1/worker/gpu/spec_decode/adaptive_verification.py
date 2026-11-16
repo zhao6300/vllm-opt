@@ -245,6 +245,9 @@ class AdmittedDraftCounts:
 
 
 class AdaptiveVerificationManager:
+    # The sampler's cost by logit row count; None until it has been timed.
+    sampler_cost_ms: np.ndarray | None = None
+
     def __init__(
         self,
         req_states: "RequestState",
@@ -441,9 +444,14 @@ class AdaptiveVerificationManager:
         self._refresher.observe(samples)
         self._refresher.tick()
 
-    def install_cost_tables(self, tables: tuple[np.ndarray, np.ndarray]) -> None:
+    def install_cost_tables(
+        self,
+        tables: tuple[np.ndarray, np.ndarray],
+        sampler_cost_ms: np.ndarray | None = None,
+    ) -> None:
         """Use new cost tables from the next step on."""
         self.cost_tables = tables
+        self.sampler_cost_ms = sampler_cost_ms
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def set_cost_curves(
@@ -595,14 +603,17 @@ class AdaptiveVerificationManager:
         num_tokens_to_estimated_accepted_tokens = np.concatenate(
             ([num_sampling_requests], num_sampling_requests + np.cumsum(scores))
         )
-        costs = (
-            draft_cost_ms[len(req_ids)]
-            + verify_cost_ms[
-                num_non_draft_tokens_total : num_non_draft_tokens_total
-                + max_draft_budget
-                + 1
-            ]
+        verify_costs = verify_cost_ms[
+            num_non_draft_tokens_total : num_non_draft_tokens_total
+            + max_draft_budget
+            + 1
+        ]
+        # Verifying a draft also costs a logit row: the sampler runs after the
+        # forward, outside the graph the verify table prices.
+        sampler_costs = self._sampler_costs(
+            num_reqs * self.num_bonus_tokens, max_draft_budget
         )
+        costs = draft_cost_ms[len(req_ids)] + verify_costs + sampler_costs
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
@@ -616,7 +627,11 @@ class AdaptiveVerificationManager:
         fill_candidates = 0
         if self._fill_padding:
             fill_candidates = self._count_fill_candidates(
-                scores, costs, draft_budget, float(rates[draft_budget])
+                scores,
+                verify_costs,
+                sampler_costs,
+                draft_budget,
+                float(rates[draft_budget]),
             )
         # Rank-local confidences must not select different TP execution sizes.
         draft_budget, fill_candidates = get_tp_group().broadcast_object(
@@ -664,23 +679,29 @@ class AdaptiveVerificationManager:
     def _count_fill_candidates(
         self,
         scores: np.ndarray,
-        costs: np.ndarray,
+        verify_costs: np.ndarray,
+        sampler_costs: np.ndarray,
         draft_budget: int,
         best_rate: float,
     ) -> int:
         """Count the drafts beyond the budget that are worth a padded row.
 
         A draft pays for its row when its survival probability reaches the
-        padded-row cost ratio times the price of a row at the step's best
-        accepted tokens per ms. The price is the average over the remaining
-        candidates, not the jump at the next graph size: the cost tables are
-        staircases, so a per-row price would charge a whole graph step to one
-        row. Depends only on values every TP rank agrees on after the
-        broadcast of this count together with the budget.
+        step's best accepted tokens per ms times the row's price. The forward's
+        part of the price is a padded row's, which is only some fraction
+        (`VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO`) of a real row's: the
+        graph runs the row anyway. The sampler's part is measured, and a draft
+        that is verified takes a logit row whatever the graph padded, so it is
+        charged in full. Prices are averages over the candidates left, not the
+        jump at the next graph size: the verify table is a staircase, and a
+        per-row price would charge a whole graph step to one row. Depends only
+        on values every TP rank agrees on after the broadcast of this count
+        together with the budget.
 
         Args:
             scores: Survival probabilities of the candidates, best first.
-            costs: Step cost for each draft budget, from none to all.
+            verify_costs: Verify cost for each draft budget, from none to all.
+            sampler_costs: Sampler cost for each draft budget.
             draft_budget: The budget chosen for this rank's own token count.
             best_rate: Accepted tokens per ms at that budget.
 
@@ -691,9 +712,33 @@ class AdaptiveVerificationManager:
         remaining = len(scores) - draft_budget
         if remaining <= 0:
             return 0
-        price = max(float(costs[len(scores)] - costs[draft_budget]), 0.0) / remaining
-        floor = self._fill_cost_ratio * best_rate * price
+        forward_price = (
+            max(float(verify_costs[len(scores)] - verify_costs[draft_budget]), 0.0)
+            / remaining
+        )
+        sampler_price = (
+            max(float(sampler_costs[len(scores)] - sampler_costs[draft_budget]), 0.0)
+            / remaining
+        )
+        floor = best_rate * (self._fill_cost_ratio * forward_price + sampler_price)
         return int(np.count_nonzero(scores[draft_budget:] >= floor))
+
+    def _sampler_costs(self, first_row: int, max_draft_budget: int) -> np.ndarray:
+        """The sampler's cost at each draft budget, from none to all.
+
+        Args:
+            first_row: Logit rows the step takes without any draft.
+            max_draft_budget: The most drafts the step could verify.
+
+        Returns:
+            Zeros until the sampler has been timed.
+
+        """
+        table = self.sampler_cost_ms
+        if table is None:
+            return np.zeros(max_draft_budget + 1)
+        rows = np.arange(first_row, first_row + max_draft_budget + 1)
+        return table[np.minimum(rows, len(table) - 1)]
 
     def compact_batch(
         self,

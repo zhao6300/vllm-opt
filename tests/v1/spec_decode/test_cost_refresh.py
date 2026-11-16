@@ -32,8 +32,23 @@ def build_tables(draft, verify):
     return build_cost_tables_from_curves(draft, verify, MAX_REQS, MAX_TOKENS)
 
 
-def timing(tokens: int, forward_ms: float, reqs: int = 2, drafter_ms: float = 0.5):
-    return StepTimingSample(forward_ms, drafter_ms, tokens, reqs, full_cudagraph=True)
+def timing(
+    tokens: int,
+    forward_ms: float,
+    reqs: int = 2,
+    drafter_ms: float = 0.5,
+    sampler_ms: float = 0.0,
+    num_logits: int = 0,
+):
+    return StepTimingSample(
+        forward_ms,
+        drafter_ms,
+        tokens,
+        reqs,
+        full_cudagraph=True,
+        sampler_ms=sampler_ms,
+        num_logits=num_logits,
+    )
 
 
 def make_refresher(installs, step, interval=16, tp=ALONE, pp=ALONE, build=build_tables):
@@ -45,7 +60,7 @@ def make_refresher(installs, step, interval=16, tp=ALONE, pp=ALONE, build=build_
         interval,
         window=16,
         build_tables=build,
-        install=lambda tables: installs.append((step[0], tables)),
+        install=lambda tables, sampler: installs.append((step[0], tables, sampler)),
         tp_group=tp,
         pp_group=pp,
     )
@@ -75,11 +90,46 @@ def test_new_tables_are_installed_on_a_fixed_step_after_each_rebuild():
 
     # With no collective to wait for, a rebuild that begins on step 16 installs
     # one lag (4 steps) later; the next begins on step 32.
-    assert [at for at, _ in installs] == [20, 36]
+    assert [at for at, *_ in installs] == [20, 36]
     _, verify = installs[0][1]
     assert verify[8] == 8.0
     assert verify[32] == 20.0
     assert verify[64] == 64.0
+
+
+def test_the_sampler_cost_is_interpolated_between_the_sizes_it_was_timed_at():
+    installs, step = [], [0]
+    refresher = make_refresher(installs, step, interval=16)
+    try:
+        refresher.observe(
+            [timing(32, 20.0, sampler_ms=1.0, num_logits=8) for _ in range(4)]
+            + [timing(32, 20.0, sampler_ms=3.0, num_logits=16) for _ in range(4)]
+        )
+        refresher.flush()
+        run_steps(refresher, step, 30)
+    finally:
+        refresher.close()
+
+    sampler = installs[0][2]
+    assert sampler[8] == 1.0
+    assert sampler[12] == 2.0
+    assert sampler[16] == 3.0
+    # Flat beyond the ends.
+    assert sampler[0] == 1.0
+    assert sampler[40] == 3.0
+
+
+def test_there_is_no_sampler_cost_until_the_sampler_was_timed():
+    installs, step = [], [0]
+    refresher = make_refresher(installs, step, interval=16)
+    try:
+        refresher.observe([timing(32, 20.0) for _ in range(4)])
+        refresher.flush()
+        run_steps(refresher, step, 30)
+    finally:
+        refresher.close()
+
+    assert installs[0][2] is None
 
 
 def test_a_size_keeps_its_startup_cost_until_it_has_enough_timings():
@@ -172,6 +222,9 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
                 32,
                 4,
                 full_cudagraph=True,
+                # Only the last stage samples; its TP ranks time slightly apart.
+                sampler_ms=2.0 + tp_rank if stage == pp_size - 1 else 0.0,
+                num_logits=16,
             )
             for _ in range(4)
         ]
@@ -180,7 +233,12 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
     run_steps(refresher, step, 30)
     refresher.close()
 
-    mine = (installs[0][0], installs[0][1][0].tolist(), installs[0][1][1].tolist())
+    mine = (
+        installs[0][0],
+        installs[0][1][0].tolist(),
+        installs[0][1][1].tolist(),
+        installs[0][2].tolist(),
+    )
     gathered: list = [None] * world_size
     dist.all_gather_object(gathered, mine)
     tp.destroy()
@@ -189,11 +247,13 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
 
     assert len(installs) == 1
     assert all(entry == gathered[0] for entry in gathered), gathered
-    install_step, draft, verify = gathered[0]
+    install_step, draft, verify, sampler = gathered[0]
     # One lag per stage: the rebuild, a TP broadcast, a PP gather.
     assert install_step == 16 + 4 * (1 + (tp_size > 1) + (pp_size > 1))
     assert verify[32] == 20.0 + 10 * (pp_size - 1)
     assert draft[4] == 1.0 + 3 * (pp_size - 1)
+    # The last stage's TP rank 0 timed the sampler; the others did not.
+    assert set(sampler) == {2.0}
 
 
 @pytest.mark.parametrize(

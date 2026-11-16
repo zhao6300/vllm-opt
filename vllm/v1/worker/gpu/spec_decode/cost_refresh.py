@@ -34,6 +34,8 @@ logger = init_logger(__name__)
 _WORKER_TIMEOUT_S = 60.0
 
 _Tables = tuple[np.ndarray, np.ndarray]
+# The draft curve, the verify curve and the sampler's cost by logit row count.
+_Curves = tuple[np.ndarray, np.ndarray, np.ndarray]
 
 
 def curve_to_dense(curve: list[tuple[int, float]], size: int) -> np.ndarray:
@@ -48,6 +50,26 @@ def curve_to_dense(curve: list[tuple[int, float]], size: int) -> np.ndarray:
 def dense_to_curve(dense: np.ndarray) -> list[tuple[int, float]]:
     """The points of a dense curve, in order."""
     return [(int(i), float(dense[i])) for i in np.flatnonzero(~np.isnan(dense))]
+
+
+def sampler_table_from_curve(dense: np.ndarray) -> np.ndarray | None:
+    """Fill a sampler curve into a cost for every logit row count.
+
+    The sampler's cost grows smoothly with its rows, so the sizes between two
+    timed ones are interpolated and the ends stay flat.
+
+    Args:
+        dense: The measured sampler milliseconds by row count, NaN where
+            nothing was timed.
+
+    Returns:
+        The table, or None when nothing was timed yet.
+
+    """
+    known = np.flatnonzero(~np.isnan(dense))
+    if known.size == 0:
+        return None
+    return np.interp(np.arange(len(dense)), known, dense[known])
 
 
 class CostRefresher:
@@ -68,7 +90,7 @@ class CostRefresher:
         build_tables: Callable[
             [list[tuple[int, float]], list[tuple[int, float]]], _Tables
         ],
-        install: Callable[[_Tables], None],
+        install: Callable[[_Tables, np.ndarray | None], None],
         tp_group: Any,
         pp_group: Any,
         min_samples: int = 4,
@@ -81,7 +103,8 @@ class CostRefresher:
         interval: Served steps between rebuilds.
         window: Timings kept per size; the median of these is the cost.
         build_tables: Turns the agreed curves into cost tables.
-        install: Takes the new tables; called from the step loop.
+        install: Takes the new tables and the sampler's cost table (None until
+            the sampler has been timed); called from the step loop.
         tp_group: Coordinator with `world_size`, `ranks` and `cpu_group`.
         pp_group: The same, for the pipeline stages.
         min_samples: Timings a size needs before it replaces its startup cost.
@@ -107,17 +130,21 @@ class CostRefresher:
         self._online_verify: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=self._window)
         )
+        self._online_sampler: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self._window)
+        )
         # This rank's curves: the startup profile with live medians laid over
         # it. Replaced whole by the worker, never edited, so a reader holding
         # one sees a consistent pair.
-        self._local: _Tables = (
+        self._local: _Curves = (
             curve_to_dense(base_draft_curve, self._draft_size),
             curve_to_dense(base_verify_curve, self._verify_size),
+            np.full(self._verify_size, np.nan, dtype=np.float32),
         )
         self._lock = threading.Lock()
         self._inbox: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._merged = threading.Event()
-        self._result: _Tables | None = None
+        self._result: tuple[_Tables, np.ndarray | None] | None = None
         self._error: BaseException | None = None
 
         # The step loop's own state.
@@ -173,8 +200,8 @@ class CostRefresher:
 
     def _begin(self) -> None:
         with self._lock:
-            draft, verify = self._local
-        send = torch.from_numpy(np.concatenate([draft, verify]))
+            curves = self._local
+        send = torch.from_numpy(np.concatenate(curves))
         if self._tp.world_size > 1:
             # Every TP rank takes rank 0's curves, as the budget does.
             self._send = send
@@ -211,7 +238,7 @@ class CostRefresher:
         if self._error is not None:
             raise RuntimeError("The cost table worker failed") from self._error
         assert self._result is not None  # set before the event
-        self._install(self._result)
+        self._install(*self._result)
         self._result = None
         self._stage = "idle"
         self._send = None
@@ -243,8 +270,7 @@ class CostRefresher:
                 return
 
     def _fold(self, samples: list[StepTimingSample]) -> None:
-        draft, verify = self._local
-        draft, verify = draft.copy(), verify.copy()
+        draft, verify, sampler = (curve.copy() for curve in self._local)
         for sample in samples:
             if 0 <= sample.num_target_tokens < self._verify_size:
                 self._online_verify[sample.num_target_tokens].append(sample.forward_ms)
@@ -252,8 +278,12 @@ class CostRefresher:
             if sample.full_cudagraph and 0 <= sample.num_reqs < self._draft_size:
                 self._online_draft[sample.num_reqs].append(sample.drafter_ms)
                 self._replace(draft, sample.num_reqs, self._online_draft)
+            # Only the last PP stage samples; a step that did not has no time.
+            if sample.sampler_ms > 0 and 0 <= sample.num_logits < self._verify_size:
+                self._online_sampler[sample.num_logits].append(sample.sampler_ms)
+                self._replace(sampler, sample.num_logits, self._online_sampler)
         with self._lock:
-            self._local = (draft, verify)
+            self._local = (draft, verify, sampler)
 
     def _replace(
         self, dense: np.ndarray, key: int, buckets: dict[int, deque[float]]
@@ -267,12 +297,14 @@ class CostRefresher:
         """Take the slowest stage's cost for every size, and build the tables."""
         # fmax skips a NaN, so a size no stage has a point for stays empty.
         merged = np.fmax.reduce(np.stack(parts), axis=0)
+        verify_end = self._draft_size + self._verify_size
         draft = dense_to_curve(merged[: self._draft_size])
-        verify = dense_to_curve(merged[self._draft_size :])
+        verify = dense_to_curve(merged[self._draft_size : verify_end])
         if not draft or not verify:
             raise RuntimeError(
                 "Adaptive verification could not rebuild its step costs from the "
                 "ranks' curves"
             )
-        self._result = self._build_tables(draft, verify)
+        sampler = sampler_table_from_curve(merged[verify_end:])
+        self._result = (self._build_tables(draft, verify), sampler)
         self._merged.set()

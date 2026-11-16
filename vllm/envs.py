@@ -1317,11 +1317,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING": lambda: bool(
         int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING", "0"))
     ),
-    # With FILL_PADDING: what a padded row costs, as a fraction of a real row at
-    # the cost tables' marginal price. A draft is admitted while its survival
-    # probability is at least this fraction of the price of a row at the
-    # current accepted-tokens-per-ms. 0 fills every spare row; 1 prices padded
-    # rows like real ones, which admits almost nothing.
+    # With FILL_PADDING: the part of a real row's forward cost that a filled row
+    # adds, because the graph runs a padded row anyway and only attention, which
+    # a padded row has no context for, differs. A draft is admitted while its
+    # survival probability is at least the step's best accepted tokens per ms
+    # times (this ratio times the average forward price of the drafts left, plus
+    # the measured sampler price of a logit row). 0 makes the forward free.
     "VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO": lambda: float(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO", "0.5")
     ),

@@ -34,6 +34,10 @@ class StepTimingSample:
     num_target_tokens: int
     num_reqs: int
     full_cudagraph: bool
+    # Logit rows the sampler ran on, and how long it took (last PP rank only;
+    # 0.0 for a step that never sampled).
+    sampler_ms: float = 0.0
+    num_logits: int = 0
 
 
 def _timing_event() -> torch.cuda.Event:
@@ -47,6 +51,16 @@ class StepTimingEvents:
     forward_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
     drafter_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
     drafter_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    sampler_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    sampler_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    # Set once the sampler's events are recorded; dummy steps never are.
+    has_sampler: bool = False
+
+    def sampler_ms(self) -> float:
+        """The sampler's time, 0.0 for a step that did not run it."""
+        if not self.has_sampler:
+            return 0.0
+        return self.sampler_start.elapsed_time(self.sampler_end)
 
 
 class StepTimingCollector:
@@ -59,14 +73,16 @@ class StepTimingCollector:
     def __init__(self):
         self._collecting = False
         self._step: StepTimingEvents | None = None
-        self._batch = (False, 0, 0)
-        self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        self._batch = (False, 0, 0, 0)
+        self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int, int]]] = []
         # Continuous sampling for online cost estimation: one step every
         # `_sample_interval`, resolved without synchronizing the stream.
         self._sample_interval = 0
         self._sample_countdown = 0
         self._sampling = False
-        self._pending: deque[tuple[StepTimingEvents, tuple[bool, int, int]]] = deque()
+        self._pending: deque[tuple[StepTimingEvents, tuple[bool, int, int, int]]] = (
+            deque()
+        )
 
     def enable_sampling(self, interval: int) -> None:
         """Time one step every `interval` forward calls; 0 disables it.
@@ -102,8 +118,15 @@ class StepTimingCollector:
                 num_target_tokens,
                 num_reqs,
                 full_cudagraph,
+                events.sampler_ms(),
+                num_logits,
             )
-            for events, (full_cudagraph, num_target_tokens, num_reqs) in timed
+            for events, (
+                full_cudagraph,
+                num_target_tokens,
+                num_reqs,
+                num_logits,
+            ) in timed
         )
 
     def record_batch(self, input_batch: "InputBatch", full_cudagraph: bool) -> None:
@@ -117,6 +140,7 @@ class StepTimingCollector:
             full_cudagraph,
             input_batch.num_tokens_after_padding,
             input_batch.num_reqs,
+            input_batch.logits_indices.shape[0],
         )
 
     def forward_start(self, sample: bool = True) -> None:
@@ -141,6 +165,16 @@ class StepTimingCollector:
         if self._step is not None:
             self._step.forward_end.record()
 
+    def sampler_start(self) -> None:
+        if self._step is not None:
+            self._step.sampler_start.record()
+
+    def sampler_end(self) -> None:
+        """Ends the sampler's timing; the logit rows were keyed by `record_batch`."""
+        if self._step is not None:
+            self._step.sampler_end.record()
+            self._step.has_sampler = True
+
     def drafter_start(self) -> None:
         if self._step is not None:
             self._step.drafter_start.record()
@@ -164,7 +198,7 @@ class StepTimingCollector:
             if not events.drafter_end.query():
                 break
             self._pending.popleft()
-            full_cudagraph, num_target_tokens, num_reqs = batch
+            full_cudagraph, num_target_tokens, num_reqs, num_logits = batch
             samples.append(
                 StepTimingSample(
                     events.forward_start.elapsed_time(events.forward_end),
@@ -172,6 +206,8 @@ class StepTimingCollector:
                     num_target_tokens,
                     num_reqs,
                     full_cudagraph,
+                    events.sampler_ms(),
+                    num_logits,
                 )
             )
         return samples

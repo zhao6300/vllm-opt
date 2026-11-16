@@ -658,6 +658,39 @@ def test_fill_graph_padding_at_zero_cost_fills_every_spare_row():
     assert manager.fill_graph_padding(64) == 6
 
 
+def _sampler_manager(sampler_ms_per_row: float, fill_cost_ratio: float = 0.0):
+    """Two requests with two drafts each. The verify table jumps once the step
+    carries more than one draft; the sampler takes a fixed time per row after
+    the two every step has."""
+    confidences = np.array([[0.9, 0.9], [0.1, 0.1]], dtype=np.float32)
+    verify_cost_ms = np.array([1.0, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0])
+    manager = make_manager(confidences, verify_cost_ms, fill_cost_ratio=fill_cost_ratio)
+    manager.sampler_cost_ms = np.maximum(np.arange(20) - 2, 0) * sampler_ms_per_row
+    manager.get_num_tokens({"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]})
+    return manager
+
+
+def test_the_sampler_is_priced_per_verified_row():
+    free = _sampler_manager(0.0)
+    # A row so dear that no draft pays for itself.
+    costly = _sampler_manager(5.0)
+
+    assert free._batch_budget[2] == 1
+    assert costly._batch_budget[2] == 0
+
+
+def test_a_filled_row_pays_the_samplers_price_in_full():
+    # The forward is free for a padded row (ratio 0), but a verified draft is a
+    # logit row whatever the graph padded.
+    free = _sampler_manager(0.0)
+    costly = _sampler_manager(0.3)
+
+    assert free._batch_budget[2] == costly._batch_budget[2] == 1
+    assert free._batch_fill_candidates == 3
+    # Only the 0.81 draft beats 2.2 accepted tokens/ms times 0.3 ms.
+    assert costly._batch_fill_candidates == 1
+
+
 def _staircase_manager(fill_cost_ratio: float, num_reqs: int = 16):
     """16 requests with 5 drafts each on a cost table that grows 4 ms per 16-token
     graph, as the cost tables do below the capture limit."""
@@ -774,6 +807,40 @@ def test_fill_graph_padding_respects_the_rejection_sampler_chunk():
     assert manager.fill_graph_padding(6) is None
 
 
+def test_step_timing_times_the_sampler_by_the_logit_rows_it_ran_on(monkeypatch):
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(9),
+    )
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.sampler_start()
+        _FakeCudaEvent.tick += 2.0  # the sampler takes three ticks
+        collector.sampler_end()
+        collector.drafter_start()
+        collector.drafter_end()
+        # A dummy step never samples: no sampler time, not a zero measurement.
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    assert [(s.sampler_ms, s.num_logits) for s in timings] == [(3.0, 9), (0.0, 9)]
+
+
 def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):
     # Under DP a rank replays the largest rank's graph; keying by its own
     # token count would price that graph on a smaller shape.
@@ -785,7 +852,12 @@ def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):
     _FakeCudaEvent.tick = 0.0
     _FakeCudaEvent.available = True
     collector = StepTimingCollector()
-    batch = SimpleNamespace(num_tokens=10, num_tokens_after_padding=64, num_reqs=5)
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(7),
+    )
     with collector.collect() as timings:
         collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
         collector.forward_start()
