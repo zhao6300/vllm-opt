@@ -247,6 +247,8 @@ class AdmittedDraftCounts:
 class AdaptiveVerificationManager:
     # The sampler's cost by logit row count; None until it has been timed.
     sampler_cost_ms: np.ndarray | None = None
+    # The drafter's eager context K/V cost by target token count; None until timed.
+    context_kv_cost_ms: np.ndarray | None = None
 
     def __init__(
         self,
@@ -448,10 +450,12 @@ class AdaptiveVerificationManager:
         self,
         tables: tuple[np.ndarray, np.ndarray],
         sampler_cost_ms: np.ndarray | None = None,
+        context_kv_cost_ms: np.ndarray | None = None,
     ) -> None:
         """Use new cost tables from the next step on."""
         self.cost_tables = tables
         self.sampler_cost_ms = sampler_cost_ms
+        self.context_kv_cost_ms = context_kv_cost_ms
         logger.debug("DSpark cost tables: %s", self.cost_tables)
 
     def set_cost_curves(
@@ -610,10 +614,21 @@ class AdaptiveVerificationManager:
         ]
         # Verifying a draft also costs a logit row: the sampler runs after the
         # forward, outside the graph the verify table prices.
-        sampler_costs = self._sampler_costs(
-            num_reqs * self.num_bonus_tokens, max_draft_budget
+        sampler_costs = self._cost_slice(
+            self.sampler_cost_ms, num_reqs * self.num_bonus_tokens, max_draft_budget
         )
-        costs = draft_cost_ms[len(req_ids)] + verify_costs + sampler_costs
+        # A step with prefill runs the drafter's context K/V pass eagerly, and it
+        # grows with the target tokens, so each verified draft adds to it. A
+        # decode-only step runs it inside the drafter's graph, priced by the
+        # draft table.
+        context_costs = np.zeros(max_draft_budget + 1)
+        if np.any(num_non_draft_tokens > 1):
+            context_costs = self._cost_slice(
+                self.context_kv_cost_ms, num_non_draft_tokens_total, max_draft_budget
+            )
+        costs = (
+            draft_cost_ms[len(req_ids)] + verify_costs + sampler_costs + context_costs
+        )
         num_drafts_per_req = {
             req_id: int(num_drafts)
             for req_id, num_drafts in zip(req_ids, scheduled_drafts, strict=True)
@@ -723,22 +738,25 @@ class AdaptiveVerificationManager:
         floor = best_rate * (self._fill_cost_ratio * forward_price + sampler_price)
         return int(np.count_nonzero(scores[draft_budget:] >= floor))
 
-    def _sampler_costs(self, first_row: int, max_draft_budget: int) -> np.ndarray:
-        """The sampler's cost at each draft budget, from none to all.
+    @staticmethod
+    def _cost_slice(
+        table: np.ndarray | None, first_size: int, max_draft_budget: int
+    ) -> np.ndarray:
+        """A smooth cost table at each draft budget, from none to all.
 
         Args:
-            first_row: Logit rows the step takes without any draft.
+            table: The cost by size, None until it has been timed.
+            first_size: The size the step has without any draft.
             max_draft_budget: The most drafts the step could verify.
 
         Returns:
-            Zeros until the sampler has been timed.
+            Zeros until the table has been timed.
 
         """
-        table = self.sampler_cost_ms
         if table is None:
             return np.zeros(max_draft_budget + 1)
-        rows = np.arange(first_row, first_row + max_draft_budget + 1)
-        return table[np.minimum(rows, len(table) - 1)]
+        sizes = np.arange(first_size, first_size + max_draft_budget + 1)
+        return table[np.minimum(sizes, len(table) - 1)]
 
     def compact_batch(
         self,

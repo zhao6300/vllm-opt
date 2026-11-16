@@ -38,6 +38,11 @@ class StepTimingSample:
     # 0.0 for a step that never sampled).
     sampler_ms: float = 0.0
     num_logits: int = 0
+    # The drafter's eager context K/V pass (storing the target's hidden states
+    # for its draft) and the target tokens it ran on; 0.0 when it ran inside
+    # the drafter's CUDA graph or not at all.
+    context_kv_ms: float = 0.0
+    num_context_tokens: int = 0
 
 
 def _timing_event() -> torch.cuda.Event:
@@ -53,8 +58,18 @@ class StepTimingEvents:
     drafter_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
     sampler_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
     sampler_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    context_start: torch.cuda.Event = field(default_factory=lambda: _timing_event())
+    context_end: torch.cuda.Event = field(default_factory=lambda: _timing_event())
     # Set once the sampler's events are recorded; dummy steps never are.
     has_sampler: bool = False
+    has_context: bool = False
+    num_context_tokens: int = 0
+
+    def context_ms(self) -> float:
+        """The drafter's eager context K/V time, 0.0 for a step without one."""
+        if not self.has_context:
+            return 0.0
+        return self.context_start.elapsed_time(self.context_end)
 
     def sampler_ms(self) -> float:
         """The sampler's time, 0.0 for a step that did not run it."""
@@ -120,6 +135,8 @@ class StepTimingCollector:
                 full_cudagraph,
                 events.sampler_ms(),
                 num_logits,
+                events.context_ms(),
+                events.num_context_tokens,
             )
             for events, (
                 full_cudagraph,
@@ -165,6 +182,17 @@ class StepTimingCollector:
         if self._step is not None:
             self._step.forward_end.record()
 
+    def context_start(self, num_tokens: int) -> None:
+        """Start timing the drafter's eager context K/V pass over `num_tokens`."""
+        if self._step is not None:
+            self._step.context_start.record()
+            self._step.num_context_tokens = num_tokens
+
+    def context_end(self) -> None:
+        if self._step is not None:
+            self._step.context_end.record()
+            self._step.has_context = True
+
     def sampler_start(self) -> None:
         if self._step is not None:
             self._step.sampler_start.record()
@@ -208,6 +236,8 @@ class StepTimingCollector:
                     full_cudagraph,
                     events.sampler_ms(),
                     num_logits,
+                    events.context_ms(),
+                    events.num_context_tokens,
                 )
             )
         return samples

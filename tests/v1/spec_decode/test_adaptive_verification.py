@@ -691,6 +691,31 @@ def test_a_filled_row_pays_the_samplers_price_in_full():
     assert costly._batch_fill_candidates == 1
 
 
+def _context_manager(non_draft_tokens: dict[str, int]):
+    """A decode request with two drafts, and another request that takes
+    `non_draft_tokens["low"]` tokens this step (a prefill chunk when above 1)."""
+    confidences = np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32)
+    manager = make_manager(confidences, np.ones(40))
+    # The drafter's eager context pass costs 5 ms per target token beyond the
+    # nine the mixed step has before any draft.
+    manager.context_kv_cost_ms = np.maximum(np.arange(40) - 9, 0) * 5.0
+    manager.get_num_tokens(
+        {"low": non_draft_tokens["low"], "high": 3},
+        {"low": [], "high": [3, 4]},
+    )
+    return manager
+
+
+def test_a_verified_draft_pays_for_the_drafters_context_pass_in_a_prefill_step():
+    mixed = _context_manager({"low": 8})
+    decode_only = _context_manager({"low": 1})
+
+    assert mixed._batch_budget[2] == 0
+    # A decode-only step runs the pass inside the drafter's graph, which the
+    # draft table already prices.
+    assert decode_only._batch_budget[2] == 2
+
+
 def _staircase_manager(fill_cost_ratio: float, num_reqs: int = 16):
     """16 requests with 5 drafts each on a cost table that grows 4 ms per 16-token
     graph, as the cost tables do below the capture limit."""
@@ -839,6 +864,43 @@ def test_step_timing_times_the_sampler_by_the_logit_rows_it_ran_on(monkeypatch):
         collector.drafter_end()
 
     assert [(s.sampler_ms, s.num_logits) for s in timings] == [(3.0, 9), (0.0, 9)]
+
+
+def test_step_timing_times_the_drafters_eager_context_pass(monkeypatch):
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(9),
+    )
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=False)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.context_start(2048)
+        _FakeCudaEvent.tick += 3.0  # the context pass takes four ticks
+        collector.context_end()
+        collector.drafter_end()
+        # A drafter that ran its context pass inside a graph has none to time.
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    assert [(s.context_kv_ms, s.num_context_tokens) for s in timings] == [
+        (4.0, 2048),
+        (0.0, 0),
+    ]
 
 
 def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):

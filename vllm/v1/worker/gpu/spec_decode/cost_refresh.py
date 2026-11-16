@@ -34,8 +34,9 @@ logger = init_logger(__name__)
 _WORKER_TIMEOUT_S = 60.0
 
 _Tables = tuple[np.ndarray, np.ndarray]
-# The draft curve, the verify curve and the sampler's cost by logit row count.
-_Curves = tuple[np.ndarray, np.ndarray, np.ndarray]
+# The draft curve, the verify curve, the sampler's cost by logit row count and
+# the drafter's eager context K/V cost by target token count.
+_Curves = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
 
 
 def curve_to_dense(curve: list[tuple[int, float]], size: int) -> np.ndarray:
@@ -53,14 +54,13 @@ def dense_to_curve(dense: np.ndarray) -> list[tuple[int, float]]:
 
 
 def sampler_table_from_curve(dense: np.ndarray) -> np.ndarray | None:
-    """Fill a sampler curve into a cost for every logit row count.
+    """Fill a smooth curve (sampler rows, context K/V tokens) into a table.
 
-    The sampler's cost grows smoothly with its rows, so the sizes between two
-    timed ones are interpolated and the ends stay flat.
+    The cost grows smoothly with its size, so the sizes between two timed ones
+    are interpolated and the ends stay flat.
 
     Args:
-        dense: The measured sampler milliseconds by row count, NaN where
-            nothing was timed.
+        dense: The measured milliseconds by size, NaN where nothing was timed.
 
     Returns:
         The table, or None when nothing was timed yet.
@@ -90,7 +90,7 @@ class CostRefresher:
         build_tables: Callable[
             [list[tuple[int, float]], list[tuple[int, float]]], _Tables
         ],
-        install: Callable[[_Tables, np.ndarray | None], None],
+        install: Callable[[_Tables, np.ndarray | None, np.ndarray | None], None],
         tp_group: Any,
         pp_group: Any,
         min_samples: int = 4,
@@ -103,8 +103,8 @@ class CostRefresher:
         interval: Served steps between rebuilds.
         window: Timings kept per size; the median of these is the cost.
         build_tables: Turns the agreed curves into cost tables.
-        install: Takes the new tables and the sampler's cost table (None until
-            the sampler has been timed); called from the step loop.
+        install: Takes the new tables, then the sampler's and the context K/V
+            cost tables (None until timed); called from the step loop.
         tp_group: Coordinator with `world_size`, `ranks` and `cpu_group`.
         pp_group: The same, for the pipeline stages.
         min_samples: Timings a size needs before it replaces its startup cost.
@@ -133,6 +133,9 @@ class CostRefresher:
         self._online_sampler: dict[int, deque[float]] = defaultdict(
             lambda: deque(maxlen=self._window)
         )
+        self._online_context: dict[int, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self._window)
+        )
         # This rank's curves: the startup profile with live medians laid over
         # it. Replaced whole by the worker, never edited, so a reader holding
         # one sees a consistent pair.
@@ -140,11 +143,12 @@ class CostRefresher:
             curve_to_dense(base_draft_curve, self._draft_size),
             curve_to_dense(base_verify_curve, self._verify_size),
             np.full(self._verify_size, np.nan, dtype=np.float32),
+            np.full(self._verify_size, np.nan, dtype=np.float32),
         )
         self._lock = threading.Lock()
         self._inbox: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._merged = threading.Event()
-        self._result: tuple[_Tables, np.ndarray | None] | None = None
+        self._result: tuple[_Tables, np.ndarray | None, np.ndarray | None] | None = None
         self._error: BaseException | None = None
 
         # The step loop's own state.
@@ -270,7 +274,7 @@ class CostRefresher:
                 return
 
     def _fold(self, samples: list[StepTimingSample]) -> None:
-        draft, verify, sampler = (curve.copy() for curve in self._local)
+        draft, verify, sampler, context = (curve.copy() for curve in self._local)
         for sample in samples:
             if 0 <= sample.num_target_tokens < self._verify_size:
                 self._online_verify[sample.num_target_tokens].append(sample.forward_ms)
@@ -282,8 +286,17 @@ class CostRefresher:
             if sample.sampler_ms > 0 and 0 <= sample.num_logits < self._verify_size:
                 self._online_sampler[sample.num_logits].append(sample.sampler_ms)
                 self._replace(sampler, sample.num_logits, self._online_sampler)
+            # Only steps that ran the drafter's context pass eagerly have one.
+            if (
+                sample.context_kv_ms > 0
+                and 0 <= sample.num_context_tokens < self._verify_size
+            ):
+                self._online_context[sample.num_context_tokens].append(
+                    sample.context_kv_ms
+                )
+                self._replace(context, sample.num_context_tokens, self._online_context)
         with self._lock:
-            self._local = (draft, verify, sampler)
+            self._local = (draft, verify, sampler, context)
 
     def _replace(
         self, dense: np.ndarray, key: int, buckets: dict[int, deque[float]]
@@ -305,6 +318,8 @@ class CostRefresher:
                 "Adaptive verification could not rebuild its step costs from the "
                 "ranks' curves"
             )
-        sampler = sampler_table_from_curve(merged[verify_end:])
-        self._result = (self._build_tables(draft, verify), sampler)
+        sampler_end = verify_end + self._verify_size
+        sampler = sampler_table_from_curve(merged[verify_end:sampler_end])
+        context = sampler_table_from_curve(merged[sampler_end:])
+        self._result = (self._build_tables(draft, verify), sampler, context)
         self._merged.set()

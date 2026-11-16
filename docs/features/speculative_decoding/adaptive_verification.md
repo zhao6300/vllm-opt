@@ -65,6 +65,8 @@ The startup profile can drift from what the server actually measures: another pr
 
 The refresh also times the sampler (the logits and rejection sampling, which run after the forward and are not in the verify table) on the last PP stage, by the number of logit rows it ran on, and interpolates between the sizes it has seen. Verifying a draft costs its row in the sampler, so the draft budget prices it: `accepted tokens / (drafter + forward + sampler)`. Until the first rebuild that has timed the sampler there is no sampler term, which is the earlier behavior.
 
+The drafter's eager context K/V pass (storing the target hidden states and precomputing context K/V) is timed the same way, by target-token count. It runs outside the drafter graph only on steps that carry prefill tokens, so its cost is added to the budget only for those steps. Decode-only steps in a FULL graph already include it in the drafter cost. Until it has been timed there is no context term.
+
 The refresh never stops the step loop. The medians and the table build run on a worker thread. The ranks exchange their curves with asynchronous CPU collectives that the loop only issues, on a schedule counted in served steps: TP ranks take rank 0's curves, then PP stages take the slowest stage's cost per shape. The new tables are installed on a fixed step, at most `3 * 8` steps after the rebuild began, so every rank switches together. The loop waits only if a stage has not finished by its step, which is rare with a lag of several steps.
 
 ```bash

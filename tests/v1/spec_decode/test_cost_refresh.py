@@ -39,6 +39,8 @@ def timing(
     drafter_ms: float = 0.5,
     sampler_ms: float = 0.0,
     num_logits: int = 0,
+    context_kv_ms: float = 0.0,
+    num_context_tokens: int = 0,
 ):
     return StepTimingSample(
         forward_ms,
@@ -48,6 +50,8 @@ def timing(
         full_cudagraph=True,
         sampler_ms=sampler_ms,
         num_logits=num_logits,
+        context_kv_ms=context_kv_ms,
+        num_context_tokens=num_context_tokens,
     )
 
 
@@ -60,7 +64,9 @@ def make_refresher(installs, step, interval=16, tp=ALONE, pp=ALONE, build=build_
         interval,
         window=16,
         build_tables=build,
-        install=lambda tables, sampler: installs.append((step[0], tables, sampler)),
+        install=lambda tables, sampler, context: installs.append(
+            (step[0], tables, sampler, context)
+        ),
         tp_group=tp,
         pp_group=pp,
     )
@@ -117,6 +123,23 @@ def test_the_sampler_cost_is_interpolated_between_the_sizes_it_was_timed_at():
     # Flat beyond the ends.
     assert sampler[0] == 1.0
     assert sampler[40] == 3.0
+
+
+def test_the_context_kv_cost_is_a_table_by_target_tokens_once_timed():
+    installs, step = [], [0]
+    refresher = make_refresher(installs, step, interval=16)
+    try:
+        refresher.observe(
+            [timing(32, 20.0, context_kv_ms=2.0, num_context_tokens=8)] * 4
+            + [timing(32, 20.0, context_kv_ms=6.0, num_context_tokens=24)] * 4
+        )
+        refresher.flush()
+        run_steps(refresher, step, 30)
+    finally:
+        refresher.close()
+
+    context = installs[0][3]
+    assert (context[8], context[16], context[24]) == (2.0, 4.0, 6.0)
 
 
 def test_there_is_no_sampler_cost_until_the_sampler_was_timed():
@@ -225,6 +248,8 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
                 # Only the last stage samples; its TP ranks time slightly apart.
                 sampler_ms=2.0 + tp_rank if stage == pp_size - 1 else 0.0,
                 num_logits=16,
+                context_kv_ms=4.0 + tp_rank if stage == pp_size - 1 else 0.0,
+                num_context_tokens=24,
             )
             for _ in range(4)
         ]
@@ -238,6 +263,7 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
         installs[0][1][0].tolist(),
         installs[0][1][1].tolist(),
         installs[0][2].tolist(),
+        installs[0][3].tolist(),
     )
     gathered: list = [None] * world_size
     dist.all_gather_object(gathered, mine)
@@ -247,13 +273,14 @@ def refresh_worker(rank: int, world_size: int, store: str, tp_size: int, pp_size
 
     assert len(installs) == 1
     assert all(entry == gathered[0] for entry in gathered), gathered
-    install_step, draft, verify, sampler = gathered[0]
+    install_step, draft, verify, sampler, context = gathered[0]
     # One lag per stage: the rebuild, a TP broadcast, a PP gather.
     assert install_step == 16 + 4 * (1 + (tp_size > 1) + (pp_size > 1))
     assert verify[32] == 20.0 + 10 * (pp_size - 1)
     assert draft[4] == 1.0 + 3 * (pp_size - 1)
     # The last stage's TP rank 0 timed the sampler; the others did not.
     assert set(sampler) == {2.0}
+    assert set(context) == {4.0}
 
 
 @pytest.mark.parametrize(
