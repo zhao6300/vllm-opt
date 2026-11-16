@@ -1825,6 +1825,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # The engine prices its backlog in ms when a prefill step time budget
         # is configured; the budget turns that into a number of steps.
         self.lb_step_budget_ms = max(envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
+        # This client's own dispatches whose prefill has not finished, by engine.
+        # It floors the engine-reported backlog for the ~100 ms before the next
+        # snapshot lands, which is exactly when a burst of mixed-size prompts is
+        # routed: without it, sizes reach the score too late and each engine
+        # simply takes every fourth request.
+        self.req_pending_prefill: dict[str, tuple[EngineIdentity, int, float]] = {}
+        self.engine_pending_tokens: Counter[EngineIdentity] = Counter()
+        self.engine_pending_ms: Counter[EngineIdentity] = Counter()
 
         super().__init__(
             vllm_config,
@@ -1891,9 +1899,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # Unfinished prefill occupies the engine's steps for as
                     # long as it takes, however few requests that is. The
                     # engine reports the remainder itself, with cache hits
-                    # already taken out. Scale this client's share by the
-                    # clients, like the in-flight count, and count at most
-                    # `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    # already taken out; this client's own recent dispatches
+                    # floor it until the next snapshot. Scale this client's
+                    # share by the clients, like the in-flight count, and count
+                    # at most `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    engine = self.core_engines[idx]
+                    pending_prefill_tokens = max(
+                        pending_prefill_tokens, self.engine_pending_tokens[engine]
+                    )
+                    pending_prefill_ms = max(
+                        pending_prefill_ms, self.engine_pending_ms[engine]
+                    )
                     if self.lb_step_budget_ms > 0 and pending_prefill_ms > 0:
                         pending_load = pending_prefill_ms / self.lb_step_budget_ms
                     else:
@@ -1944,7 +1960,22 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
+        if self.token_aware_lb and request.prompt_token_ids is not None:
+            tokens = len(request.prompt_token_ids)
+            ms = tokens * envs.VLLM_PREFILL_COST_MS_PER_TOKEN
+            self.req_pending_prefill[request.request_id] = (chosen_engine, tokens, ms)
+            self.engine_pending_tokens[chosen_engine] += tokens
+            self.engine_pending_ms[chosen_engine] += ms
         return chosen_engine
+
+    def _release_pending_prefill(self, req_id: str) -> None:
+        """Drop a request's own dispatch from its engine's local floor."""
+        entry = self.req_pending_prefill.pop(req_id, None)
+        if entry is None:
+            return
+        engine, tokens, ms = entry
+        self.engine_pending_tokens[engine] -= tokens
+        self.engine_pending_ms[engine] -= ms
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1969,6 +2000,13 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.req_pending_prefill:
+            # The first output of a request means its prefill is done; a request
+            # that finishes without one (an abort) also stops being pending.
+            for output in outputs.outputs:
+                self._release_pending_prefill(output.request_id)
+            for req_id in outputs.finished_requests or ():
+                self._release_pending_prefill(req_id)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:

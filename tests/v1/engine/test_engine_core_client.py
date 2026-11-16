@@ -29,6 +29,7 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
@@ -223,6 +224,9 @@ def _make_dplb_client(
     client.token_aware_lb = token_aware
     client.lb_prefill_tokens_per_request = prefill_tokens_per_request
     client.lb_step_budget_ms = 0.0
+    client.req_pending_prefill = {}
+    client.engine_pending_tokens = Counter()
+    client.engine_pending_ms = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
     # [waiting, running, kv_cache_usage, pending_prefill_tokens]
     client.lb_engines = [[0, 0, 0.0, 0] for _ in range(num_engines)]
@@ -519,6 +523,9 @@ def test_dplb_token_aware_prices_the_backlog_in_budget_steps():
     # The same snapshot without a budget prices the ten tokens as nothing:
     # engine 0 scores 3 against 4 and wins.
     client.lb_step_budget_ms = 0.0
+    client.req_pending_prefill = {}
+    client.engine_pending_tokens = Counter()
+    client.engine_pending_ms = Counter()
     client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
     client.eng_start_index = 1
     chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
@@ -1842,3 +1849,41 @@ def test_dp_prefill_cap_is_agreed_over_the_group(monkeypatch):
     core.scheduler.prefill_cost_model = None
     core._align_prefill_cap_over_dp()
     assert calls == []
+
+
+def test_dplb_uses_its_own_dispatches_as_a_pending_floor():
+    """A burst routes before any engine snapshot lands, so the size of what
+    this client just sent is the only load signal it has: it must floor the
+    reported backlog, or every engine simply takes every fourth request and
+    mixed sizes land wherever."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    # Tokens per request-equivalent is 1000; a 8000-token prompt is 8 of them,
+    # above the 4 the term counts.
+    client.lb_prefill_tokens_per_request = 1000
+
+    # First request: nothing known, the scan start decides.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert client.get_core_engine_for_request(first) == client.core_engines[0]
+    assert client.engine_pending_tokens[client.core_engines[0]] == 8000
+
+    # Second request sees no snapshot change, but the local floor now makes
+    # engine 0 look busy, so it goes elsewhere.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    second = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert client.get_core_engine_for_request(second) == client.core_engines[1]
+
+    # The first output ends the pending prefill and drops the floor.
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=first.request_id, new_token_ids=[5])]
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert client.engine_pending_tokens[client.core_engines[0]] == 0
+    assert first.request_id not in client.req_pending_prefill
+
+    # Finishing without an output (an abort) releases it too, and only once.
+    outputs = EngineCoreOutputs(finished_requests={second.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_tokens.values()) == 0
+    assert not client.req_pending_prefill
