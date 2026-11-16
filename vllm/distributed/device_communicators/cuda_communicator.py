@@ -7,7 +7,12 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.device_allocator.alloc_conf import (
+    EXPANDABLE_SEGMENTS,
+    conf_flag_enabled,
+    current_alloc_conf,
+)
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_ag_rs,
@@ -30,6 +35,26 @@ logger = init_logger(__name__)
 # Since NCCL 2.29.2, ncclSymkPickKernel accepts registered input with
 # non-registered output for ReduceScatter (ncclSymSendRegRecvNonreg).
 NCCL_DIRECT_SYMM_RS_OUTPUT_MIN_VERSION = 22902
+
+
+def registers_graph_buffers(config: VllmConfig | None) -> bool:
+    """Whether custom all-reduce can IPC-register the buffers a CUDA graph reads.
+
+    `cudaIpcGetMemHandle` rejects memory that CUDA VMM maps, which is what
+    PyTorch's `expandable_segments` allocator and the cuMem graph pool hand
+    out, and it fails capture with "invalid argument". Their inputs are copied
+    into the pre-registered buffer instead.
+
+    Args:
+        config: The vLLM config, or None outside an engine.
+
+    Returns:
+        True when graph buffers can be registered.
+
+    """
+    if conf_flag_enabled(current_alloc_conf(), EXPANDABLE_SEGMENTS):
+        return False
+    return config is None or not config.use_cumem_cudagraph_pool
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -121,9 +146,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_aiter_ag_rs: bool = False
         self.use_aiter_tp_all_gather: bool = False
 
-        # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
-        config = get_current_vllm_config_or_none()
-        register = config is None or not config.use_cumem_cudagraph_pool
+        register = registers_graph_buffers(get_current_vllm_config_or_none())
 
         if use_torch_symm_mem and current_platform.is_cuda():
             self.symm_mem_comm = SymmMemCommunicator(
