@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING: bool = False
     VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO: float = 0.5
     VLLM_DP_LB_TOKEN_AWARE: bool = False
+    VLLM_DP_LB_SHARED_LOAD: bool = False
     VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
     VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
     VLLM_PREFILL_COST_FIXED_MS: float = 0.0
@@ -1328,6 +1329,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DP_LB_TOKEN_AWARE": lambda: bool(
         int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
+    ),
+    # With several API servers on one host, let them share their per-engine
+    # in-flight and pending-prefill figures through shared memory, so each routes
+    # from every server's dispatches rather than its own scaled by the server
+    # count. Default: off.
+    "VLLM_DP_LB_SHARED_LOAD": lambda: bool(
+        int(os.getenv("VLLM_DP_LB_SHARED_LOAD", "0"))
     ),
     # With VLLM_DP_LB_TOKEN_AWARE: how many pending prefill tokens weigh as much
     # as one waiting/running request in an engine's score. One engine's pending

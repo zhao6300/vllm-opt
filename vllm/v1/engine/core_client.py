@@ -57,6 +57,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.dp_lb_shared import SharedDPLoadStats
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
@@ -101,6 +102,9 @@ _DP_LB_MAX_PENDING_REQUESTS = 4.0
 # may have been computed before the engine received the request, the second
 # cannot have been.
 _DP_LB_FLOOR_SNAPSHOTS = 2
+# The stats task wakes at least this often, so a server stays alive to the
+# others' shared-load heartbeat check (stale after 2 s) between sparse snapshots.
+_STATS_POLL_TIMEOUT_MS = 500
 
 
 def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
@@ -1613,6 +1617,10 @@ class DPAsyncMPClient(AsyncMPClient):
     def _on_lb_snapshot(self) -> None:
         """Called after a load snapshot has replaced `lb_engines`."""
 
+    def _on_stats_poll(self) -> None:
+        """Called each time the stats task wakes, at least every
+        `_STATS_POLL_TIMEOUT_MS`, snapshot or not."""
+
     def _ensure_stats_update_task(self):
         resources = self.resources
         if resources.stats_update_task is not None:
@@ -1641,7 +1649,8 @@ class DPAsyncMPClient(AsyncMPClient):
                 poller.register(scale_rcv_socket, zmq.POLLIN)
 
                 while True:
-                    events = dict(await poller.poll())
+                    events = dict(await poller.poll(timeout=_STATS_POLL_TIMEOUT_MS))
+                    self._on_stats_poll()
                     if scale_rcv_socket in events:
                         buf = scale_rcv_socket.recv(flags=zmq.NOBLOCK).result()
                         msg_type, new_engine_count = msgspec.msgpack.decode(buf)
@@ -1847,6 +1856,15 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.lb_snapshot_seq = 0
         self.engine_pending_tokens: Counter[EngineIdentity] = Counter()
         self.engine_pending_ms: Counter[EngineIdentity] = Counter()
+        # Other API servers' load, when they share it (VLLM_DP_LB_SHARED_LOAD).
+        self.shared_load: SharedDPLoadStats | None = None
+        if client_addresses is not None and "dp_lb_shared_load" in client_addresses:
+            self.shared_load = SharedDPLoadStats(
+                client_addresses.pop("dp_lb_shared_load"),
+                client_count,
+                client_index,
+                client_addresses.pop("dp_lb_shared_load_engines"),
+            )
 
         super().__init__(
             vllm_config,
@@ -1890,6 +1908,14 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             trace: list[tuple[int, int, int, float] | None] | None = None
             if logger.isEnabledFor(logging.DEBUG):
                 trace = [None] * num_engines
+            # With shared load the other servers' figures are exact, so nothing
+            # is scaled by the server count.
+            others = (
+                self.shared_load.others(num_engines)
+                if self.shared_load is not None
+                else None
+            )
+            scale = 1 if others is not None else self.client_count
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
@@ -1908,7 +1934,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # race with routing decisions; the snapshot raises the score
                 # when other clients or stale requests load the engine.
                 inflight = self.engine_inflight[self.core_engines[idx]]
-                score: float = max(self.client_count * inflight, waiting + running)
+                other_inflight, other_tokens, other_ms = (
+                    others[idx] if others is not None else (0, 0, 0.0)
+                )
+                score: float = max(
+                    scale * (inflight + other_inflight), waiting + running
+                )
                 if self.token_aware_lb:
                     # Unfinished prefill occupies the engine's steps for as
                     # long as it takes, however few requests that is. The
@@ -1919,10 +1950,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # at most `_DP_LB_MAX_PENDING_REQUESTS` of them.
                     engine = self.core_engines[idx]
                     pending_prefill_tokens = max(
-                        pending_prefill_tokens, self.engine_pending_tokens[engine]
+                        pending_prefill_tokens,
+                        self.engine_pending_tokens[engine] + other_tokens,
                     )
                     pending_prefill_ms = max(
-                        pending_prefill_ms, self.engine_pending_ms[engine]
+                        pending_prefill_ms,
+                        self.engine_pending_ms[engine] + other_ms,
                     )
                     if self.lb_step_budget_ms > 0 and pending_prefill_ms > 0:
                         pending_load = pending_prefill_ms / self.lb_step_budget_ms
@@ -1930,9 +1963,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         pending_load = (
                             pending_prefill_tokens / self.lb_prefill_tokens_per_request
                         )
-                    score += min(
-                        self.client_count * pending_load, _DP_LB_MAX_PENDING_REQUESTS
-                    )
+                    score += min(scale * pending_load, _DP_LB_MAX_PENDING_REQUESTS)
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache
                     # pressure: a queue on a KV-bound engine drains slowly, so
@@ -1953,7 +1984,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+            current_counts[eng_index][0] += scale
             # Rotate the scan start so that ties (equal scores, e.g. right
             # after a coordinator stats reset when engines look equally loaded)
             # don't systematically favor the same engine. This removes the
@@ -1985,7 +2016,24 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             )
             self.engine_pending_tokens[chosen_engine] += tokens
             self.engine_pending_ms[chosen_engine] += ms
+        self._publish_load(chosen_engine)
         return chosen_engine
+
+    def _on_stats_poll(self) -> None:
+        # Snapshots can be 5 s apart on a steady load, so the heartbeat that
+        # tells the other servers this one is alive rides on the poll timeout.
+        if self.shared_load is not None:
+            self.shared_load.heartbeat()
+
+    def _publish_load(self, engine: EngineIdentity) -> None:
+        """Write this server's figures for `engine` to the shared slots."""
+        if self.shared_load is not None:
+            self.shared_load.publish(
+                self.core_engines.index(engine),
+                self.engine_inflight[engine],
+                self.engine_pending_tokens[engine],
+                self.engine_pending_ms[engine],
+            )
 
     def _release_pending_prefill(self, req_id: str) -> None:
         """Drop a request's own dispatch from its engine's local floor."""
@@ -1995,6 +2043,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         engine, tokens, ms, _ = entry
         self.engine_pending_tokens[engine] -= tokens
         self.engine_pending_ms[engine] -= ms
+        self._publish_load(engine)
 
     def _on_lb_snapshot(self) -> None:
         """Drop the floor of every dispatch a snapshot has had time to see."""
@@ -2039,6 +2088,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
+                    self._publish_load(engine)
 
     @staticmethod
     async def eep_process_engine_core_notification(

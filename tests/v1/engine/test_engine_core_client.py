@@ -4,6 +4,7 @@
 import asyncio
 import importlib
 import inspect
+import multiprocessing
 import os
 import signal
 import time
@@ -42,6 +43,7 @@ from vllm.v1.engine.core_client import (
     MPClient,
     SyncMPClient,
 )
+from vllm.v1.engine.dp_lb_shared import SharedDPLoadStats
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.pool.late_interaction import (
@@ -226,6 +228,7 @@ def _make_dplb_client(
     client.lb_step_budget_ms = 0.0
     client.req_pending_prefill = {}
     client.lb_snapshot_seq = 0
+    client.shared_load = None
     client.engine_pending_tokens = Counter()
     client.engine_pending_ms = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
@@ -1974,3 +1977,133 @@ def test_dplb_pending_floor_expires_in_dispatch_order():
     asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
     assert sum(client.engine_pending_tokens.values()) == 0
     assert sum(client.engine_pending_ms.values()) == 0
+
+
+def _make_shared_dplb_clients(num_engines=2, client_count=2, capacity=None):
+    """DPLB clients, like API server processes, over one shared load array."""
+    capacity = capacity or num_engines
+    counters = multiprocessing.RawArray(
+        "q", SharedDPLoadStats.num_counters(client_count, capacity)
+    )
+    clients = []
+    for index in range(client_count):
+        client = _make_dplb_client(
+            num_engines=num_engines, client_count=client_count, token_aware=True
+        )
+        client.shared_load = SharedDPLoadStats(counters, client_count, index, capacity)
+        clients.append(client)
+    return clients
+
+
+def test_shared_dp_load_sums_the_other_live_servers(monkeypatch):
+    counters = multiprocessing.RawArray("q", SharedDPLoadStats.num_counters(3, 2))
+    servers = [SharedDPLoadStats(counters, 3, i, 2) for i in range(3)]
+    now = 10_000_000_000
+    monkeypatch.setattr("vllm.v1.engine.dp_lb_shared.time.monotonic_ns", lambda: now)
+    servers[0].publish(0, 1, 100, 2.5)
+    servers[1].publish(0, 2, 300, 1.0)
+    servers[1].publish(1, 4, 0, 0.0)
+
+    # Server 2 never wrote, so it is not counted; a server never counts itself.
+    assert servers[0].others(2) == [(2, 300, 1.0), (4, 0, 0.0)]
+    assert servers[2].others(2) == [(3, 400, 3.5), (4, 0, 0.0)]
+
+    # A server that stops beating is a dead one, and its load is dropped.
+    monkeypatch.setattr(
+        "vllm.v1.engine.dp_lb_shared.time.monotonic_ns", lambda: now + 3_000_000_000
+    )
+    servers[0].heartbeat()
+    assert servers[0].others(2) == [(0, 0, 0.0), (0, 0, 0.0)]
+    assert servers[2].others(2) == [(1, 100, 2.5), (0, 0, 0.0)]
+
+
+def test_shared_dp_load_ignores_engines_past_its_capacity():
+    counters = multiprocessing.RawArray("q", SharedDPLoadStats.num_counters(2, 2))
+    first, second = (SharedDPLoadStats(counters, 2, i, 2) for i in range(2))
+    first.publish(1, 5, 50, 1.0)
+    first.publish(2, 9, 90, 9.0)  # no such slot: ignored, not written over a neighbour
+    assert second.others(3) == [(0, 0, 0.0), (5, 50, 1.0), (0, 0, 0.0)]
+    assert SharedDPLoadStats.slot_counters(2) % SharedDPLoadStats.COUNTERS_PER_LINE == 0
+
+
+def test_dplb_routes_around_another_servers_dispatches():
+    """Server B has dispatched nothing, but sees A's long prompt through the
+    shared slots at once, so a burst split over two servers is still spread."""
+    a, b = _make_shared_dplb_clients()
+    for client in (a, b):
+        client.lb_prefill_tokens_per_request = 1000
+    first = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert a.get_core_engine_for_request(first) == a.core_engines[0]
+
+    # B's own request count matches A's, so only the prompt A sent tells them apart.
+    b.engine_inflight[b.core_engines[1]] += 1
+    b.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 100)
+    assert b.get_core_engine_for_request(probe) == b.core_engines[1]
+
+    # Without the shared slots B has no way to know and takes engine 0.
+    b.shared_load = None
+    b.eng_start_index = 0
+    alone = make_request(SamplingParams(max_tokens=4), [1] * 100)
+    assert b.get_core_engine_for_request(alone) == b.core_engines[0]
+
+
+def test_dplb_shared_load_follows_a_finished_request():
+    a, b = _make_shared_dplb_clients()
+    request = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    a.get_core_engine_for_request(request)
+    assert b.shared_load.others(2)[0][:2] == (1, 8000)
+
+    a_outputs = EngineCoreOutputs(finished_requests={request.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(a, a_outputs))
+    assert b.shared_load.others(2)[0] == (0, 0, 0.0)
+
+
+def test_dplb_shared_load_is_not_scaled_by_the_server_count():
+    """With the other servers' load exact, one request in flight on engine 0
+    weighs one request, not four: engine 1, already running two, is busier."""
+    a, b, *_ = _make_shared_dplb_clients(client_count=4)
+    a.get_core_engine_for_request(make_request(SamplingParams(max_tokens=4), [1] * 10))
+    snapshot = [[0, 0, 0.0, 0, 0.0], [0, 2, 0.0, 0, 0.0]]
+
+    b.lb_engines = [list(counts) for counts in snapshot]
+    b.eng_start_index = 0
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[0])
+    )
+
+    # The estimate it replaces: scaled by four, engine 0 looks busier.
+    b.shared_load = None
+    b.lb_engines = [list(counts) for counts in snapshot]
+    b.eng_start_index = 0
+    b.engine_inflight.clear()
+    b.engine_inflight[b.core_engines[0]] = 1
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[1])
+    )
+
+
+def test_dplb_stats_poll_keeps_the_server_alive_to_the_others():
+    a, b = _make_shared_dplb_clients()
+    assert b.shared_load.others(2) == [(0, 0, 0.0), (0, 0, 0.0)]
+    a.shared_load._counters[0 + 1] = 3  # engine 0 in flight, written before any beat
+    assert b.shared_load.others(2)[0] == (0, 0, 0.0)  # never beat: not counted
+    a._on_stats_poll()
+    assert b.shared_load.others(2)[0] == (3, 0, 0.0)
+
+
+def test_dplb_counts_the_other_servers_in_flight_requests():
+    """Without token-aware routing, only the request counts of the other servers
+    tell B that engine 0 is already taken."""
+    a, b = _make_shared_dplb_clients()
+    for client in (a, b):
+        client.token_aware_lb = False
+    a.get_core_engine_for_request(make_request(SamplingParams(max_tokens=4)))
+
+    b.eng_start_index = 0
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[1])
+    )

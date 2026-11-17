@@ -88,6 +88,12 @@ By default the API server sends a new request to the DP rank with the lowest loa
 
 Set `VLLM_DP_LB_TOKEN_AWARE=1` to add the prompt tokens a rank has not finished prefilling to its score. Each engine reports its own remainder with the load snapshot it publishes every 100 ms, and until the second snapshot after a dispatch the API server floors it with the prefill it has just dispatched itself (its own requests' sizes are known before a snapshot has seen them; afterwards the engine's remainder decides), and that remainder already excludes the tokens a prefix cache or KV connector supplied, so a cached prompt weighs only what it still has to compute (a request that has not been scheduled yet counts in full). When a step time budget is configured (`VLLM_PREFILL_STEP_BUDGET_MS`), the remainder is priced with that budget's cost model and measured in steps of the budget, so what is left of a long-context prompt weighs by its cost rather than its token count; otherwise `VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST` (default 2048) sets how many pending tokens weigh as much as one request. One rank's pending prefill counts for at most four requests, so a single long prompt cannot leave that rank unroutable while its prefill runs. It is off by default, and the default weight has not been tuned.
 
+### Sharing load between API servers
+
+With internal load balancing `--api-server-count` defaults to the data parallel size, and each API server routes alone: it knows its own dispatches exactly, guesses the other servers' by scaling its own by the server count, and otherwise relies on the engines' snapshot, which is up to 200 ms old. A burst that reaches the servers unevenly is then routed from a skewed view.
+
+Set `VLLM_DP_LB_SHARED_LOAD=1` to let the API servers on one host publish their per-engine in-flight requests and pending prefill into shared memory. Each server sums the other servers' figures into its own, so it sees every dispatch as soon as it is made, and nothing is scaled by the server count. A server that stops heartbeating for 2 s (a crashed one) is ignored. It is off by default, does nothing with one API server, and cannot share across hosts, where the engines' snapshot remains the only common view.
+
 ### Sizing prefill chunks by a step time budget
 
 The scheduler caps the prefill tokens of a step with `--max-num-batched-tokens`, whatever else the step carries. In a DP MoE deployment the chunks of a long prompt then make steps of very different length, and the decodes of every rank wait for them.
