@@ -96,6 +96,11 @@ EngineIdentity = bytes
 # staggered 32 x 16K run skews 10/8/7/7 and takes 25% longer than routing
 # without the term; capped, it stays 8/8/8/8 at the uncapped-off time).
 _DP_LB_MAX_PENDING_REQUESTS = 4.0
+# A request this client dispatched floors its engine's pending prefill until this
+# many load snapshots have arrived after it. The first snapshot after a dispatch
+# may have been computed before the engine received the request, the second
+# cannot have been.
+_DP_LB_FLOOR_SNAPSHOTS = 2
 
 
 def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
@@ -1605,6 +1610,9 @@ class DPAsyncMPClient(AsyncMPClient):
         except RuntimeError:
             pass
 
+    def _on_lb_snapshot(self) -> None:
+        """Called after a load snapshot has replaced `lb_engines`."""
+
     def _ensure_stats_update_task(self):
         resources = self.resources
         if resources.stats_update_task is not None:
@@ -1683,6 +1691,7 @@ class DPAsyncMPClient(AsyncMPClient):
                         count_slice = slice(ranks[0], ranks[-1] + 1)
                         sliced_counts = counts[count_slice]
                         self.lb_engines = sliced_counts
+                        self._on_lb_snapshot()
                         logger.debug(
                             "Received counts: %s (%s)", sliced_counts, count_slice
                         )
@@ -1826,11 +1835,16 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # is configured; the budget turns that into a number of steps.
         self.lb_step_budget_ms = max(envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
         # This client's own dispatches whose prefill has not finished, by engine.
-        # It floors the engine-reported backlog for the ~100 ms before the next
-        # snapshot lands, which is exactly when a burst of mixed-size prompts is
-        # routed: without it, sizes reach the score too late and each engine
-        # simply takes every fourth request.
-        self.req_pending_prefill: dict[str, tuple[EngineIdentity, int, float]] = {}
+        # It floors the engine-reported backlog for the ~100 ms before a snapshot
+        # that has seen them lands, which is exactly when a burst of mixed-size
+        # prompts is routed: without it, sizes reach the score too late and each
+        # engine simply takes every fourth request. Once such a snapshot has
+        # arrived the floor is dropped, so the engine's own remainder (cache hits
+        # and prefill progress included) decides.
+        # request id -> (engine, tokens, ms, snapshots received at dispatch);
+        # insertion order is dispatch order, so the snapshot count never falls.
+        self.req_pending_prefill: dict[str, tuple[EngineIdentity, int, float, int]] = {}
+        self.lb_snapshot_seq = 0
         self.engine_pending_tokens: Counter[EngineIdentity] = Counter()
         self.engine_pending_ms: Counter[EngineIdentity] = Counter()
 
@@ -1963,7 +1977,12 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         if self.token_aware_lb and request.prompt_token_ids is not None:
             tokens = len(request.prompt_token_ids)
             ms = tokens * envs.VLLM_PREFILL_COST_MS_PER_TOKEN
-            self.req_pending_prefill[request.request_id] = (chosen_engine, tokens, ms)
+            self.req_pending_prefill[request.request_id] = (
+                chosen_engine,
+                tokens,
+                ms,
+                self.lb_snapshot_seq,
+            )
             self.engine_pending_tokens[chosen_engine] += tokens
             self.engine_pending_ms[chosen_engine] += ms
         return chosen_engine
@@ -1973,9 +1992,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         entry = self.req_pending_prefill.pop(req_id, None)
         if entry is None:
             return
-        engine, tokens, ms = entry
+        engine, tokens, ms, _ = entry
         self.engine_pending_tokens[engine] -= tokens
         self.engine_pending_ms[engine] -= ms
+
+    def _on_lb_snapshot(self) -> None:
+        """Drop the floor of every dispatch a snapshot has had time to see."""
+        self.lb_snapshot_seq += 1
+        seen_through = self.lb_snapshot_seq - _DP_LB_FLOOR_SNAPSHOTS
+        for req_id, entry in list(self.req_pending_prefill.items()):
+            if entry[3] > seen_through:
+                break
+            self._release_pending_prefill(req_id)
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.

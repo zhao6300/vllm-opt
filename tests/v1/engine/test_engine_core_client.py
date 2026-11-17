@@ -225,6 +225,7 @@ def _make_dplb_client(
     client.lb_prefill_tokens_per_request = prefill_tokens_per_request
     client.lb_step_budget_ms = 0.0
     client.req_pending_prefill = {}
+    client.lb_snapshot_seq = 0
     client.engine_pending_tokens = Counter()
     client.engine_pending_ms = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
@@ -524,6 +525,7 @@ def test_dplb_token_aware_prices_the_backlog_in_budget_steps():
     # engine 0 scores 3 against 4 and wins.
     client.lb_step_budget_ms = 0.0
     client.req_pending_prefill = {}
+    client.lb_snapshot_seq = 0
     client.engine_pending_tokens = Counter()
     client.engine_pending_ms = Counter()
     client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
@@ -1887,3 +1889,88 @@ def test_dplb_uses_its_own_dispatches_as_a_pending_floor():
     asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
     assert sum(client.engine_pending_tokens.values()) == 0
     assert not client.req_pending_prefill
+
+
+def _deliver_snapshot(client, counts):
+    """What the stats task does when a load snapshot arrives."""
+    client.lb_engines = counts
+    client._on_lb_snapshot()
+
+
+def test_dplb_pending_floor_waits_for_a_snapshot_that_has_seen_the_dispatch():
+    """The first snapshot after a dispatch may have been computed before the
+    engine received the request, so it cannot replace the floor; the second
+    one can."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    request = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    engine = client.get_core_engine_for_request(request)
+    idle = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+
+    _deliver_snapshot(client, idle)
+    assert client.engine_pending_tokens[engine] == 8000
+    assert request.request_id in client.req_pending_prefill
+
+    _deliver_snapshot(client, idle)
+    assert client.engine_pending_tokens[engine] == 0
+    assert client.engine_pending_ms[engine] == 0
+    assert not client.req_pending_prefill
+
+
+def test_dplb_engine_report_decides_once_it_has_seen_the_dispatch():
+    """A prompt that is a prefix-cache hit has nothing left to prefill, which
+    the engine reports. Once a snapshot has seen it, the full prompt size this
+    client dispatched must no longer weigh the engine down."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_prefill_tokens_per_request = 1000
+    cached = make_request(SamplingParams(max_tokens=4), [1] * 3000)
+    assert client.get_core_engine_for_request(cached) == client.core_engines[0]
+    # Engine 1 runs two small requests, engine 0 only the cached one.
+    client.engine_inflight[client.core_engines[1]] += 2
+    report = [[0, 1, 0.0, 0, 0.0], [0, 2, 0.0, 0, 0.0]]
+
+    # One snapshot is not enough: the floor still keeps new work off engine 0.
+    _deliver_snapshot(client, report)
+    client.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 10)
+    assert client.get_core_engine_for_request(probe) == client.core_engines[1]
+    # Undo that dispatch so the next probe sees the same load.
+    client.engine_inflight[client.core_engines[1]] -= 1
+    client.reqs_in_flight.pop(probe.request_id)
+    client._release_pending_prefill(probe.request_id)
+
+    # The second one has seen it: engine 0 reports nothing to prefill and has
+    # fewer requests, so it wins.
+    _deliver_snapshot(client, report)
+    client.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 10)
+    assert client.get_core_engine_for_request(probe) == client.core_engines[0]
+
+
+def test_dplb_pending_floor_expires_in_dispatch_order():
+    """Each dispatch is released by the snapshot that follows its own second
+    one, not by one that arrived before it was sent, and a later first output
+    does not release it twice."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    idle = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 5000)
+    client.get_core_engine_for_request(first)
+    _deliver_snapshot(client, idle)
+    second = make_request(SamplingParams(max_tokens=4), [1] * 2000)
+    client.get_core_engine_for_request(second)
+
+    _deliver_snapshot(client, idle)
+    assert first.request_id not in client.req_pending_prefill
+    assert second.request_id in client.req_pending_prefill
+    assert sum(client.engine_pending_tokens.values()) == 2000
+
+    _deliver_snapshot(client, idle)
+    assert not client.req_pending_prefill
+    assert sum(client.engine_pending_tokens.values()) == 0
+
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=first.request_id, new_token_ids=[5])],
+        finished_requests={second.request_id},
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_tokens.values()) == 0
+    assert sum(client.engine_pending_ms.values()) == 0
