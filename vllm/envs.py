@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     VLLM_PREFILL_MIN_CHUNK_TOKENS: int = 256
     VLLM_PREFILL_FILL_TARGET: bool = False
     VLLM_PREFILL_TARGET_INIT_TOKENS: int = 0
+    VLLM_PREFILL_COST_FIT: bool = False
+    VLLM_PREFILL_COST_FIT_INTERVAL: int = 64
     VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
@@ -1377,8 +1379,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the step to a shared token target instead of pricing it with the cost
     # model. A rank takes `target - its decode tokens` of prefill, so ranks end
     # their steps together and a rank with few decodes fills the room it would
-    # pad. The budget is then the step period the target steers toward, and the
-    # chunk does not shrink with the context.
+    # pad. The budget is then the step period the target steers toward. A chunk
+    # is still capped by what its attention over the context costs in the
+    # budget left after the target's token cost, so a rank with a long context
+    # does not hold the others to its chunk, and they do not hold it to theirs.
     "VLLM_PREFILL_FILL_TARGET": lambda: bool(
         int(os.getenv("VLLM_PREFILL_FILL_TARGET", "0"))
     ),
@@ -1388,9 +1392,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PREFILL_TARGET_INIT_TOKENS", "0")
     ),
     # How often a background thread moves the target toward the budget, in
-    # milliseconds. The scheduler only reads the current value.
+    # milliseconds. The scheduler only reads the current value. Not used with
+    # VLLM_PREFILL_COST_FIT, which moves the target from the steps of the whole
+    # DP group.
     "VLLM_PREFILL_TARGET_UPDATE_MS": lambda: float(
         os.getenv("VLLM_PREFILL_TARGET_UPDATE_MS", "200")
+    ),
+    # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
+    # (the VLLM_PREFILL_COST_* values are then the starting point and the fit
+    # stays within 0.25x to 4x of them) to the measured step periods while
+    # serving. Across data parallel ranks the steps are exchanged over an
+    # asynchronous CPU collective, so every rank installs the same coefficients
+    # at the same step. Default: off.
+    "VLLM_PREFILL_COST_FIT": lambda: bool(int(os.getenv("VLLM_PREFILL_COST_FIT", "0"))),
+    # Steps between two fits (and, across ranks, between the exchanges). Must be
+    # equal on every DP rank.
+    "VLLM_PREFILL_COST_FIT_INTERVAL": lambda: int(
+        os.getenv("VLLM_PREFILL_COST_FIT_INTERVAL", "64")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

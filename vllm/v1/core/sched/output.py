@@ -291,6 +291,11 @@ class SchedulerOutput:
     # Prefill tokens in this step: the part of the scheduled tokens that is not
     # decode. Read when the step's output arrives.
     num_prefill_tokens: int = 0
+    # Attention work of this step's prefill chunks, `sum(q * (context + q / 2))`,
+    # and the step's id on its DP group (equal on every rank), for the online
+    # fit of the prefill cost model. -1 outside a DP group.
+    prefill_attn_work: float = 0.0
+    dp_step: int = -1
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

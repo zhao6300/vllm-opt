@@ -2767,7 +2767,8 @@ class DPEngineCoreProc(EngineCoreProc):
         one by that many steps.
         """
         scheduler = self.scheduler
-        # A shared token target already equalizes the ranks' steps.
+        # A shared token target equalizes the token part of the ranks' steps, and
+        # each rank caps its own attention part; there is no minimum to agree on.
         if (
             scheduler.prefill_cost_model is None
             or scheduler.prefill_target is not None
@@ -2820,6 +2821,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
+            # The step id every DP rank gives the same pass, for the cost fit.
+            self.scheduler.dp_step = (self.current_wave << 24) | self.step_counter
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -2883,6 +2886,8 @@ class DPEngineCoreProc(EngineCoreProc):
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
+        if (fitter := getattr(self.scheduler, "cost_fit", None)) is not None:
+            fitter.tick(self.dp_group, self.step_counter)
         if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
             return True
 

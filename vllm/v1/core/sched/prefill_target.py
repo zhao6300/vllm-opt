@@ -152,6 +152,13 @@ class PrefillTarget:
         with self._lock:
             self._samples.append(sample)
 
+    def ingest(self, period_s: float, total_tokens: int, prefill_tokens: int) -> None:
+        """Add a step whose period the caller measured, e.g. merged over the DP
+        group so that every rank updates from the same steps."""
+        sample = _Sample(next(self._seq), period_s, total_tokens, prefill_tokens)
+        with self._lock:
+            self._samples.append(sample)
+
     def update(self) -> int:
         """Move the target toward the step period target.
 

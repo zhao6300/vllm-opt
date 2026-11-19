@@ -9,7 +9,8 @@ keeps it within a time budget.
 """
 
 import math
-from dataclasses import dataclass
+import sys
+from dataclasses import dataclass, replace
 
 import vllm.envs as envs
 
@@ -63,6 +64,17 @@ class PrefillCostModel:
             min_chunk_tokens=envs.VLLM_PREFILL_MIN_CHUNK_TOKENS,
         )
 
+    def with_coefficients(
+        self, fixed_ms: float, ms_per_token: float, ms_per_token_context: float
+    ) -> "PrefillCostModel":
+        """The same budget with fitted coefficients."""
+        return replace(
+            self,
+            fixed_ms=fixed_ms,
+            ms_per_token=ms_per_token,
+            ms_per_token_context=ms_per_token_context,
+        )
+
     def step_ms(self, decode_tokens: int, prefill_tokens: int, context: int) -> float:
         """Modelled time of a step."""
         return (
@@ -83,6 +95,34 @@ class PrefillCostModel:
         return self.ms_per_token * prefill_tokens + self.ms_per_token_context * (
             prefill_tokens * (context + prefill_tokens / 2)
         )
+
+    def max_attention_tokens(self, room_ms: float, context: int, align: int = 1) -> int:
+        """Largest prefill chunk whose attention over `context` fits `room_ms`.
+
+        Only the context term is priced: the token term of a data-parallel step
+        is shared by the ranks, so the caller accounts for it once.
+
+        Args:
+            room_ms: Time left for attention after the shared terms.
+            context: Context the prefill chunk attends over.
+            align: Round a chunk longer than this down to a multiple of it.
+
+        Returns:
+            The chunk length, at least `min_chunk_tokens`; `sys.maxsize` when the
+            context costs nothing.
+
+        """
+        c = self.ms_per_token_context
+        if c <= 0:
+            return sys.maxsize
+        if room_ms <= 0:
+            return self.min_chunk_tokens
+        linear = c * context
+        tokens = (2 * room_ms) / (linear + math.sqrt(linear * linear + 2 * c * room_ms))
+        chunk = int(tokens)
+        if align > 1 and chunk > align:
+            chunk -= chunk % align
+        return max(chunk, self.min_chunk_tokens)
 
     def max_prefill_tokens(
         self, decode_tokens: int, context: int, align: int = 1

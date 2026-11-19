@@ -41,6 +41,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.cost_fit import StepCostFitter, StepSample
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -89,6 +90,8 @@ logger = init_logger(__name__)
 class Scheduler(SchedulerInterface):
     # The shared prefill token target; None unless VLLM_PREFILL_FILL_TARGET.
     prefill_target: PrefillTarget | None = None
+    # The online fit of the prefill cost model; None unless VLLM_PREFILL_COST_FIT.
+    cost_fit: StepCostFitter | None = None
 
     def __init__(
         self,
@@ -425,13 +428,25 @@ class Scheduler(SchedulerInterface):
                 self.prefill_cost_model.budget_ms,
                 self.scheduler_config.max_num_batched_tokens,
             )
-            self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
+            if not envs.VLLM_PREFILL_COST_FIT:
+                self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
             logger.info(
                 "Prefill chunks fill each step to a shared token target "
                 "(now %d, at most %d) that follows a %s ms step period",
                 self.prefill_target.tokens,
                 self.prefill_target.max_tokens,
                 self.prefill_cost_model.budget_ms,
+            )
+        # Online fit of the cost model; the DP engine core drives its exchange.
+        self.cost_fit: StepCostFitter | None = None
+        self.dp_step = -1
+        self._logged_fit = None
+        model = self.prefill_cost_model
+        if envs.VLLM_PREFILL_COST_FIT and model is not None:
+            self.cost_fit = StepCostFitter.from_env(
+                (model.fixed_ms, model.ms_per_token, model.ms_per_token_context),
+                model.budget_ms,
+                self._on_cost_fit,
             )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
@@ -759,10 +774,50 @@ class Scheduler(SchedulerInterface):
             elif request.next_decode_eligible_step <= self.current_step:
                 decode_tokens += 1 + self.num_spec_tokens
         if self.prefill_target is not None:
-            return self.prefill_target.max_prefill_tokens(
+            target = self.prefill_target
+            chunk = target.max_prefill_tokens(
                 decode_tokens, model.min_chunk_tokens, align=self.block_size
             )
+            # The target shares the token-priced part of the step between the
+            # ranks; the attention over this rank's context is its own.
+            room_ms = (
+                model.budget_ms - model.fixed_ms - model.ms_per_token * target.tokens
+            )
+            attention_cap = model.max_attention_tokens(
+                room_ms, context, align=self.block_size
+            )
+            return max(min(chunk, attention_cap), model.min_chunk_tokens)
         return model.max_prefill_tokens(decode_tokens, context, align=self.block_size)
+
+    def _on_cost_fit(
+        self, theta: tuple[float, float, float], samples: list[StepSample]
+    ) -> None:
+        """Install fitted coefficients and move the target from the same steps."""
+        model = self.prefill_cost_model
+        assert model is not None
+        fixed_ms, ms_per_token, ms_per_token_context = theta
+        self.prefill_cost_model = model.with_coefficients(
+            fixed_ms, ms_per_token, ms_per_token_context
+        )
+        if self._logged_fit is None or any(
+            abs(new - old) > 0.05 * max(abs(old), 1e-12)
+            for new, old in zip(theta, self._logged_fit, strict=True)
+        ):
+            self._logged_fit = theta
+            logger.info(
+                "Prefill cost model fitted: fixed %.2f ms, %.4g ms/token, "
+                "%.3g ms/token/context (%d steps this round)",
+                fixed_ms,
+                ms_per_token,
+                ms_per_token_context,
+                len(samples),
+            )
+        if self.prefill_target is not None:
+            for sample in samples:
+                self.prefill_target.ingest(
+                    sample.period_ms / 1000, sample.tokens, sample.prefill_tokens
+                )
+            self.prefill_target.update()
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -843,6 +898,7 @@ class Scheduler(SchedulerInterface):
         # Prefill tokens this step may still take (None: no extra cap).
         prefill_left = self._prefill_token_cap()
         num_prefill_tokens_scheduled = 0
+        prefill_attn_work: dict[str, float] = {}
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1016,6 +1072,7 @@ class Scheduler(SchedulerInterface):
                             restored = num_scheduled_tokens.pop(preempted_req_id)
                             if preempted_req.is_prefill_chunk:
                                 num_prefill_tokens_scheduled -= restored
+                                prefill_attn_work.pop(preempted_req_id, None)
                             if (
                                 prefill_left is not None
                                 and preempted_req.is_prefill_chunk
@@ -1077,6 +1134,9 @@ class Scheduler(SchedulerInterface):
             input_budget -= num_new_tokens + draft_slots
             if request.is_prefill_chunk:
                 num_prefill_tokens_scheduled += num_new_tokens
+                prefill_attn_work[request_id] = num_new_tokens * (
+                    request.num_computed_tokens + num_new_tokens / 2
+                )
             if prefill_left is not None and request.is_prefill_chunk:
                 prefill_left -= num_new_tokens
             req_index += 1
@@ -1715,6 +1775,9 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 if prefill_work:
                     num_prefill_tokens_scheduled += num_new_tokens
+                    prefill_attn_work[request_id] = num_new_tokens * (
+                        num_computed_tokens + num_new_tokens / 2
+                    )
                 if prefill_left is not None and prefill_work:
                     prefill_left -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -1861,6 +1924,8 @@ class Scheduler(SchedulerInterface):
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             iteration_details=iteration_details,
             num_prefill_tokens=num_prefill_tokens_scheduled,
+            prefill_attn_work=sum(prefill_attn_work.values()),
+            dp_step=self.dp_step,
             preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
@@ -2368,7 +2433,15 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        if self.prefill_target is not None:
+        if self.cost_fit is not None:
+            self.cost_fit.record(
+                time.perf_counter(),
+                scheduler_output.dp_step,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.prefill_attn_work,
+                scheduler_output.num_prefill_tokens,
+            )
+        elif self.prefill_target is not None:
             self.prefill_target.record_output(
                 time.perf_counter(),
                 scheduler_output.total_num_scheduled_tokens,
