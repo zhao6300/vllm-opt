@@ -120,6 +120,9 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# Pricing a deep backlog takes milliseconds: a load snapshot reuses it this long.
+_PENDING_PREFILL_MS_MAX_AGE_S = 0.025
+
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -1821,7 +1824,7 @@ class EngineCoreProc(EngineCore):
         counts = (
             *self.scheduler.get_request_counts(),
             self.scheduler.get_pending_prefill_tokens(),
-            round(self.scheduler.get_pending_prefill_ms()),
+            round(self.scheduler.get_pending_prefill_ms(_PENDING_PREFILL_MS_MAX_AGE_S)),
         )
         if counts != self.last_counts:
             self.last_counts = counts
@@ -1830,6 +1833,7 @@ class EngineCoreProc(EngineCore):
                 num_waiting_reqs=counts[1],
                 pending_prefill_tokens=counts[2],
                 pending_prefill_ms=float(counts[3]),
+                prefill_ms_per_token=self.scheduler.get_prefill_ms_per_token(),
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
@@ -2742,7 +2746,7 @@ class DPEngineCoreProc(EngineCoreProc):
         counts = (
             *self.scheduler.get_request_counts(),
             self.scheduler.get_pending_prefill_tokens(),
-            round(self.scheduler.get_pending_prefill_ms()),
+            round(self.scheduler.get_pending_prefill_ms(_PENDING_PREFILL_MS_MAX_AGE_S)),
         )
         if counts != self.last_counts:
             self.last_counts = counts
@@ -2751,6 +2755,7 @@ class DPEngineCoreProc(EngineCoreProc):
                 num_waiting_reqs=counts[1],
                 pending_prefill_tokens=counts[2],
                 pending_prefill_ms=float(counts[3]),
+                prefill_ms_per_token=self.scheduler.get_prefill_ms_per_token(),
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,

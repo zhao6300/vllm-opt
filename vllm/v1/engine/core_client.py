@@ -2007,7 +2007,17 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.engine_inflight[chosen_engine] += 1
         if self.token_aware_lb and request.prompt_token_ids is not None:
             tokens = len(request.prompt_token_ids)
-            ms = tokens * envs.VLLM_PREFILL_COST_MS_PER_TOKEN
+            # Priced as the chosen engine prices its own backlog, so the floor and
+            # its report compare; the configured cost is the fallback.
+            counts = (
+                self.lb_engines[eng_index] if eng_index < len(self.lb_engines) else ()
+            )
+            ms_per_token = (
+                counts[5]
+                if len(counts) > 5 and counts[5] > 0
+                else envs.VLLM_PREFILL_COST_MS_PER_TOKEN
+            )
+            ms = tokens * ms_per_token
             self.req_pending_prefill[request.request_id] = (
                 chosen_engine,
                 tokens,

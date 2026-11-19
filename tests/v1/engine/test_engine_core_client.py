@@ -1798,7 +1798,8 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
     core.scheduler = SimpleNamespace(
         get_request_counts=lambda: (2, 3),
         get_pending_prefill_tokens=lambda: 4096,
-        get_pending_prefill_ms=lambda: 1200.0,
+        get_pending_prefill_ms=lambda max_age_s=0.0: 1200.0,
+        get_prefill_ms_per_token=lambda: 0.75,
         get_kv_cache_usage=lambda: 0.5,
     )
 
@@ -1808,6 +1809,7 @@ def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
     stats = outputs.scheduler_stats
     assert stats.pending_prefill_tokens == 4096
     assert stats.pending_prefill_ms == 1200.0
+    assert stats.prefill_ms_per_token == 0.75
     assert stats.num_running_reqs == 2
     assert stats.num_waiting_reqs == 3
     assert stats.num_skipped_waiting_reqs == 0
@@ -2107,3 +2109,21 @@ def test_dplb_counts_the_other_servers_in_flight_requests():
         b.get_core_engine_for_request(make_request(SamplingParams()))
         == (b.core_engines[1])
     )
+
+
+def test_dplb_prices_a_dispatch_as_its_engine_prices_its_backlog():
+    """The floor a router puts on an engine until its report catches up is in
+    the same units as that report: the engine says what a prefill token costs
+    it, and the configured cost is only the fallback."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0, 0.5], [0, 0, 0.0, 0, 0.0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 1000)
+    assert client.get_core_engine_for_request(first) == client.core_engines[0]
+    assert client.engine_pending_ms[client.core_engines[0]] == pytest.approx(500.0)
+
+    # An engine that reports no price, or an older snapshot without the field.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0, 0.0]]
+    client.eng_start_index = 1
+    second = make_request(SamplingParams(max_tokens=4), [1] * 1000)
+    assert client.get_core_engine_for_request(second) == client.core_engines[1]
+    assert client.engine_pending_ms[client.core_engines[1]] == 0.0

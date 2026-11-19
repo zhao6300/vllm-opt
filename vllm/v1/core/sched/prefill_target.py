@@ -88,6 +88,7 @@ class PrefillTarget:
         self._samples: deque[_Sample] = deque(maxlen=max_samples)
         # `_consumed` and `_target` are written by the updating thread only.
         self._consumed = 0
+        self._step_ms: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -112,6 +113,13 @@ class PrefillTarget:
     def tokens(self) -> int:
         """The current target; a single read, safe from any thread."""
         return self._target
+
+    @property
+    def step_ms(self) -> float | None:
+        """Median period of the steps that last informed the target, in
+        milliseconds, or None before any did. What a step that fills the target
+        takes."""
+        return self._step_ms
 
     def max_prefill_tokens(
         self, decode_tokens: int, min_chunk_tokens: int, align: int = 1
@@ -184,6 +192,7 @@ class PrefillTarget:
         if len(periods) < self.min_samples:
             return target
         self._consumed = samples[-1].seq
+        self._step_ms = median(periods) * 1000
         ratio = self.target_step_ms / 1000 / median(periods)
         factor = min(
             max(1 + self.gain * (ratio - 1), 1 / self.max_factor), self.max_factor

@@ -326,3 +326,34 @@ def test_fitted_coefficients_keep_the_budget_and_the_minimum_chunk():
         2e-6,
     )
     assert (model.budget_ms, model.min_chunk_tokens) == (600.0, 16)
+
+
+def test_the_diagnostics_show_a_window_that_cannot_determine_the_fit():
+    """A window of decode steps has no prefill and no spread in attention work:
+    the per-token and per-context terms are not determined by it."""
+    solver = make_solver()
+    for key in range(40):
+        solver.add(StepSample(key, 20.0 + key % 3, 96, 0.0, 0))
+    window = solver.diagnostics(solver.fit())
+    assert window.steps == 40
+    assert window.prefill_steps == 0
+    assert window.attn_work_std == 0.0
+    assert window.tokens_std == 0.0
+    assert window.median_period_ms == 21.0
+
+    for step in make_steps(40, noise=0.0):
+        solver.add(step)
+    window = solver.diagnostics(TRUE)
+    assert window.steps == 80
+    assert window.prefill_steps == 40
+    assert window.tokens_std > 0 and window.attn_work_std > 0
+
+
+def test_the_diagnostics_residual_is_what_the_fit_leaves_unexplained():
+    solver = make_solver()
+    for step in make_steps(200, noise=0.0):
+        solver.add(step)
+    assert solver.diagnostics(TRUE).residual_ms == pytest.approx(0.0, abs=1e-6)
+    # Coefficients that are 20% too low miss by a fifth of the period.
+    off = tuple(0.8 * c for c in TRUE)
+    assert solver.diagnostics(off).residual_ms > 1.0

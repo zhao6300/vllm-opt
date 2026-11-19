@@ -9264,27 +9264,37 @@ def test_pending_prefill_tokens_skip_the_prefix_cache_hit():
     )
 
 
-def test_pending_prefill_ms_prices_the_remainder_with_the_cost_model(monkeypatch):
-    """DP routing weighs an engine's backlog by modelled time when a step time
-    budget is configured: what is left of a prompt is priced by the context it
-    still attends over."""
-    monkeypatch.setenv("VLLM_PREFILL_STEP_BUDGET_MS", "600")
-    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "0.02")
-    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.000004")
-    scheduler = create_scheduler(max_num_batched_tokens=64, block_size=16)
+def test_pending_prefill_ms_counts_the_steps_the_chunk_rule_needs(monkeypatch):
+    """DP routing weighs an engine's backlog by the time it takes to drain: the
+    steps its chunks need, each taking what a step with that chunk takes. A
+    prompt that attends over a longer context gets shorter chunks and so weighs
+    more."""
+    _set_prefill_budget(monkeypatch, 1120, 10)
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.001")
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
     model = scheduler.prefill_cost_model
     assert model is not None
 
-    (request,) = create_requests(num_requests=1, num_tokens=200, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
     scheduler.add_request(request)
-    scheduler.schedule()
-    remaining = request.num_prompt_tokens - request.num_computed_tokens
-    assert remaining > 0
+    middle = 1500
+    chunk = model.max_prefill_tokens(0, middle, align=16)
     assert scheduler.get_pending_prefill_ms() == pytest.approx(
-        model.work_ms(remaining, request.num_computed_tokens)
+        3000 / chunk * model.step_ms(0, chunk, middle)
     )
-    # The same work priced linearly still ignores the context term.
-    assert model.work_ms(remaining, 0) < scheduler.get_pending_prefill_ms()
+
+    # Chunks later in the prompt attend over more context: what is left costs more
+    # per token than the whole prompt did.
+    per_token_at_start = scheduler.get_pending_prefill_ms() / 3000
+    for _ in range(3):
+        scheduler.schedule()
+    remaining = request.num_prompt_tokens - request.num_computed_tokens
+    assert 0 < remaining < 3000
+    middle = request.num_computed_tokens + remaining // 2
+    chunk = model.max_prefill_tokens(0, middle, align=16)
+    pending = scheduler.get_pending_prefill_ms()
+    assert pending == pytest.approx(remaining / chunk * model.step_ms(0, chunk, middle))
+    assert pending / remaining > per_token_at_start
 
     # Done prefilling: nothing left to price.
     request.num_computed_tokens = request.num_prompt_tokens
@@ -9297,6 +9307,54 @@ def test_pending_prefill_ms_prices_the_remainder_with_the_cost_model(monkeypatch
     plain.add_request(other)
     plain.schedule()
     assert plain.get_pending_prefill_ms() == 0.0
+    assert plain.get_prefill_ms_per_token() == 0.0
+
+
+def test_pending_prefill_ms_can_be_reused_for_a_moment(monkeypatch):
+    """The engine core asks every step; a result a few milliseconds old will do
+    for a load snapshot, while any other caller gets the current backlog."""
+    _set_prefill_budget(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+    before = scheduler.get_pending_prefill_ms()
+
+    scheduler.schedule()
+    assert scheduler.get_pending_prefill_ms(max_age_s=3600) == before
+    assert scheduler.get_pending_prefill_ms() < before
+    # An exact call refreshes what a later reuse returns.
+    assert scheduler.get_pending_prefill_ms(max_age_s=3600) == (
+        scheduler.get_pending_prefill_ms()
+    )
+
+
+def test_pending_prefill_ms_follows_the_measured_step_period(monkeypatch):
+    """With a token target the steps take what the steps that filled it
+    measured, so a coefficient the data does not determine cannot reprice the
+    backlog: 3000 tokens in chunks of the target, at the measured period."""
+    _set_fill_target(monkeypatch, 1024)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, max_model_len=4096
+    )
+    try:
+        target = scheduler.prefill_target
+        assert target is not None
+        (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+        scheduler.add_request(request)
+
+        # Nothing measured yet: a step takes the budget.
+        assert target.step_ms is None
+        assert scheduler.get_pending_prefill_ms() == pytest.approx(3000 / 1024 * 600)
+        assert scheduler.get_prefill_ms_per_token() == pytest.approx(600 / 1024)
+
+        for _ in range(6):
+            target.ingest(0.2, target.tokens, target.tokens // 2)
+        grown = target.update()
+        assert target.step_ms == pytest.approx(200.0)
+        assert scheduler.get_pending_prefill_ms() == pytest.approx(3000 / grown * 200)
+        assert scheduler.get_prefill_ms_per_token() == pytest.approx(200 / grown)
+    finally:
+        scheduler.shutdown()
 
 
 def _set_fill_target(monkeypatch, init_tokens: int = 1024) -> None:

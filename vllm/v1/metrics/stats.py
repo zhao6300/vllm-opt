@@ -236,13 +236,16 @@ class SchedulerStats:
     current_wave: int = 0
 
     pending_prefill_ms: float = 0.0
-    """Modelled time of the prefill this engine has not finished.
+    """Time the prefill this engine has not finished takes to drain.
 
-    Priced with the step time budget's cost model
-    (VLLM_PREFILL_COST_MS_PER_TOKEN[_CONTEXT]), so a request near the end of a
-    long context weighs by what it costs, not by its token count. Zero when no
-    step time budget is configured; DP load balancing then prices tokens.
+    The steps it needs, from the chunk the scheduler gives each request (shorter
+    on a long context), times what a step takes. Zero when no step time budget is
+    configured; DP load balancing then prices tokens.
     """
+
+    prefill_ms_per_token: float = 0.0
+    """Time one prefill token takes at this engine's chunk size, to price a
+    request a router has just sent before the engine reports it."""
 
     pending_prefill_tokens: int = 0
     """Prompt tokens this engine has not finished prefilling.

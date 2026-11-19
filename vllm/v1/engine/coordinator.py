@@ -142,8 +142,8 @@ class DPCoordinator:
 class EngineState:
     def __init__(self):
         # [waiting, running, kv_cache_usage, pending_prefill_tokens,
-        #  pending_prefill_ms]
-        self.request_counts: list[int | float] = [0, 0, 0.0, 0, 0.0]
+        #  pending_prefill_ms, prefill_ms_per_token]
+        self.request_counts: list[int | float] = [0, 0, 0.0, 0, 0.0, 0.0]
 
 
 class DPCoordinatorProc:
@@ -409,6 +409,7 @@ class DPCoordinatorProc:
                         stats[2] = scheduler_stats.kv_cache_usage
                         stats[3] = scheduler_stats.pending_prefill_tokens
                         stats[4] = scheduler_stats.pending_prefill_ms
+                        stats[5] = scheduler_stats.prefill_ms_per_token
                         stats_changed = True
 
                     # Wave coordination: handle wave completion and start notifications

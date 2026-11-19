@@ -253,8 +253,13 @@ class SchedulerInterface(ABC):
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return 0.0
 
-    def get_pending_prefill_ms(self) -> float:
-        """Modelled time of the prefill this engine has not finished."""
+    def get_pending_prefill_ms(self, max_age_s: float = 0.0) -> float:
+        """Time the prefill this engine has not finished takes to drain, reusing a
+        result at most `max_age_s` old."""
+        return 0.0
+
+    def get_prefill_ms_per_token(self) -> float:
+        """Time one prefill token takes at the current chunk size."""
         return 0.0
 
     def get_pending_prefill_tokens(self) -> int:

@@ -52,6 +52,29 @@ class StepSample:
     prefill_tokens: int
 
 
+@dataclass(frozen=True)
+class FitDiagnostics:
+    """The window a fit used.
+
+    Attributes:
+        steps: Steps in the window.
+        prefill_steps: How many carried prefill.
+        tokens_std: Weighted standard deviation of the token counts; a
+            coefficient on a figure that barely varies is not determined.
+        attn_work_std: The same for the attention work.
+        residual_ms: Weighted RMS of what the fit leaves unexplained.
+        median_period_ms: Median step period.
+
+    """
+
+    steps: int
+    prefill_steps: int
+    tokens_std: float
+    attn_work_std: float
+    residual_ms: float
+    median_period_ms: float
+
+
 class StepCostSolver:
     """Ridge fit of `fixed_ms + ms_per_token * tokens + ms_per_token_context *
     attn_work` toward configured coefficients.
@@ -82,7 +105,10 @@ class StepCostSolver:
         self._prior_u = np.array(prior) / self._scale
         self.prior_samples = prior_samples
         self.half_life = half_life
-        self._rows: deque[tuple[float, float, float, float]] = deque(maxlen=window)
+        # period, 1, tokens, attention work, whether the step carried prefill
+        self._rows: deque[tuple[float, float, float, float, float]] = deque(
+            maxlen=window
+        )
 
     def add(self, sample: StepSample) -> None:
         """Add a step; one with a figure that is not a finite number is ignored."""
@@ -92,11 +118,40 @@ class StepCostSolver:
         ):
             return
         self._rows.append(
-            (sample.period_ms, 1.0, float(sample.tokens), float(sample.attn_work))
+            (
+                sample.period_ms,
+                1.0,
+                float(sample.tokens),
+                float(sample.attn_work),
+                float(sample.prefill_tokens > 0),
+            )
         )
 
     def __len__(self) -> int:
         return len(self._rows)
+
+    def diagnostics(self, theta: tuple[float, float, float]) -> "FitDiagnostics":
+        """What the window holds and how well `theta` explains it, to tell a fit
+        the data determines from one it does not."""
+        rows = np.array(self._rows)
+        if not len(rows):
+            return FitDiagnostics(0, 0, 0.0, 0.0, 0.0, 0.0)
+        age = np.arange(len(rows) - 1, -1, -1)
+        w = 0.5 ** (age / self.half_life)
+        w = w / w.sum()
+
+        def spread(x: np.ndarray) -> float:
+            return float(np.sqrt((w * (x - (w * x).sum()) ** 2).sum()))
+
+        residual = rows[:, 0] - rows[:, 1:4] @ np.array(theta)
+        return FitDiagnostics(
+            steps=len(rows),
+            prefill_steps=int(rows[:, 4].sum()),
+            tokens_std=spread(rows[:, 2]),
+            attn_work_std=spread(rows[:, 3]),
+            residual_ms=float(np.sqrt((w * residual**2).sum())),
+            median_period_ms=float(np.median(rows[:, 0])),
+        )
 
     def fit(self) -> tuple[float, float, float]:
         """The coefficients, the prior until `min_samples` steps are in."""
@@ -104,7 +159,7 @@ class StepCostSolver:
             return self.prior
         rows = np.array(self._rows)
         y = rows[:, 0]
-        z = rows[:, 1:] * self._scale
+        z = rows[:, 1:4] * self._scale
         age = np.arange(len(rows) - 1, -1, -1)
         w = 0.5 ** (age / self.half_life)
         gram = (z * w[:, None]).T @ z

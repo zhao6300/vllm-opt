@@ -92,6 +92,8 @@ class Scheduler(SchedulerInterface):
     prefill_target: PrefillTarget | None = None
     # The online fit of the prefill cost model; None unless VLLM_PREFILL_COST_FIT.
     cost_fit: StepCostFitter | None = None
+    # When `get_pending_prefill_ms` last priced the backlog, and what it found.
+    _pending_ms_cache: tuple[float, float] | None = None
 
     def __init__(
         self,
@@ -773,21 +775,38 @@ class Scheduler(SchedulerInterface):
                 context = max(context, request.num_computed_tokens)
             elif request.next_decode_eligible_step <= self.current_step:
                 decode_tokens += 1 + self.num_spec_tokens
-        if self.prefill_target is not None:
-            target = self.prefill_target
-            chunk = target.max_prefill_tokens(
-                decode_tokens, model.min_chunk_tokens, align=self.block_size
+        return self._prefill_chunk(model, decode_tokens, context)
+
+    def _prefill_chunk(
+        self, model: PrefillCostModel, decode_tokens: int, context: int
+    ) -> int:
+        """The prefill chunk a step with `decode_tokens` of decodes takes when it
+        attends over `context`; the rule that sizes chunks and prices backlogs."""
+        if self.prefill_target is None:
+            return model.max_prefill_tokens(
+                decode_tokens, context, align=self.block_size
             )
-            # The target shares the token-priced part of the step between the
-            # ranks; the attention over this rank's context is its own.
-            room_ms = (
-                model.budget_ms - model.fixed_ms - model.ms_per_token * target.tokens
-            )
-            attention_cap = model.max_attention_tokens(
-                room_ms, context, align=self.block_size
-            )
-            return max(min(chunk, attention_cap), model.min_chunk_tokens)
-        return model.max_prefill_tokens(decode_tokens, context, align=self.block_size)
+        target = self.prefill_target
+        chunk = target.max_prefill_tokens(
+            decode_tokens, model.min_chunk_tokens, align=self.block_size
+        )
+        # The target shares the token-priced part of the step between the ranks;
+        # the attention over this rank's context is its own.
+        room_ms = model.budget_ms - model.fixed_ms - model.ms_per_token * target.tokens
+        attention_cap = model.max_attention_tokens(
+            room_ms, context, align=self.block_size
+        )
+        return max(min(chunk, attention_cap), model.min_chunk_tokens)
+
+    def _eligible_decode_tokens(self) -> int:
+        """Tokens the decoding requests that may run now add to a step."""
+        return sum(
+            1 + self.num_spec_tokens
+            for request in self.running
+            if not request.is_finished()
+            and not request.is_prefill_chunk
+            and request.next_decode_eligible_step <= self.current_step
+        )
 
     def _on_cost_fit(
         self, theta: tuple[float, float, float], samples: list[StepSample]
@@ -804,13 +823,23 @@ class Scheduler(SchedulerInterface):
             for new, old in zip(theta, self._logged_fit, strict=True)
         ):
             self._logged_fit = theta
+            assert self.cost_fit is not None
+            window = self.cost_fit.solver.diagnostics(theta)
             logger.info(
                 "Prefill cost model fitted: fixed %.2f ms, %.4g ms/token, "
-                "%.3g ms/token/context (%d steps this round)",
+                "%.3g ms/token/context (%d steps this round; window of %d steps, "
+                "%d with prefill, token std %.0f, attention work std %.3g, "
+                "residual %.1f ms, median period %.1f ms)",
                 fixed_ms,
                 ms_per_token,
                 ms_per_token_context,
                 len(samples),
+                window.steps,
+                window.prefill_steps,
+                window.tokens_std,
+                window.attn_work_std,
+                window.residual_ms,
+                window.median_period_ms,
             )
         if self.prefill_target is not None:
             for sample in samples:
@@ -3202,26 +3231,71 @@ class Scheduler(SchedulerInterface):
             + len(self.async_kv_waiting)
         )
 
-    def get_pending_prefill_ms(self) -> float:
-        """Modelled time of the prefill this engine has not finished.
+    def _prefill_step_ms(
+        self, model: PrefillCostModel, decode_tokens: int, chunk: int, context: int
+    ) -> float:
+        """Time a step carrying a prefill chunk takes: with a token target, what
+        the steps that filled it measured; otherwise what the cost model says."""
+        target = self.prefill_target
+        if target is not None:
+            return target.step_ms or model.budget_ms
+        return model.step_ms(decode_tokens, chunk, context)
 
-        Priced with the step time budget's cost model, so a request whose
-        remaining tokens attend over a long context weighs by its cost rather
-        than by its token count.
+    def get_pending_prefill_ms(self, max_age_s: float = 0.0) -> float:
+        """Time the prefill this engine has not finished takes to drain.
+
+        Counted in steps: every step carries one chunk, so a request needs its
+        remaining tokens over the chunk the scheduler gives it, taken at the
+        middle of the context it will cover (a request on a long context gets
+        shorter chunks), and each step takes what a step with that chunk takes.
+        With a token target both come from the chunk rule and the measured step
+        period, not from the marginal cost of one token, which the data may not
+        determine.
+
+        Args:
+            max_age_s: Reuse the last result when it is at most this old. The
+                engine core asks every step, and pricing a backlog of thousands of
+                requests takes milliseconds.
+
+        Returns:
+            The time in milliseconds.
+
         """
         model = self.prefill_cost_model
         if model is None:
             return 0.0
+        now = time.monotonic()
+        cached = self._pending_ms_cache
+        if max_age_s > 0 and cached is not None and now - cached[0] < max_age_s:
+            return cached[1]
+        decode_tokens = self._eligible_decode_tokens()
         total = 0.0
         for request in itertools.chain(
             self.running, self.waiting, self.kv_holding_waiting
         ):
             if request.is_finished():
                 continue
-            remaining = request.num_prompt_tokens - request.num_computed_tokens
+            context = request.num_computed_tokens
+            remaining = request.num_prompt_tokens - context
             if remaining > 0:
-                total += model.work_ms(remaining, request.num_computed_tokens)
+                middle = context + remaining // 2
+                chunk = self._prefill_chunk(model, decode_tokens, middle)
+                step_ms = self._prefill_step_ms(model, decode_tokens, chunk, middle)
+                total += remaining / chunk * step_ms
+        self._pending_ms_cache = (now, total)
         return total
+
+    def get_prefill_ms_per_token(self) -> float:
+        """Time a prefill token takes at this engine's chunk size, from a fresh
+        context: what a router prices a request it has just sent with, until the
+        engine reports the request itself. 0 without a step time budget.
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return 0.0
+        decode_tokens = self._eligible_decode_tokens()
+        chunk = self._prefill_chunk(model, decode_tokens, 0)
+        return self._prefill_step_ms(model, decode_tokens, chunk, 0) / chunk
 
     def get_pending_prefill_tokens(self) -> int:
         """Prompt tokens this engine has not finished prefilling.
