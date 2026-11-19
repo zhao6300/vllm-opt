@@ -1399,8 +1399,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PREFILL_TARGET_UPDATE_MS", "200")
     ),
     # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
-    # (the VLLM_PREFILL_COST_* values are then the starting point and the fit
-    # stays within 0.25x to 4x of them) to the measured step periods while
+    # (the VLLM_PREFILL_COST_* values are then the starting point, and the fit
+    # only keeps them valid) to the measured step periods while
     # serving. Across data parallel ranks the steps are exchanged over an
     # asynchronous CPU collective, so every rank installs the same coefficients
     # at the same step. Default: off.

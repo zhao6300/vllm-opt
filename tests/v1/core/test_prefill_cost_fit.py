@@ -40,7 +40,7 @@ def make_steps(count: int, seed: int = 0, truth=TRUE, noise: float = 0.02):
 
 
 def make_solver(prior=PRIOR, **kwargs) -> StepCostSolver:
-    return StepCostSolver(prior, max_fixed_ms=BUDGET_MS / 4, **kwargs)
+    return StepCostSolver(prior, **kwargs)
 
 
 def test_the_fit_recovers_coefficients_far_from_the_configured_ones():
@@ -68,11 +68,36 @@ def test_a_term_the_data_does_not_vary_stays_at_its_prior():
     assert per_context == PRIOR[2]
 
 
-def test_a_fit_stays_within_a_factor_of_the_prior():
+def test_a_fit_may_end_far_from_the_configured_values():
     solver = make_solver()
     for step in make_steps(400, truth=(0.0, 0.021, 1e-8), noise=0.0):
         solver.add(step)
-    assert solver.fit()[2] == pytest.approx(PRIOR[2] / 4)
+    assert solver.fit()[2] < PRIOR[2] / 100
+
+
+def test_a_fit_is_always_valid_even_for_impossible_data():
+    """A period that falls as the step grows asks for negative coefficients; the
+    fit keeps them valid, so a cost model can still be built from it."""
+    solver = make_solver()
+    for step in make_steps(400, truth=(-300.0, -0.01, -1e-6), noise=0.0):
+        solver.add(step)
+    fixed, per_token, per_context = solver.fit()
+    assert fixed >= 0
+    assert per_token > 0
+    assert per_context >= 0
+    model = make_model().with_coefficients(fixed, per_token, per_context)
+    assert model.max_prefill_tokens(0, 1000) >= model.min_chunk_tokens
+
+
+def test_steps_that_are_not_numbers_are_ignored():
+    clean, dirty = make_solver(), make_solver()
+    for step in make_steps(100):
+        clean.add(step)
+        dirty.add(step)
+    dirty.add(StepSample(-1, float("nan"), 4096, 1e7, 1))
+    dirty.add(StepSample(-2, 100.0, 4096, float("inf"), 1))
+    assert len(dirty) == len(clean)
+    assert dirty.fit() == clean.fit()
 
 
 def test_a_term_configured_as_zero_can_be_fitted():

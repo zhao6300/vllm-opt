@@ -11,6 +11,7 @@ merged steps. Every rank receives the same samples at the same step and so
 installs the same coefficients.
 """
 
+import math
 import statistics
 from collections import deque
 from collections.abc import Callable
@@ -56,39 +57,40 @@ class StepCostSolver:
     attn_work` toward configured coefficients.
 
     The prior counts as `prior_samples` observations of typical size, enough to
-    keep a term the data does not vary at its prior, and a fitted term stays within
-    `[lo, hi]` times its prior. Recent steps weigh more: a step's weight halves
-    every `half_life` steps.
+    keep a term the data does not vary at its prior. A fitted term is only kept
+    valid, so a cost model can be built from it: fixed and per-context time not
+    below 0, per-token time above 0. Recent steps weigh more: a step's weight
+    halves every `half_life` steps.
     """
 
     # Size of a parameter whose prior is 0, which only fixes the units.
     _FLOOR = (1.0, 1e-3, 1e-7)
+    # What a coefficient may not fall below: the per-token time must stay positive.
+    _LOWER = (0.0, 1e-9, 0.0)
 
     def __init__(
         self,
         prior: tuple[float, float, float],
-        max_fixed_ms: float,
         window: int = 512,
         half_life: float = 256.0,
         prior_samples: float = 1.0,
         min_samples: int = 16,
-        lo: float = 0.25,
-        hi: float = 4.0,
     ) -> None:
         self.prior = prior
         self.min_samples = min_samples
         self._scale = np.array([max(p, f) for p, f in zip(prior, self._FLOOR)])
         self._prior_u = np.array(prior) / self._scale
-        upper_if_zero = (max_fixed_ms, 1.0, 1e-4)
-        self._lower = np.array([0.0 if p == 0 else lo * p for p in prior])
-        self._upper = np.array(
-            [hi * p if p > 0 else u for p, u in zip(prior, upper_if_zero)]
-        )
         self.prior_samples = prior_samples
         self.half_life = half_life
         self._rows: deque[tuple[float, float, float, float]] = deque(maxlen=window)
 
     def add(self, sample: StepSample) -> None:
+        """Add a step; one with a figure that is not a finite number is ignored."""
+        if not all(
+            math.isfinite(v)
+            for v in (sample.period_ms, sample.tokens, sample.attn_work)
+        ):
+            return
         self._rows.append(
             (sample.period_ms, 1.0, float(sample.tokens), float(sample.attn_work))
         )
@@ -113,7 +115,7 @@ class StepCostSolver:
         )
         rhs = (z * w[:, None]).T @ y + ridge @ self._prior_u
         u = np.linalg.solve(gram + ridge, rhs)
-        theta = np.clip(u * self._scale, self._lower, self._upper)
+        theta = np.maximum(u * self._scale, self._LOWER)
         return float(theta[0]), float(theta[1]), float(theta[2])
 
 
@@ -159,7 +161,7 @@ class StepCostFitter:
         on_fit: Callable[[tuple[float, float, float], list[StepSample]], None],
     ) -> "StepCostFitter":
         return cls(
-            StepCostSolver(prior, max_fixed_ms=budget_ms / 4),
+            StepCostSolver(prior),
             envs.VLLM_PREFILL_COST_FIT_INTERVAL,
             4 * budget_ms,
             on_fit,
