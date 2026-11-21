@@ -2,11 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """V4.1 state saving/compression and independently schedulable cache insertion."""
 
+import numpy as np
 import torch
 
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import _fp32x2_to_fp4x2
+from vllm.models.deepseek_v41.common.ops.cache_utils import (
+    paged_cache_block_span,
+    paged_cache_page_rows,
+    paged_slots_to_cache_rows,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.flashinfer import (
+    flashinfer_dsv41_fp4_quantize_append,
+    flashinfer_dsv41_fp4_quantize_pack,
+)
 
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX950
@@ -488,6 +498,7 @@ def rope_quant_insert(
     slot_mapping: torch.Tensor,
     compress_ratio: int,
     fp8_scale: torch.Tensor | None = None,
+    footer_scale: bool = False,
 ) -> None:
     """Apply GPT-J RoPE and publish a latent to the compressed KV cache.
 
@@ -499,7 +510,9 @@ def rope_quant_insert(
     (512 MXFP8 value bytes covering the RoPE dims too, then 16 UE8M0 scales of
     32 dims each), or 288 B for V4.1 NVFP4 (256 bytes of e2m1 pairs then 32
     e4m3 scales of 16 dims each), which only the compressed cache uses. The
-    two V4.1 records keep each token's scales right after its own values.
+    two V4.1 records keep each token's scales right after its own values,
+    unless `footer_scale` asks for the page-footer layout (`page_size` value
+    rows, then the page's scales), which only the SM120 `cake` backend reads.
     `bfloat16` and `float8_e4m3fn` are the plain [448 NoPE | 64 RoPE] rows
     read by FlashInfer, the latter scaled by the per-tensor `fp8_scale`.
     """
@@ -511,6 +524,27 @@ def rope_quant_insert(
     if num_tokens == 0:
         return
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
+    if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 288:
+        roped_latent = torch.empty_like(latent)
+        _gptj_rotate_latent_kernel[(num_tokens,)](
+            latent,
+            positions,
+            cos_sin_cache,
+            roped_latent,
+            COS_STRIDE=cos_sin_cache.stride(0),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+            **launch_kwargs,
+        )
+        _insert_fp4_packed_or_append(
+            roped_latent,
+            slot_mapping,
+            kv_cache,
+            positions,
+            compress_ratio,
+            footer_scale=footer_scale,
+        )
+        return
     if kv_cache.dtype == torch.uint8:
         kernel = {
             584: _rope_quant_insert_kernel,
@@ -520,6 +554,14 @@ def rope_quant_insert(
         assert kernel is not None, (
             f"unsupported paged KV record width {kv_cache.shape[-1]}"
         )
+        kernel_kwargs = {}
+        if kernel is _rope_quant_insert_mxfp8_kernel:
+            kernel_kwargs["FOOTER_SCALE"] = footer_scale
+        else:
+            assert not footer_scale, (
+                f"the page-footer layout covers V4.1 records only, not "
+                f"{kv_cache.shape[-1]}-byte ones"
+            )
         kernel[(num_tokens,)](
             latent,
             positions,
@@ -532,10 +574,12 @@ def rope_quant_insert(
             COMPRESS_RATIO=compress_ratio,
             SANITIZE_CACHE_NANS=_ON_GFX950,
             num_warps=4,
+            **kernel_kwargs,
             **launch_kwargs,
         )
         return
 
+    assert not footer_scale, "the page-footer layout covers V4.1 records only"
     assert kv_cache.dtype in (torch.bfloat16, torch.float8_e4m3fn)
     assert kv_cache.shape[-1] == 512 and kv_cache.stride(-1) == 1
     store_fp8 = kv_cache.dtype == torch.float8_e4m3fn
@@ -558,6 +602,115 @@ def rope_quant_insert(
         num_warps=4,
         **launch_kwargs,
     )
+
+
+def _insert_fp4_packed_or_append(
+    roped_latent: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+    footer_scale: bool = False,
+) -> None:
+    """Use page packing only for whole consecutive pages, otherwise append."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+
+    if compress_ratio != 1:
+        # Callers already mark non-boundary tokens as PAD; keep the writer
+        # correct on its own so a stray valid slot cannot publish a token that
+        # does not close a compression group.
+        slot_mapping = slot_mapping.masked_fill(
+            (positions + 1) % compress_ratio != 0, -1
+        )
+    # FlashInfer's writer addresses an inline-scale record as a flat row of the
+    # whole cache, so padded pages need the slot rewritten to the row the token
+    # occupies. Footer-scale pages are addressed by paged slot id.
+    page_tokens = paged_cache_page_rows(kv_cache)
+    append_slots = (
+        slot_mapping
+        if footer_scale
+        else paged_slots_to_cache_rows(
+            slot_mapping, page_tokens, paged_cache_block_span(kv_cache)
+        )
+    )
+    if (
+        slot_mapping.dim() != 1
+        or compress_ratio != 1
+        or torch.cuda.is_current_stream_capturing()
+        or BreakableCUDAGraphCapture.is_active()
+    ):
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent, append_slots, kv_cache, inline_scale=not footer_scale
+        )
+        return
+
+    # compress_ratio == 1 here, so every token closes a group and ``positions``
+    # needs no boundary check. One host copy of the slots replaces the former
+    # per-element ``.item()`` syncs.
+    slots_cpu = slot_mapping.cpu().numpy()
+    runs = _whole_page_runs(slots_cpu, page_tokens)
+    packed_mask = np.zeros(slots_cpu.shape[0], dtype=bool)
+    for start, end in runs:
+        packed_mask[start:end] = True
+        page_ids = (
+            slot_mapping[start:end:page_tokens]
+            .div(page_tokens, rounding_mode="trunc")
+            .to(torch.long)
+        )
+        packed = flashinfer_dsv41_fp4_quantize_pack(
+            roped_latent[start:end].view(-1, page_tokens, 512),
+            kv_layout="NHD",
+            inline_scale=not footer_scale,
+        )
+        kv_cache.index_copy_(
+            0,
+            page_ids,
+            packed.reshape(-1, page_tokens, 288),
+        )
+
+    append_rows = np.flatnonzero(~packed_mask)
+    if append_rows.size:
+        append_rows_t = torch.from_numpy(append_rows).to(slot_mapping.device)
+        flashinfer_dsv41_fp4_quantize_append(
+            roped_latent[append_rows_t],
+            append_slots[append_rows_t],
+            kv_cache,
+            inline_scale=not footer_scale,
+        )
+
+
+def _whole_page_runs(slots: np.ndarray, page_tokens: int) -> list[tuple[int, int]]:
+    """Token ranges `[start, end)` made only of complete, in-order pages.
+
+    A page qualifies when it starts on a page boundary and its `page_tokens`
+    slots are consecutive, so one pack call can write it whole. Every slot of
+    the page is checked: a batch holding several requests, or decode tokens next
+    to a prefill, can have a page-aligned slot followed by slots of another
+    request. Adjacent qualifying pages are merged into one run; they need not
+    be adjacent in the cache because the caller derives each page id from the
+    page's first slot.
+    """
+    num_tokens = slots.shape[0]
+    offsets = np.arange(page_tokens, dtype=slots.dtype)
+    runs: list[tuple[int, int]] = []
+    token = 0
+    while token < num_tokens:
+        end = token + page_tokens
+        first = slots[token]
+        if (
+            first >= 0
+            and first % page_tokens == 0
+            and end <= num_tokens
+            and np.array_equal(slots[token:end], first + offsets)
+        ):
+            if runs and runs[-1][1] == token:
+                runs[-1] = (runs[-1][0], end)
+            else:
+                runs.append((token, end))
+            token = end
+        else:
+            token += 1
+    return runs
 
 
 @triton.jit
@@ -651,11 +804,14 @@ def _rope_quant_insert_mxfp8_kernel(
     CACHE_BLOCK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     SANITIZE_CACHE_NANS: tl.constexpr,
+    FOOTER_SCALE: tl.constexpr = False,
 ):
     """V4.1 record: RoPE first, then MXFP8-quantize all 512 dims.
 
     The RoPE dims are quantized here too, so unlike the V4 kernel the rotation
-    has to happen before the scales are picked.
+    has to happen before the scales are picked. The record is either one token
+    (data then its own scales) or, with `FOOTER_SCALE`, a page of value rows
+    followed by the page's scale rows.
     """
     t = tl.program_id(0)
     slot = tl.load(cache_slots + t)
@@ -678,8 +834,12 @@ def _rope_quant_insert_mxfp8_kernel(
         rotated = tl.where(rotated == rotated, rotated, 0.0)
 
     page = cache + (slot // CACHE_BLOCK).to(tl.int64) * CACHE_STRIDE
-    values = page + (slot % CACHE_BLOCK) * 528
-    scales = values + 512
+    if FOOTER_SCALE:
+        values = page + (slot % CACHE_BLOCK) * 512
+        scales = page + CACHE_BLOCK * 512 + (slot % CACHE_BLOCK) * 16
+    else:
+        values = page + (slot % CACHE_BLOCK) * 528
+        scales = values + 512
 
     quant = tl.reshape(rotated, (16, 32))
     amax = tl.maximum(tl.max(tl.abs(quant), 1), 1e-4)
@@ -734,7 +894,7 @@ def _rope_quant_insert_nvfp4_kernel(
     tiles = tl.reshape(rotated, (32, 16))
     amax = tl.max(tl.abs(tiles), 1)
     # 2**-9 is the smallest normal e4m3 magnitude; 448 the largest.
-    scale = tl.clamp(amax * (1.0 / 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
+    scale = tl.clamp(tl.math.div_rn(amax, 6.0), 0.001953125, 448.0).to(tl.float8e4nv)
     # Round-to-nearest division: Triton's default div.full misplaces values
     # that land exactly on an e2m1 tie.
     scaled = tl.math.div_rn(tiles, tl.reshape(scale.to(tl.float32), (32, 1)))
@@ -789,3 +949,28 @@ def _rope_plain_insert_kernel(
         tl.store(dst + d, tl.clamp(scaled, -448.0, 448.0).to(tl.float8e4nv))
     else:
         tl.store(dst + d, row)
+
+
+@triton.jit
+def _gptj_rotate_latent_kernel(
+    latent,
+    positions,
+    cos_sin,
+    output,
+    COS_STRIDE: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+):
+    t = tl.program_id(0)
+    position = tl.load(positions + t)
+    if (position + 1) % COMPRESS_RATIO != 0:
+        return
+    d = tl.arange(0, 512)
+    normed = tl.load(latent + t.to(tl.int64) * 512 + d).to(tl.float32)
+    even, odd = tl.split(tl.reshape(normed, (256, 2)))
+    pair = tl.arange(0, 256) - 224
+    cs = cos_sin + (position // COMPRESS_RATIO * COMPRESS_RATIO) * COS_STRIDE
+    c = tl.load(cs + tl.maximum(pair, 0), pair >= 0, other=1.0).to(tl.float32)
+    s = tl.load(cs + 32 + tl.maximum(pair, 0), pair >= 0, other=0.0).to(tl.float32)
+    rotated = tl.interleave(even * c - odd * s, odd * c + even * s)
+    rotated = tl.where(rotated != rotated, 0.0, rotated)
+    tl.store(output + t.to(tl.int64) * 512 + d, rotated.to(tl.bfloat16))

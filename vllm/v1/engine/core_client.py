@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import contextlib
+import logging
 import queue
 import sys
 import uuid
@@ -56,6 +57,7 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.core import EngineCore, EngineCoreProc
+from vllm.v1.engine.dp_lb_shared import SharedDPLoadStats
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
@@ -81,6 +83,28 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
+
+# Token-aware DP routing weighs an engine's unfinished prefill against its
+# request count. With a prefill step time budget configured, the engine reports
+# that backlog in modelled milliseconds and it is measured in steps of that
+# budget (`VLLM_PREFILL_STEP_BUDGET_MS`): a request that still has to attend
+# over a long context costs what it costs, not what it counts. Without a
+# budget, VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens weigh as one request.
+# The weight is capped at this many requests: an engine already prefilling
+# several prompts' worth of tokens is simply busy, and scaling the score with
+# its whole backlog keeps it unroutable for the length of that prefill, so
+# every other engine piles up instead (measured in simulation: uncapped, a
+# staggered 32 x 16K run skews 10/8/7/7 and takes 25% longer than routing
+# without the term; capped, it stays 8/8/8/8 at the uncapped-off time).
+_DP_LB_MAX_PENDING_REQUESTS = 4.0
+# A request this client dispatched floors its engine's pending prefill until this
+# many load snapshots have arrived after it. The first snapshot after a dispatch
+# may have been computed before the engine received the request, the second
+# cannot have been.
+_DP_LB_FLOOR_SNAPSHOTS = 2
+# The stats task wakes at least this often, so a server stays alive to the
+# others' shared-load heartbeat check (stale after 2 s) between sparse snapshots.
+_STATS_POLL_TIMEOUT_MS = 500
 
 
 def _with_packed_prompt(request: EngineCoreRequest) -> EngineCoreRequest:
@@ -1590,6 +1614,13 @@ class DPAsyncMPClient(AsyncMPClient):
         except RuntimeError:
             pass
 
+    def _on_lb_snapshot(self) -> None:
+        """Called after a load snapshot has replaced `lb_engines`."""
+
+    def _on_stats_poll(self) -> None:
+        """Called each time the stats task wakes, at least every
+        `_STATS_POLL_TIMEOUT_MS`, snapshot or not."""
+
     def _ensure_stats_update_task(self):
         resources = self.resources
         if resources.stats_update_task is not None:
@@ -1618,7 +1649,8 @@ class DPAsyncMPClient(AsyncMPClient):
                 poller.register(scale_rcv_socket, zmq.POLLIN)
 
                 while True:
-                    events = dict(await poller.poll())
+                    events = dict(await poller.poll(timeout=_STATS_POLL_TIMEOUT_MS))
+                    self._on_stats_poll()
                     if scale_rcv_socket in events:
                         buf = scale_rcv_socket.recv(flags=zmq.NOBLOCK).result()
                         msg_type, new_engine_count = msgspec.msgpack.decode(buf)
@@ -1668,6 +1700,7 @@ class DPAsyncMPClient(AsyncMPClient):
                         count_slice = slice(ranks[0], ranks[-1] + 1)
                         sliced_counts = counts[count_slice]
                         self.lb_engines = sliced_counts
+                        self._on_lb_snapshot()
                         logger.debug(
                             "Received counts: %s (%s)", sliced_counts, count_slice
                         )
@@ -1801,6 +1834,38 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         # Exact per-engine count of this client's unfinished requests.
         self.engine_inflight: Counter[EngineIdentity] = Counter()
 
+        # Token-aware routing (VLLM_DP_LB_TOKEN_AWARE): score an engine by the
+        # prefill tokens it has not finished, as each engine reports it.
+        self.token_aware_lb = envs.VLLM_DP_LB_TOKEN_AWARE
+        self.lb_prefill_tokens_per_request = max(
+            envs.VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST, 1
+        )
+        # The engine prices its backlog in ms when a prefill step time budget
+        # is configured; the budget turns that into a number of steps.
+        self.lb_step_budget_ms = max(envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
+        # This client's own dispatches whose prefill has not finished, by engine.
+        # It floors the engine-reported backlog for the ~100 ms before a snapshot
+        # that has seen them lands, which is exactly when a burst of mixed-size
+        # prompts is routed: without it, sizes reach the score too late and each
+        # engine simply takes every fourth request. Once such a snapshot has
+        # arrived the floor is dropped, so the engine's own remainder (cache hits
+        # and prefill progress included) decides.
+        # request id -> (engine, tokens, ms, snapshots received at dispatch);
+        # insertion order is dispatch order, so the snapshot count never falls.
+        self.req_pending_prefill: dict[str, tuple[EngineIdentity, int, float, int]] = {}
+        self.lb_snapshot_seq = 0
+        self.engine_pending_tokens: Counter[EngineIdentity] = Counter()
+        self.engine_pending_ms: Counter[EngineIdentity] = Counter()
+        # Other API servers' load, when they share it (VLLM_DP_LB_SHARED_LOAD).
+        self.shared_load: SharedDPLoadStats | None = None
+        if client_addresses is not None and "dp_lb_shared_load" in client_addresses:
+            self.shared_load = SharedDPLoadStats(
+                client_addresses.pop("dp_lb_shared_load"),
+                client_count,
+                client_index,
+                client_addresses.pop("dp_lb_shared_load_engines"),
+            )
+
         super().__init__(
             vllm_config,
             executor_class,
@@ -1840,11 +1905,27 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             num_engines = len(current_counts)
             min_score: float = sys.maxsize
             eng_index = 0
+            trace: list[tuple[int, int, int, float] | None] | None = None
+            if logger.isEnabledFor(logging.DEBUG):
+                trace = [None] * num_engines
+            # With shared load the other servers' figures are exact, so nothing
+            # is scaled by the server count.
+            others = (
+                self.shared_load.others(num_engines)
+                if self.shared_load is not None
+                else None
+            )
+            scale = 1 if others is not None else self.client_count
             for i in range(num_engines):
                 # Start from client_index to help with balancing when engines
                 # are empty.
                 idx = (self.eng_start_index + i) % num_engines
-                waiting, running, kv_cache_usage = current_counts[idx]
+                counts = current_counts[idx]
+                waiting, running, kv_cache_usage = counts[:3]
+                # Snapshot tuples from before the prefill stats carry neither
+                # of the extra fields.
+                pending_prefill_tokens = counts[3] if len(counts) > 3 else 0
+                pending_prefill_ms = counts[4] if len(counts) > 4 else 0.0
                 # Estimate engine load as the greater of the coordinator's
                 # latest (waiting + running) snapshot and this client's own
                 # in-flight count (scaled by the number of clients). The
@@ -1853,7 +1934,36 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                 # race with routing decisions; the snapshot raises the score
                 # when other clients or stale requests load the engine.
                 inflight = self.engine_inflight[self.core_engines[idx]]
-                score: float = max(self.client_count * inflight, waiting + running)
+                other_inflight, other_tokens, other_ms = (
+                    others[idx] if others is not None else (0, 0, 0.0)
+                )
+                score: float = max(
+                    scale * (inflight + other_inflight), waiting + running
+                )
+                if self.token_aware_lb:
+                    # Unfinished prefill occupies the engine's steps for as
+                    # long as it takes, however few requests that is. The
+                    # engine reports the remainder itself, with cache hits
+                    # already taken out; this client's own recent dispatches
+                    # floor it until the next snapshot. Scale this client's
+                    # share by the clients, like the in-flight count, and count
+                    # at most `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    engine = self.core_engines[idx]
+                    pending_prefill_tokens = max(
+                        pending_prefill_tokens,
+                        self.engine_pending_tokens[engine] + other_tokens,
+                    )
+                    pending_prefill_ms = max(
+                        pending_prefill_ms,
+                        self.engine_pending_ms[engine] + other_ms,
+                    )
+                    if self.lb_step_budget_ms > 0 and pending_prefill_ms > 0:
+                        pending_load = pending_prefill_ms / self.lb_step_budget_ms
+                    else:
+                        pending_load = (
+                            pending_prefill_tokens / self.lb_prefill_tokens_per_request
+                        )
+                    score += min(scale * pending_load, _DP_LB_MAX_PENDING_REQUESTS)
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache
                     # pressure: a queue on a KV-bound engine drains slowly, so
@@ -1862,24 +1972,97 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # the penalty stays off, preserving exact round-robin.
                     # Ramps from 0 at <=50% usage to 3x waiting at 100%.
                     score += waiting * 6.0 * max(0.0, kv_cache_usage - 0.5)
+                if trace is not None:
+                    trace[idx] = (
+                        waiting,
+                        running,
+                        round(pending_prefill_ms, 1),
+                        score,
+                    )
                 if score < min_score:
                     min_score = score
                     eng_index = idx
             # Increment local waiting count for better balancing between stats
             # updates from the coordinator (which happen every 100ms).
-            current_counts[eng_index][0] += self.client_count
+            current_counts[eng_index][0] += scale
             # Rotate the scan start so that ties (equal scores, e.g. right
             # after a coordinator stats reset when engines look equally loaded)
             # don't systematically favor the same engine. This removes the
             # fixed tie-break bias without affecting load-aware decisions when
             # scores actually differ.
             self.eng_start_index = (self.eng_start_index + 1) % num_engines
+            if trace is not None:
+                logger.debug(
+                    "DP route %s (%d prompt tokens) -> engine %d: "
+                    "[waiting, running, pending prefill ms, score] %s",
+                    request.request_id,
+                    len(request.prompt_token_ids or ()),
+                    eng_index,
+                    trace,
+                )
 
         chosen_engine = self.core_engines[eng_index]
         # Record which engine is chosen for this request, to handle aborts.
         self.reqs_in_flight[request.request_id] = chosen_engine
         self.engine_inflight[chosen_engine] += 1
+        if self.token_aware_lb and request.prompt_token_ids is not None:
+            tokens = len(request.prompt_token_ids)
+            # Priced as the chosen engine prices its own backlog, so the floor and
+            # its report compare; the configured cost is the fallback.
+            counts = (
+                self.lb_engines[eng_index] if eng_index < len(self.lb_engines) else ()
+            )
+            ms_per_token = (
+                counts[5]
+                if len(counts) > 5 and counts[5] > 0
+                else envs.VLLM_PREFILL_COST_MS_PER_TOKEN
+            )
+            ms = tokens * ms_per_token
+            self.req_pending_prefill[request.request_id] = (
+                chosen_engine,
+                tokens,
+                ms,
+                self.lb_snapshot_seq,
+            )
+            self.engine_pending_tokens[chosen_engine] += tokens
+            self.engine_pending_ms[chosen_engine] += ms
+        self._publish_load(chosen_engine)
         return chosen_engine
+
+    def _on_stats_poll(self) -> None:
+        # Snapshots can be 5 s apart on a steady load, so the heartbeat that
+        # tells the other servers this one is alive rides on the poll timeout.
+        if self.shared_load is not None:
+            self.shared_load.heartbeat()
+
+    def _publish_load(self, engine: EngineIdentity) -> None:
+        """Write this server's figures for `engine` to the shared slots."""
+        if self.shared_load is not None:
+            self.shared_load.publish(
+                self.core_engines.index(engine),
+                self.engine_inflight[engine],
+                self.engine_pending_tokens[engine],
+                self.engine_pending_ms[engine],
+            )
+
+    def _release_pending_prefill(self, req_id: str) -> None:
+        """Drop a request's own dispatch from its engine's local floor."""
+        entry = self.req_pending_prefill.pop(req_id, None)
+        if entry is None:
+            return
+        engine, tokens, ms, _ = entry
+        self.engine_pending_tokens[engine] -= tokens
+        self.engine_pending_ms[engine] -= ms
+        self._publish_load(engine)
+
+    def _on_lb_snapshot(self) -> None:
+        """Drop the floor of every dispatch a snapshot has had time to see."""
+        self.lb_snapshot_seq += 1
+        seen_through = self.lb_snapshot_seq - _DP_LB_FLOOR_SNAPSHOTS
+        for req_id, entry in list(self.req_pending_prefill.items()):
+            if entry[3] > seen_through:
+                break
+            self._release_pending_prefill(req_id)
 
     async def call_utility_async(self, method: str, *args) -> Any:
         # Only the result from the first engine is returned.
@@ -1904,10 +2087,18 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     async def process_engine_outputs(
         self: "DPLBAsyncMPClient", outputs: EngineCoreOutputs
     ):
+        if self.req_pending_prefill:
+            # The first output of a request means its prefill is done; a request
+            # that finishes without one (an abort) also stops being pending.
+            for output in outputs.outputs:
+                self._release_pending_prefill(output.request_id)
+            for req_id in outputs.finished_requests or ():
+                self._release_pending_prefill(req_id)
         if outputs.finished_requests and self.reqs_in_flight:
             for req_id in outputs.finished_requests:
                 if (engine := self.reqs_in_flight.pop(req_id, None)) is not None:
                     self.engine_inflight[engine] -= 1
+                    self._publish_load(engine)
 
     @staticmethod
     async def eep_process_engine_core_notification(

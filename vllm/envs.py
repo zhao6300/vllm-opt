@@ -61,8 +61,37 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MQA_TOPK: bool = True
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
+    VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
+    VLLM_FLASHINFER_DSV41_SM120_CAKE: bool = False
+    VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS: int = 256
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
+    VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL: int = 0
+    VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG: int = 1
+    VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING: bool = False
+    VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO: float = 0.5
+    VLLM_DP_LB_TOKEN_AWARE: bool = False
+    VLLM_DP_LB_SHARED_LOAD: bool = False
+    VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
+    VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
+    VLLM_PREFILL_COST_FIXED_MS: float = 0.0
+    VLLM_PREFILL_COST_MS_PER_TOKEN: float = 0.0
+    VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT: float = 0.0
+    VLLM_PREFILL_MIN_CHUNK_TOKENS: int = 256
+    VLLM_PREFILL_FILL_TARGET: bool = False
+    VLLM_PREFILL_TARGET_INIT_TOKENS: int = 0
+    VLLM_PREFILL_COST_FIT: bool = False
+    VLLM_PREFILL_COST_FIT_INTERVAL: int = 64
+    VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_XPU_PP_MICROBATCH: bool = True
+    VLLM_PP_NUM_MICROBATCHES: int = 0
+    VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
+    VLLM_PP_PACK_MAX_SEQS: int = 0
+    VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS: int | None = None
+    VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS: int | None = None
+    VLLM_PP_SEND_BUFFERS: int = 0
+    VLLM_PP_STEP_PROFILE_INTERVAL: int = 0
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
@@ -327,6 +356,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+    VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -435,6 +465,19 @@ def compile_on_one_rank() -> bool:
     if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
         return False
     return os.environ.get("VLLM_COMPILE_ON_ONE_RANK", "0") == "1"
+
+
+def _pp_microbatch_balance() -> str:
+    """VLLM_PP_MICROBATCH_BALANCE: off, balance or pack ("0" and "1" are the
+    older spellings of off and balance)."""
+    value = os.getenv("VLLM_PP_MICROBATCH_BALANCE", "off")
+    mode = {"0": "off", "1": "balance"}.get(value, value)
+    if mode not in ("off", "balance", "pack"):
+        raise ValueError(
+            f"Invalid value '{value}' for VLLM_PP_MICROBATCH_BALANCE. "
+            "Valid options: off, balance, pack (or 0, 1)."
+        )
+    return mode
 
 
 def env_with_choices(
@@ -962,6 +1005,52 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_PP_MICROBATCH": lambda: bool(
         int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
     ),
+    # V2 runner + PP + async scheduling: decode microbatches M. Each request
+    # decodes every M steps, the sampled-token ring is M deep and M + 1 batches
+    # are in flight. 0 (default) is pipeline_parallel_size; larger values fill
+    # a pipeline whose round trip through the stages exceeds one microbatch
+    # step, at the cost of M x step time per token and smaller microbatches.
+    # Read by the scheduler and every worker: set it for the whole server.
+    "VLLM_PP_NUM_MICROBATCHES": lambda: int(os.getenv("VLLM_PP_NUM_MICROBATCHES", "0")),
+    # V2 runner + PP + async scheduling: how decode requests are spread over the
+    # decode microbatches (the requests decoded in alternating steps). A burst
+    # of requests that start decoding in one step otherwise stays in one
+    # microbatch, and every other step reaches the stages nearly empty.
+    # "balance" (or "1") keeps the microbatches the same size. "pack" gathers
+    # the decodes in the fullest microbatch, so the other steps carry no decode
+    # and a small prefill chunk fits in the idle time of a stage. "off" (or
+    # "0", the default) leaves the assignment alone.
+    "VLLM_PP_MICROBATCH_BALANCE": lambda: _pp_microbatch_balance(),
+    # "pack" mode: most decode requests one microbatch holds before the rest
+    # go to the next fullest one. 0 never spills over, which is what the
+    # scheduler's max_num_seqs (total running requests) allows anyway.
+    "VLLM_PP_PACK_MAX_SEQS": lambda: int(os.getenv("VLLM_PP_PACK_MAX_SEQS", "0")),
+    # "pack" mode: most prefill tokens a step may carry, in steps that have
+    # decodes to run (DECODE_STEP) and in steps that have none (FREE_STEP). The
+    # decode step is on the critical path of every decoding request, so each
+    # prefill token there adds to TPOT; a free step only has to fit in the idle
+    # time of a stage. 0 defers the prefill of that kind of step. Unset: the
+    # decode step takes --long-prefill-token-threshold (or
+    # --max-num-batched-tokens without it), the free step
+    # --max-num-batched-tokens.
+    "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS", None)
+    ),
+    "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS": lambda: maybe_convert_int(
+        os.environ.get("VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS", None)
+    ),
+    # Number of send buffers per non-last PP rank. 0 waits for the previous
+    # step's intermediate-tensor send before each forward (default). N >= 1
+    # copies each step's payload into one of N preallocated buffers and waits
+    # only for the send that last used that buffer, so a stage can run up to
+    # N steps ahead of its successor's receives.
+    "VLLM_PP_SEND_BUFFERS": lambda: int(os.getenv("VLLM_PP_SEND_BUFFERS", "0")),
+    # Log per-rank PP step timings (GPU time from CUDA events: step cadence,
+    # execute, receive and send waits, sampling, drafting) averaged over this
+    # many steps. 0 disables it.
+    "VLLM_PP_STEP_PROFILE_INTERVAL": lambda: int(
+        os.getenv("VLLM_PP_STEP_PROFILE_INTERVAL", "0")
+    ),
     # When True, GroupCoordinator constructs its CPU/device subgroups via
     # ``torch.distributed.split_group(backend=...)``
     # and ``init_distributed_environment`` initializes the default PG with
@@ -1142,6 +1231,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB", "2048")
     ),
+    # FlashInfer SM120 sparse-MLA prefill kernel selection: "auto", "swapab"
+    # or "mg". Only used by the DeepSeek-V4.1 FP4 extra-cache path.
+    "VLLM_FLASHINFER_SM120_PREFILL_IMPL": lambda: os.getenv(
+        "VLLM_FLASHINFER_SM120_PREFILL_IMPL", "auto"
+    ),
+    # Sparse-MLA decode backend for the DeepSeek-V4.1 FP4 extra-cache path on
+    # SM120: FlashInfer's `backend="cake"` kernels, which read the footer-scale
+    # KV layout, instead of the default inline-scale sparse kernels. Changes the
+    # KV cache layout, so the two settings cannot share a cache.
+    "VLLM_FLASHINFER_DSV41_SM120_CAKE": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE", "0"))
+    ),
+    # Decode rows one cake launch takes (default 256). A wider step runs the
+    # cake kernels in several launches of this size, so cake still covers it.
+    # The split-K scratch of one launch is held per device and grows with this
+    # value (about 0.67 GB per 256 rows at 64 heads, main topk 512 + extra
+    # topk 2048).
+    "VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS", "256")
+    ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
     # Raise it for long-context deployments, where step cost is dominated by
@@ -1149,6 +1258,136 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Clamped to max_model_len - query_len. Default: 8192 tokens
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+    ),
+    # How often live decode steps refresh the adaptive-verification cost
+    # tables from measured timings. 0 keeps the startup profile only.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL", "0")
+    ),
+    # Runner steps between the timed steps that feed that refresh; 0 takes a
+    # 64th of the refresh interval. Each size needs a few timings before it
+    # replaces its startup cost, so a long interval wants a short sampling one.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL", "0")
+    ),
+    # Timed samples kept per (request count / token count) bucket when
+    # refreshing the tables. Larger windows track slower drift but react less
+    # to a sudden change in step cost.
+    "VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW", "256")
+    ),
+    # With pipeline parallelism, how many steps before the newest relay of the
+    # drafter's confidences a non-last stage's trim may read. 0 waits for the
+    # newest one, which serializes the stages; the value is capped at the
+    # decode stagger minus one.
+    "VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG": lambda: int(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG", "1")
+    ),
+    # Data-parallel load balancing by pending prefill work. By default a new
+    # request goes to the engine with the fewest waiting + running requests.
+    # With this set, the prefill an engine reports it has not finished adds to
+    # its score, so a long prompt avoids an engine already busy prefilling. The
+    # engine reports the remainder after cache hits, so a cached prompt costs
+    # only what it still has to compute (a request that has not been scheduled
+    # yet counts in full). With VLLM_PREFILL_STEP_BUDGET_MS set, that remainder
+    # is priced in modelled milliseconds and measured in steps of the budget,
+    # so what is left of a long-context prompt weighs by its cost; without a
+    # budget it is priced in VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST tokens.
+    # Admit extra drafts into the rows a FULL cudagraph pads anyway (under DP,
+    # up to the largest rank's size). Off by default: padded rows are cheaper
+    # than real ones, so the extra drafts are not free.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING": lambda: bool(
+        int(os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING", "0"))
+    ),
+    # With FILL_PADDING: the part of a real row's forward cost that a filled row
+    # adds, because the graph runs a padded row anyway and only attention, which
+    # a padded row has no context for, differs. A draft is admitted while its
+    # survival probability is at least the step's best accepted tokens per ms
+    # times (this ratio times the average forward price of the drafts left, plus
+    # the measured sampler price of a logit row). 0 makes the forward free.
+    "VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO": lambda: float(
+        os.getenv("VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO", "0.5")
+    ),
+    "VLLM_DP_LB_TOKEN_AWARE": lambda: bool(
+        int(os.getenv("VLLM_DP_LB_TOKEN_AWARE", "0"))
+    ),
+    # With several API servers on one host, let them share their per-engine
+    # in-flight and pending-prefill figures through shared memory, so each routes
+    # from every server's dispatches rather than its own scaled by the server
+    # count. Default: off.
+    "VLLM_DP_LB_SHARED_LOAD": lambda: bool(
+        int(os.getenv("VLLM_DP_LB_SHARED_LOAD", "0"))
+    ),
+    # With VLLM_DP_LB_TOKEN_AWARE: how many pending prefill tokens weigh as much
+    # as one waiting/running request in an engine's score. One engine's pending
+    # prefill counts for at most four requests, so a single long prompt cannot
+    # make it unroutable for the length of that prefill.
+    "VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST": lambda: int(
+        os.getenv("VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST", "2048")
+    ),
+    # Time budget in milliseconds of one scheduler step. When positive, the
+    # scheduler caps the prefill tokens a step carries so the modelled step time
+    # stays within it: fixed + per_token * (decode + prefill tokens)
+    # + per_token_context * prefill * (context + prefill / 2). 0 keeps the
+    # fixed max_num_batched_tokens cap. The cost coefficients below have no
+    # defaults to guess from and must be fitted on the deployment.
+    "VLLM_PREFILL_STEP_BUDGET_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_STEP_BUDGET_MS", "0")
+    ),
+    # Step time independent of the token count, in milliseconds.
+    "VLLM_PREFILL_COST_FIXED_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_FIXED_MS", "0")
+    ),
+    # Milliseconds one token adds to a step (required when the budget is set).
+    "VLLM_PREFILL_COST_MS_PER_TOKEN": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "0")
+    ),
+    # Milliseconds a prefill token adds per token of context it attends over.
+    # 0 models a cost independent of the context length.
+    "VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT": lambda: float(
+        os.getenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0")
+    ),
+    # Fewest prefill tokens a step with a time budget still carries, so a
+    # prefill advances when decodes alone fill the budget. Across data parallel
+    # ranks the chunk size is the group's smallest, agreed with the DP state
+    # sync, so a step does not wait on one rank's longer chunk.
+    "VLLM_PREFILL_MIN_CHUNK_TOKENS": lambda: int(
+        os.getenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "256")
+    ),
+    # With VLLM_PREFILL_STEP_BUDGET_MS: size every step's prefill chunk to fill
+    # the step to a shared token target instead of pricing it with the cost
+    # model. A rank takes `target - its decode tokens` of prefill, so ranks end
+    # their steps together and a rank with few decodes fills the room it would
+    # pad. The budget is then the step period the target steers toward. A chunk
+    # is still capped by what its attention over the context costs in the
+    # budget left after the target's token cost, so a rank with a long context
+    # does not hold the others to its chunk, and they do not hold it to theirs.
+    "VLLM_PREFILL_FILL_TARGET": lambda: bool(
+        int(os.getenv("VLLM_PREFILL_FILL_TARGET", "0"))
+    ),
+    # Starting value of that target in tokens; 0 is a quarter of
+    # --max-num-batched-tokens.
+    "VLLM_PREFILL_TARGET_INIT_TOKENS": lambda: int(
+        os.getenv("VLLM_PREFILL_TARGET_INIT_TOKENS", "0")
+    ),
+    # How often a background thread moves the target toward the budget, in
+    # milliseconds. The scheduler only reads the current value. Not used with
+    # VLLM_PREFILL_COST_FIT, which moves the target from the steps of the whole
+    # DP group.
+    "VLLM_PREFILL_TARGET_UPDATE_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_TARGET_UPDATE_MS", "200")
+    ),
+    # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
+    # (the VLLM_PREFILL_COST_* values are then the starting point, and the fit
+    # only keeps them valid) to the measured step periods while
+    # serving. Across data parallel ranks the steps are exchanged over an
+    # asynchronous CPU collective, so every rank installs the same coefficients
+    # at the same step. Default: off.
+    "VLLM_PREFILL_COST_FIT": lambda: bool(int(os.getenv("VLLM_PREFILL_COST_FIT", "0"))),
+    # Steps between two fits (and, across ranks, between the exchanges). Must be
+    # equal on every DP rank.
+    "VLLM_PREFILL_COST_FIT_INTERVAL": lambda: int(
+        os.getenv("VLLM_PREFILL_COST_FIT_INTERVAL", "64")
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -2286,6 +2525,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD": lambda: int(
         int(os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256))
     ),
+    # Decode steps replay FULL graphs, where the MoE all-to-all is also on the
+    # critical path, so the useful cutoff can differ from the prefill one. The
+    # cutoff applies while the FULL graph is recorded, since replay runs no
+    # Python. Unset falls back to VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD.
+    "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD": lambda: int(
+        int(
+            os.getenv(
+                "VLLM_SHARED_EXPERTS_STREAM_DECODE_TOKEN_THRESHOLD",
+                os.getenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", 256),
+            )
+        )
+    ),
     # Token-count cutoff for multi-stream overlap of the attention input
     # GEMM with auxiliary GEMMs (e.g. fused_wqa_wkv overlapped with indexer
     # weights / kv-score projections in DeepSeek-V4). At or below this many
@@ -2542,6 +2793,14 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # PP scheduling, send buffering and step timing run outside the model.
+        "VLLM_PP_NUM_MICROBATCHES",
+        "VLLM_PP_MICROBATCH_BALANCE",
+        "VLLM_PP_PACK_MAX_SEQS",
+        "VLLM_PP_PACK_DECODE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_PACK_FREE_STEP_PREFILL_TOKENS",
+        "VLLM_PP_SEND_BUFFERS",
+        "VLLM_PP_STEP_PROFILE_INTERVAL",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

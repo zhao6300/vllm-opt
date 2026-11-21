@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import (
@@ -45,6 +46,7 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.cost_fit import StepCostFitter, StepSample
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -54,6 +56,8 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.core.sched.prefill_budget import PrefillCostModel
+from vllm.v1.core.sched.prefill_target import PrefillTarget
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
@@ -94,6 +98,13 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # The shared prefill token target; None unless VLLM_PREFILL_FILL_TARGET.
+    prefill_target: PrefillTarget | None = None
+    # The online fit of the prefill cost model; None unless VLLM_PREFILL_COST_FIT.
+    cost_fit: StepCostFitter | None = None
+    # When `get_pending_prefill_ms` last priced the backlog, and what it found.
+    _pending_ms_cache: tuple[float, float] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -271,6 +282,9 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # Finished requests whose blocks are held by the connector until an
+        # async send completes. They must survive an earlier recv completion.
+        self.pending_kv_send_req_ids: set[str] = set()
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -406,6 +420,51 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        # Optional time budget per step (VLLM_PREFILL_STEP_BUDGET_MS): caps the
+        # prefill tokens a step carries by a cost model instead of by tokens.
+        self.prefill_cost_model = PrefillCostModel.from_env()
+        # Set by the DP engine core to the group's MIN cap, so every rank's
+        # step carries the same prefill work.
+        self.prefill_cap_override: int | None = None
+        if self.prefill_cost_model is not None:
+            logger.info(
+                "Prefill chunks are sized by a step time budget: %s",
+                self.prefill_cost_model,
+            )
+        # Optional shared token target (VLLM_PREFILL_FILL_TARGET): the prefill
+        # chunk fills the step to it, and a background thread adapts it to the
+        # measured step period.
+        self.prefill_target: PrefillTarget | None = None
+        if envs.VLLM_PREFILL_FILL_TARGET:
+            if self.prefill_cost_model is None:
+                raise ValueError(
+                    "VLLM_PREFILL_FILL_TARGET needs VLLM_PREFILL_STEP_BUDGET_MS "
+                    "as the step period to steer toward"
+                )
+            self.prefill_target = PrefillTarget.from_env(
+                self.prefill_cost_model.budget_ms,
+                self.scheduler_config.max_num_batched_tokens,
+            )
+            if not envs.VLLM_PREFILL_COST_FIT:
+                self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
+            logger.info(
+                "Prefill chunks fill each step to a shared token target "
+                "(now %d, at most %d) that follows a %s ms step period",
+                self.prefill_target.tokens,
+                self.prefill_target.max_tokens,
+                self.prefill_cost_model.budget_ms,
+            )
+        # Online fit of the cost model; the DP engine core drives its exchange.
+        self.cost_fit: StepCostFitter | None = None
+        self.dp_step = -1
+        self._logged_fit = None
+        model = self.prefill_cost_model
+        if envs.VLLM_PREFILL_COST_FIT and model is not None:
+            self.cost_fit = StepCostFitter.from_env(
+                (model.fixed_ms, model.ms_per_token, model.ms_per_token_context),
+                model.budget_ms,
+                self._on_cost_fit,
+            )
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -699,6 +758,113 @@ class Scheduler(SchedulerInterface):
             num_new_tokens -= self.num_prefill_lookahead - remaining
         return max(num_new_tokens, 0)
 
+    def _prefill_token_cap(self) -> int | None:
+        """Most prefill tokens this step may carry, or None for no extra cap."""
+        return self._time_budget_prefill_cap()
+
+    def time_budget_prefill_cap(self) -> int | None:
+        """Prefill tokens this rank's time budget allows, ignoring the DP
+        group's agreement."""
+        return self._time_budget_prefill_cap(local_only=True)
+
+    def set_prefill_cap_override(self, cap: int | None) -> None:
+        """Use `cap` (the DP group's MIN) for this step, or compute locally."""
+        self.prefill_cap_override = cap
+
+    def _time_budget_prefill_cap(self, local_only: bool = False) -> int | None:
+        """Prefill tokens that keep the step within its time budget.
+
+        The step carries one token run per decoding request that is eligible
+        now, plus the prefill chunks. Chunks of one step share the cap, and the
+        context they attend over is taken from the longest running prefill.
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return None
+        if self.prefill_cap_override is not None and not local_only:
+            return self.prefill_cap_override
+        decode_tokens = 0
+        context = 0
+        for request in self.running:
+            if request.is_finished():
+                continue
+            if request.is_prefill_chunk:
+                context = max(context, request.num_computed_tokens)
+            elif request.next_decode_eligible_step <= self.current_step:
+                decode_tokens += 1 + self.num_spec_tokens
+        return self._prefill_chunk(model, decode_tokens, context)
+
+    def _prefill_chunk(
+        self, model: PrefillCostModel, decode_tokens: int, context: int
+    ) -> int:
+        """The prefill chunk a step with `decode_tokens` of decodes takes when it
+        attends over `context`; the rule that sizes chunks and prices backlogs."""
+        if self.prefill_target is None:
+            return model.max_prefill_tokens(
+                decode_tokens, context, align=self.block_size
+            )
+        target = self.prefill_target
+        chunk = target.max_prefill_tokens(
+            decode_tokens, model.min_chunk_tokens, align=self.block_size
+        )
+        # The target shares the token-priced part of the step between the ranks;
+        # the attention over this rank's context is its own.
+        room_ms = model.budget_ms - model.fixed_ms - model.ms_per_token * target.tokens
+        attention_cap = model.max_attention_tokens(
+            room_ms, context, align=self.block_size
+        )
+        return max(min(chunk, attention_cap), model.min_chunk_tokens)
+
+    def _eligible_decode_tokens(self) -> int:
+        """Tokens the decoding requests that may run now add to a step."""
+        return sum(
+            1 + self.num_spec_tokens
+            for request in self.running
+            if not request.is_finished()
+            and not request.is_prefill_chunk
+            and request.next_decode_eligible_step <= self.current_step
+        )
+
+    def _on_cost_fit(
+        self, theta: tuple[float, float, float], samples: list[StepSample]
+    ) -> None:
+        """Install fitted coefficients and move the target from the same steps."""
+        model = self.prefill_cost_model
+        assert model is not None
+        fixed_ms, ms_per_token, ms_per_token_context = theta
+        self.prefill_cost_model = model.with_coefficients(
+            fixed_ms, ms_per_token, ms_per_token_context
+        )
+        if self._logged_fit is None or any(
+            abs(new - old) > 0.05 * max(abs(old), 1e-12)
+            for new, old in zip(theta, self._logged_fit, strict=True)
+        ):
+            self._logged_fit = theta
+            assert self.cost_fit is not None
+            window = self.cost_fit.solver.diagnostics(theta)
+            logger.info(
+                "Prefill cost model fitted: fixed %.2f ms, %.4g ms/token, "
+                "%.3g ms/token/context (%d steps this round; window of %d steps, "
+                "%d with prefill, token std %.0f, attention work std %.3g, "
+                "residual %.1f ms, median period %.1f ms)",
+                fixed_ms,
+                ms_per_token,
+                ms_per_token_context,
+                len(samples),
+                window.steps,
+                window.prefill_steps,
+                window.tokens_std,
+                window.attn_work_std,
+                window.residual_ms,
+                window.median_period_ms,
+            )
+        if self.prefill_target is not None:
+            for sample in samples:
+                self.prefill_target.ingest(
+                    sample.period_ms / 1000, sample.tokens, sample.prefill_tokens
+                )
+            self.prefill_target.update()
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -775,6 +941,10 @@ class Scheduler(SchedulerInterface):
                 long_prefill_token_threshold, input_budget // num_eligible_reqs
             )
 
+        # Prefill tokens this step may still take (None: no extra cap).
+        prefill_left = self._prefill_token_cap()
+        num_prefill_tokens_scheduled = 0
+        prefill_attn_work: dict[str, float] = {}
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -811,6 +981,14 @@ class Scheduler(SchedulerInterface):
                 continue
 
             if (
+                prefill_left is not None
+                and request.is_prefill_chunk
+                and not prefill_left
+            ):
+                req_index += 1
+                continue
+
+            if (
                 self.ec_connector is not None
                 and request.mm_features
                 and not self.ec_connector.ensure_cache_available(
@@ -828,6 +1006,8 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
+            if prefill_left is not None and request.is_prefill_chunk:
+                num_new_tokens = min(num_new_tokens, prefill_left)
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
@@ -936,6 +1116,14 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
+                            if preempted_req.is_prefill_chunk:
+                                num_prefill_tokens_scheduled -= restored
+                                prefill_attn_work.pop(preempted_req_id, None)
+                            if (
+                                prefill_left is not None
+                                and preempted_req.is_prefill_chunk
+                            ):
+                                prefill_left += restored
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
@@ -990,6 +1178,13 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
+            if request.is_prefill_chunk:
+                num_prefill_tokens_scheduled += num_new_tokens
+                prefill_attn_work[request_id] = num_new_tokens * (
+                    request.num_computed_tokens + num_new_tokens / 2
+                )
+            if prefill_left is not None and request.is_prefill_chunk:
+                prefill_left -= num_new_tokens
             req_index += 1
             drafts_needed = drafts_needed or not self._drafts_unused(
                 request, request.num_computed_tokens, num_new_tokens
@@ -1322,6 +1517,7 @@ class Scheduler(SchedulerInterface):
                     take_async_kv = False
                     continue
 
+                prefill_work = num_computed_tokens < request.num_tokens - 1
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
                     assert num_external_computed_tokens > 0
@@ -1332,6 +1528,9 @@ class Scheduler(SchedulerInterface):
                 ):
                     # DP prefill balancing: defer this step's local prefill
                     # compute to a cadence-aligned step.
+                    break
+                elif prefill_left is not None and prefill_work and not prefill_left:
+                    # This step's prefill token cap is used up.
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
@@ -1373,6 +1572,12 @@ class Scheduler(SchedulerInterface):
 
                     if 0 < long_prefill_token_threshold < num_new_tokens:
                         num_new_tokens = long_prefill_token_threshold
+                    if (
+                        prefill_left is not None
+                        and prefill_work
+                        and not pad_spec_decode
+                    ):
+                        num_new_tokens = min(num_new_tokens, prefill_left)
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
@@ -1620,6 +1825,13 @@ class Scheduler(SchedulerInterface):
                 num_scheduled_tokens[request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 input_budget -= num_new_tokens + draft_slots
+                if prefill_work:
+                    num_prefill_tokens_scheduled += num_new_tokens
+                    prefill_attn_work[request_id] = num_new_tokens * (
+                        num_computed_tokens + num_new_tokens / 2
+                    )
+                if prefill_left is not None and prefill_work:
+                    prefill_left -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 self._set_kv_fetch_stage(request, None)
@@ -1763,6 +1975,9 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             iteration_details=iteration_details,
+            num_prefill_tokens=num_prefill_tokens_scheduled,
+            prefill_attn_work=sum(prefill_attn_work.values()),
+            dp_step=self.dp_step,
             preempted_req_ids=self.reset_preempted_req_ids,
             # finished_req_ids is an existing state in the scheduler,
             # instead of being newly scheduled in this step.
@@ -2336,6 +2551,20 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if self.cost_fit is not None:
+            self.cost_fit.record(
+                time.perf_counter(),
+                scheduler_output.dp_step,
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.prefill_attn_work,
+                scheduler_output.num_prefill_tokens,
+            )
+        elif self.prefill_target is not None:
+            self.prefill_target.record_output(
+                time.perf_counter(),
+                scheduler_output.total_num_scheduled_tokens,
+                scheduler_output.num_prefill_tokens,
+            )
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
@@ -3102,6 +3331,87 @@ class Scheduler(SchedulerInterface):
             + len(self.async_kv_waiting)
         )
 
+    def _prefill_step_ms(
+        self, model: PrefillCostModel, decode_tokens: int, chunk: int, context: int
+    ) -> float:
+        """Time a step carrying a prefill chunk takes: with a token target, what
+        the steps that filled it measured; otherwise what the cost model says."""
+        target = self.prefill_target
+        if target is not None:
+            return target.step_ms or model.budget_ms
+        return model.step_ms(decode_tokens, chunk, context)
+
+    def get_pending_prefill_ms(self, max_age_s: float = 0.0) -> float:
+        """Time the prefill this engine has not finished takes to drain.
+
+        Counted in steps: every step carries one chunk, so a request needs its
+        remaining tokens over the chunk the scheduler gives it, taken at the
+        middle of the context it will cover (a request on a long context gets
+        shorter chunks), and each step takes what a step with that chunk takes.
+        With a token target both come from the chunk rule and the measured step
+        period, not from the marginal cost of one token, which the data may not
+        determine.
+
+        Args:
+            max_age_s: Reuse the last result when it is at most this old. The
+                engine core asks every step, and pricing a backlog of thousands of
+                requests takes milliseconds.
+
+        Returns:
+            The time in milliseconds.
+
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return 0.0
+        now = time.monotonic()
+        cached = self._pending_ms_cache
+        if max_age_s > 0 and cached is not None and now - cached[0] < max_age_s:
+            return cached[1]
+        decode_tokens = self._eligible_decode_tokens()
+        total = 0.0
+        for request in itertools.chain(
+            self.running, self.waiting, self.kv_holding_waiting
+        ):
+            if request.is_finished():
+                continue
+            context = request.num_computed_tokens
+            remaining = request.num_prompt_tokens - context
+            if remaining > 0:
+                middle = context + remaining // 2
+                chunk = self._prefill_chunk(model, decode_tokens, middle)
+                step_ms = self._prefill_step_ms(model, decode_tokens, chunk, middle)
+                total += remaining / chunk * step_ms
+        self._pending_ms_cache = (now, total)
+        return total
+
+    def get_prefill_ms_per_token(self) -> float:
+        """Time a prefill token takes at this engine's chunk size, from a fresh
+        context: what a router prices a request it has just sent with, until the
+        engine reports the request itself. 0 without a step time budget.
+        """
+        model = self.prefill_cost_model
+        if model is None:
+            return 0.0
+        decode_tokens = self._eligible_decode_tokens()
+        chunk = self._prefill_chunk(model, decode_tokens, 0)
+        return self._prefill_step_ms(model, decode_tokens, chunk, 0) / chunk
+
+    def get_pending_prefill_tokens(self) -> int:
+        """Prompt tokens this engine has not finished prefilling.
+
+        `num_computed_tokens` counts what a prefix cache or KV connector
+        already supplied, so a request served from cache carries only its
+        remainder; a decoding request carries none.
+        """
+        return sum(
+            max(0, request.num_prompt_tokens - request.num_computed_tokens)
+            for request in itertools.chain(
+                self.running, self.waiting, self.kv_holding_waiting
+            )
+            if not request.is_finished()
+        )
+
     def get_kv_cache_usage(self) -> float:
         """Returns the fraction of the KV cache currently in use (0.0-1.0)."""
         return self.kv_cache_manager.usage
@@ -3246,6 +3556,8 @@ class Scheduler(SchedulerInterface):
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         delay_free_blocks |= connector_delay_free_blocks
+        if connector_delay_free_blocks:
+            self.pending_kv_send_req_ids.add(request_id)
         if not delay_free_blocks:
             self._free_blocks(request)
 
@@ -3253,6 +3565,7 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        self.pending_kv_send_req_ids.discard(request.request_id)
         self._free_request_blocks(request)
         del self.requests[request.request_id]
 
@@ -3479,6 +3792,8 @@ class Scheduler(SchedulerInterface):
             num_waiting_reqs=num_waiting - num_deferred,
             num_skipped_waiting_reqs=num_deferred,
             num_preempted_reqs=num_preempted_reqs,
+            pending_prefill_tokens=self.get_pending_prefill_tokens(),
+            pending_prefill_ms=self.get_pending_prefill_ms(),
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
             kv_cache_usage=self.kv_cache_manager.usage,
             prefix_cache_stats=prefix_cache_stats,
@@ -3511,6 +3826,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        if self.prefill_target is not None:
+            self.prefill_target.stop()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -3777,19 +4094,30 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # The request was already freed, e.g. by a duplicate report or
+                # because its send completed first.
+                logger.debug("Ignoring finished recv for unknown request %s", req_id)
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
                 self._set_kv_fetch_stage(req, KV_FETCH_COMPLETED_WAITING)
             else:
                 assert RequestStatus.is_finished(req.status)
                 self._aborted_kv_loads.discard(req_id)
-                self._free_blocks(self.requests[req_id])
+                # Keep the blocks until the connector reports the pending send;
+                # freeing here would race the sender and leave its completion
+                # pointing at a removed request.
+                if req_id not in self.pending_kv_send_req_ids:
+                    self._free_blocks(req)
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            req = self.requests.get(req_id)
+            if req is None:
+                logger.debug("Ignoring finished send for unknown request %s", req_id)
+                continue
+            self._free_blocks(req)
 
     def _update_requests_with_invalid_blocks(
         self,

@@ -166,6 +166,13 @@ class CachedRequestData:
     def num_reqs(self) -> int:
         return len(self.req_ids)
 
+    @property
+    def resumed_req_ids(self) -> set[str]:
+        """Always empty: a resumed request is re-sent in full in
+        `scheduled_new_reqs`. Kept for external KV connectors (e.g. LMCache's
+        `LMCacheMPConnector`) that still read it."""
+        return set()
+
     @cached_property
     def _req_id_to_num_output_tokens(self) -> dict[str, int]:
         """Cache mapping of req_id to num_output_tokens for O(1) lookup.
@@ -280,6 +287,15 @@ class SchedulerOutput:
 
     # Optional scheduling-time snapshot, before worker-side token adjustments.
     iteration_details: IterationDetails | None = None
+
+    # Prefill tokens in this step: the part of the scheduled tokens that is not
+    # decode. Read when the step's output arrives.
+    num_prefill_tokens: int = 0
+    # Attention work of this step's prefill chunks, `sum(q * (context + q / 2))`,
+    # and the step's id on its DP group (equal on every rank), for the online
+    # fit of the prefill cost model. -1 outside a DP group.
+    prefill_attn_work: float = 0.0
+    dp_step: int = -1
 
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.

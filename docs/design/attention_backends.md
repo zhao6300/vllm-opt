@@ -250,4 +250,16 @@ pipeline (compressor + SWA + indexer, 256-token blocks, head 512);
 default on NVIDIA is `FLASHINFER_MLA_SPARSE_DSV4` on SM12x and
 `FLASHMLA_SPARSE_DSV4` on other supported CUDA architectures.
 
+On SM120/SM121, `VLLM_FLASHINFER_DSV41_SM120_CAKE=1` selects FlashInfer's
+`cake` sparse-MLA decode kernels for the DeepSeek-V4.1 FP4 extra-cache path.
+It rewrites the V4.1 KV records from per-token records into the page layout
+those kernels read: `page_size` value rows followed by the page's UE8M0
+scales (plus the same for the 288-byte FP4 rows). Decode steps then run on
+`cake`, one launch per
+`VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS` decode rows (default 256,
+0.67 GB of split-K scratch per 256 rows at 64 heads); a wider step takes
+several launches, and prefill stays on the sparse kernels that read the same
+cache. The layout is part of the cache, so a prefix cache or KV-transfer
+snapshot written with one setting cannot be loaded with the other.
+
 --8<-- "gen:table-mla-v4-decode"

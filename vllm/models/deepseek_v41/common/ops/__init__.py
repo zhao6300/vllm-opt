@@ -25,7 +25,11 @@ from .cache_utils import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
+    paged_cache_block_span,
+    paged_cache_page_rows,
+    paged_slots_to_cache_rows,
     quantize_and_insert_k_cache,
+    remap_flashinfer_sparse_indices,
 )
 from .indexer_k_store import indexer_k_norm_rope_store
 
@@ -38,5 +42,9 @@ __all__ = [
     "fused_indexer_q_rope_quant",
     "fused_inv_rope_fp8_quant",
     "indexer_k_norm_rope_store",
+    "paged_cache_block_span",
+    "paged_cache_page_rows",
+    "paged_slots_to_cache_rows",
+    "remap_flashinfer_sparse_indices",
     "quantize_and_insert_k_cache",
 ]

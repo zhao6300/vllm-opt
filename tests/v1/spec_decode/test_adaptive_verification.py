@@ -14,10 +14,12 @@ import torch.multiprocessing as mp
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import parallel_state
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
-from vllm.v1.worker.gpu.async_utils import StepTimingSample
+from vllm.v1.worker.gpu import async_utils
+from vllm.v1.worker.gpu.async_utils import StepTimingCollector, StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    _merge_rank_curves,
     assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
@@ -25,7 +27,10 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 
 
 def make_manager(
-    confidences: np.ndarray, verify_cost_ms: np.ndarray
+    confidences: np.ndarray,
+    verify_cost_ms: np.ndarray,
+    fill_padding: bool = True,
+    fill_cost_ratio: float = 0.0,
 ) -> AdaptiveVerificationManager:
     num_reqs, num_steps = confidences.shape
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
@@ -40,6 +45,8 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager._fill_padding = fill_padding
+    manager._fill_cost_ratio = fill_cost_ratio
     return manager
 
 
@@ -366,6 +373,7 @@ def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
         )
         for batch in manager.batches_to_profile([8, 1024])
     ]
+    manager._online_interval = 0
     manager.set_initial_cost_curves(timings)
 
     # Tail beyond the last capture size: 1.5x then doubling to the max.
@@ -521,3 +529,469 @@ def test_draft_budget_kernel_admits_exact_budget_on_ties():
     survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
     assign_draft_token_budget(confidence_probs, idx_mapping, capacities, 800, survival)
     assert capacities.tolist() == [3] * 266 + [2] + [0] * 33
+
+
+def test_merge_rank_curves_keeps_the_slowest_stage_per_shape():
+    # Pipeline stages time their own layers, and a step cannot finish before
+    # its slowest stage: shape 8 costs 30 (stage 1), shape 16 costs 20 (stage
+    # 0). The stages without the drafter report 0 and must not erase its curve,
+    # and a shape only one stage profiled still has to appear.
+    assert _merge_rank_curves(
+        [
+            [(8, 10.0), (16, 20.0)],
+            [(8, 30.0), (16, 5.0), (32, 7.0)],
+        ]
+    ) == [(8, 30.0), (16, 20.0), (32, 7.0)]
+    assert _merge_rank_curves([[(8, 0.0)], [(8, 4.0)]]) == [(8, 4.0)]
+    assert _merge_rank_curves([[(8, 0.0)], []]) == [(8, 0.0)]
+    assert _merge_rank_curves([]) == []
+
+
+class _FakeCudaEvent:
+    """CPU stand-in for a timing event: orders records on one stream."""
+
+    tick = 0.0
+    available = False
+
+    def record(self) -> None:
+        self.timestamp = _FakeCudaEvent.tick
+        _FakeCudaEvent.tick += 1.0
+
+    def query(self) -> bool:
+        return _FakeCudaEvent.available
+
+    def elapsed_time(self, end: "_FakeCudaEvent") -> float:
+        return end.timestamp - self.timestamp
+
+
+def test_step_timing_sampling_is_interval_gated_and_non_blocking(monkeypatch):
+    monkeypatch.setattr(async_utils, "_timing_event", _FakeCudaEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = False
+    collector = StepTimingCollector()
+    collector.enable_sampling(2)
+
+    def run_step() -> None:
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step()
+    run_step()
+    run_step()
+
+    # One sample per two steps, and none is resolved before its events finish.
+    assert collector.poll_sampled() == []
+    _FakeCudaEvent.available = True
+    samples = collector.poll_sampled()
+    assert [
+        (s.forward_ms, s.drafter_ms, s.num_target_tokens, s.num_reqs, s.full_cudagraph)
+        for s in samples
+    ] == [(1.0, 1.0, 0, 0, False), (1.0, 1.0, 0, 0, False)]
+    assert collector.poll_sampled() == []
+
+
+class _RelayEvent:
+    def __init__(self, log: list, name: int) -> None:
+        self.log, self.name = log, name
+
+    def record(self) -> None:
+        self.log.append(("record", self.name))
+
+
+class _RelayStream:
+    def __init__(self, log: list) -> None:
+        self.log = log
+
+    def wait_event(self, event: _RelayEvent) -> None:
+        self.log.append(("wait", event.name))
+
+
+def _relay_manager(monkeypatch, lag: int):
+    """A manager with the relay bookkeeping on CPU stand-ins."""
+    log: list = []
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(device="cpu")
+    manager._relay_lag = lag
+    manager._relays_accepted = 0
+    manager._relay_events = [_RelayEvent(log, i) for i in range(lag + 1)]
+    manager._remote_confidences = torch.ones(2, 3)
+    manager._confidence_probs = torch.zeros(2, 3)
+    slot = SimpleNamespace(gpu=torch.zeros(2, 3), copy_to_cpu=lambda: None)
+    manager._stale_confidences = [slot, slot]
+    manager._copy_events = [SimpleNamespace(record=lambda: None)] * 2
+    manager._next_confidence_slot = lambda: 0  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda device: _RelayStream(log)
+    )
+    return manager, manager.accept_remote_confidences, log
+
+
+@pytest.mark.parametrize("lag", [0, 1, 2])
+def test_trim_waits_for_the_relay_lag_steps_before_the_newest(monkeypatch, lag):
+    manager, accept, log = _relay_manager(monkeypatch, lag)
+    latest_relay_in_slot: dict[int, int] = {}
+    for step in range(8):
+        # execute_model(step) waits, then sample_tokens(step) accepts a relay.
+        log.clear()
+        manager.wait_for_remote_confidences()
+        waits = [name for kind, name in log if kind == "wait"]
+        wanted = step - 1 - lag  # relay `lag` steps before the newest one
+        if wanted < 0:
+            assert waits == []
+        else:
+            # The waited event must still hold that relay, not a later one.
+            assert [latest_relay_in_slot[w] for w in waits] == [wanted]
+        log.clear()
+        accept()
+        (slot,) = [name for kind, name in log if kind == "record"]
+        latest_relay_in_slot[slot] = step
+
+
+def test_step_timing_sampling_skips_dummy_steps(monkeypatch):
+    # Dummy steps are padded to other ranks' sizes; sampling one would price a
+    # shape with another shape's cost.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    collector.enable_sampling(1)
+
+    def run_step(sample: bool) -> None:
+        collector.forward_start(sample=sample)
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    run_step(sample=False)
+    assert collector.poll_sampled() == []
+    run_step(sample=True)
+    assert len(collector.poll_sampled()) == 1
+
+    # Profiling (collect) still times dummy steps.
+    with collector.collect() as timings:
+        run_step(sample=False)
+    assert len(timings) == 1
+
+
+def _fill_manager(**kwargs) -> AdaptiveVerificationManager:
+    # Survival probabilities, best first: 0.9, 0.81, 0.1, 0.01. Accepted tokens
+    # per ms peak at one draft (2.9), and each further row costs 0.4 ms.
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 1.4, 1.8, 2.2]),
+        **kwargs,
+    )
+    assert (
+        manager.get_num_tokens({"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]})
+        == 3
+    )
+    return manager
+
+
+def test_fill_graph_padding_is_off_unless_enabled():
+    manager = _fill_manager(fill_padding=False)
+    assert manager.fill_graph_padding(64) is None
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 1
+
+
+def test_fill_graph_padding_admits_drafts_that_pay_for_their_row():
+    # A row is worth it while survival >= ratio * 2.9 * 0.4. At 0.5 that is
+    # 0.58: the 0.81 draft qualifies, the 0.1 one does not.
+    manager = _fill_manager(fill_cost_ratio=0.5)
+    assert manager.fill_graph_padding(5) == 4
+    assert manager._batch_budget is not None
+    assert manager._batch_budget[2] == 2
+    assert manager.fill_graph_padding(64) is None
+
+    # At 0.05 the bar is 0.058, so 0.81 and 0.1 qualify and 0.01 does not.
+    manager = _fill_manager(fill_cost_ratio=0.05)
+    assert manager.fill_graph_padding(64) == 5
+
+
+def test_fill_graph_padding_at_full_price_admits_nothing_here():
+    # Pricing a padded row like a real one is the budget's own stopping rule.
+    assert _fill_manager(fill_cost_ratio=1.0).fill_graph_padding(64) is None
+
+
+def test_fill_graph_padding_at_zero_cost_fills_every_spare_row():
+    manager = _fill_manager(fill_cost_ratio=0.0)
+    assert manager.fill_graph_padding(5) == 5
+    assert manager.fill_graph_padding(64) == 6
+
+
+def _sampler_manager(sampler_ms_per_row: float, fill_cost_ratio: float = 0.0):
+    """Two requests with two drafts each. The verify table jumps once the step
+    carries more than one draft; the sampler takes a fixed time per row after
+    the two every step has."""
+    confidences = np.array([[0.9, 0.9], [0.1, 0.1]], dtype=np.float32)
+    verify_cost_ms = np.array([1.0, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0])
+    manager = make_manager(confidences, verify_cost_ms, fill_cost_ratio=fill_cost_ratio)
+    manager.sampler_cost_ms = np.maximum(np.arange(20) - 2, 0) * sampler_ms_per_row
+    manager.get_num_tokens({"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]})
+    return manager
+
+
+def test_the_sampler_is_priced_per_verified_row():
+    free = _sampler_manager(0.0)
+    # A row so dear that no draft pays for itself.
+    costly = _sampler_manager(5.0)
+
+    assert free._batch_budget[2] == 1
+    assert costly._batch_budget[2] == 0
+
+
+def test_a_filled_row_pays_the_samplers_price_in_full():
+    # The forward is free for a padded row (ratio 0), but a verified draft is a
+    # logit row whatever the graph padded.
+    free = _sampler_manager(0.0)
+    costly = _sampler_manager(0.3)
+
+    assert free._batch_budget[2] == costly._batch_budget[2] == 1
+    assert free._batch_fill_candidates == 3
+    # Only the 0.81 draft beats 2.2 accepted tokens/ms times 0.3 ms.
+    assert costly._batch_fill_candidates == 1
+
+
+def _context_manager(non_draft_tokens: dict[str, int]):
+    """A decode request with two drafts, and another request that takes
+    `non_draft_tokens["low"]` tokens this step (a prefill chunk when above 1)."""
+    confidences = np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32)
+    manager = make_manager(confidences, np.ones(40))
+    # The drafter's eager context pass costs 5 ms per target token beyond the
+    # nine the mixed step has before any draft.
+    manager.context_kv_cost_ms = np.maximum(np.arange(40) - 9, 0) * 5.0
+    manager.get_num_tokens(
+        {"low": non_draft_tokens["low"], "high": 3},
+        {"low": [], "high": [3, 4]},
+    )
+    return manager
+
+
+def test_a_verified_draft_pays_for_the_drafters_context_pass_in_a_prefill_step():
+    mixed = _context_manager({"low": 8})
+    decode_only = _context_manager({"low": 1})
+
+    assert mixed._batch_budget[2] == 0
+    # A decode-only step runs the pass inside the drafter's graph, which the
+    # draft table already prices.
+    assert decode_only._batch_budget[2] == 2
+
+
+def _staircase_manager(fill_cost_ratio: float, num_reqs: int = 16):
+    """16 requests with 5 drafts each on a cost table that grows 4 ms per 16-token
+    graph, as the cost tables do below the capture limit."""
+    num_steps = 5
+    confidences = np.random.default_rng(1).uniform(
+        0.35, 0.75, size=(num_reqs, num_steps)
+    )
+    confidences = confidences.astype(np.float32)
+    sizes = np.arange(600)
+    verify_cost_ms = 10.0 + np.ceil(np.maximum(sizes, 1) / 16.0) * 4.0
+    manager = make_manager(confidences, verify_cost_ms, fill_cost_ratio=fill_cost_ratio)
+    manager.req_states = SimpleNamespace(
+        req_id_to_index={f"r{i}": i for i in range(num_reqs)},
+        num_computed_tokens_np=np.ones(num_reqs, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.ones(num_reqs, dtype=np.int32)),
+    )
+    manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
+    tokens = {f"r{i}": 1 + num_steps for i in range(num_reqs)}
+    drafts = {f"r{i}": list(range(num_steps)) for i in range(num_reqs)}
+    return manager, manager.get_num_tokens(tokens, drafts)
+
+
+@pytest.mark.parametrize("padded_rows", [8, 16, 32, 64])
+def test_fill_graph_padding_is_not_blocked_by_the_cost_table_staircase(padded_rows):
+    # Past the graph the budget stopped at, the next row of the table jumps by a
+    # whole graph step; charged to that one row it would refuse every fill even
+    # though the rows after it cost nothing more.
+    baseline, own_tokens = _staircase_manager(fill_cost_ratio=0.0)
+    manager, _ = _staircase_manager(fill_cost_ratio=0.05)
+
+    filled = manager.fill_graph_padding(own_tokens + padded_rows)
+
+    assert filled is not None
+    assert own_tokens < filled <= own_tokens + padded_rows
+    assert filled <= baseline.fill_graph_padding(own_tokens + padded_rows)
+
+
+def test_fill_graph_padding_admits_fewer_drafts_as_padded_rows_cost_more():
+    rows = []
+    for ratio in (0.0, 0.05, 0.5, 1.0, 100.0):
+        manager, own_tokens = _staircase_manager(fill_cost_ratio=ratio)
+        filled = manager.fill_graph_padding(own_tokens + 64)
+        rows.append(0 if filled is None else filled - own_tokens)
+
+    assert rows == sorted(rows, reverse=True)
+    assert rows[0] == 64  # every draft that is left
+    assert rows[-1] == 0  # a row priced at 100x admits nothing
+
+
+def fill_consensus_worker(rank: int, world_size: int, store: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{store}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    parallel_state._TP = parallel_state.GroupCoordinator(
+        group_ranks=[list(range(world_size))],
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        use_device_communicator=False,
+        group_name="tp",
+    )
+    # Rank 0 sees confident drafts, the others hopeless ones, so ranks would
+    # count different drafts worth a padded row if each decided for itself.
+    confidence = 0.9 if rank == 0 else 0.02
+    confidences = np.full((8, 4), confidence, dtype=np.float32)
+    sizes = np.arange(200)
+    manager = make_manager(
+        confidences,
+        10.0 + np.ceil(np.maximum(sizes, 1) / 16.0) * 4.0,
+        fill_cost_ratio=0.5,
+    )
+    manager.req_states = SimpleNamespace(
+        req_id_to_index={f"r{i}": i for i in range(8)},
+        num_computed_tokens_np=np.ones(8, dtype=np.int32),
+        prefill_len=SimpleNamespace(np=np.ones(8, dtype=np.int32)),
+    )
+    manager.cost_tables = (np.zeros(9), manager.cost_tables[1])
+    tokens = {f"r{i}": 5 for i in range(8)}
+    drafts = {f"r{i}": [0, 1, 2, 3] for i in range(8)}
+    manager.get_num_tokens(tokens, drafts)
+    fills = manager.fill_graph_padding(160)
+    gathered: list = [None] * world_size
+    dist.all_gather_object(gathered, fills)
+    parallel_state._TP.destroy()
+    dist.destroy_process_group()
+    assert all(fill == gathered[0] for fill in gathered), gathered
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_tp_ranks_agree_on_how_many_drafts_fill_the_padding(world_size, tmp_path):
+    """Each TP rank reads its own confidences, so the count of drafts worth a
+    padded row travels with the budget and every rank fills the same rows."""
+    mp.spawn(
+        fill_consensus_worker,
+        args=(world_size, str(tmp_path / "store")),
+        nprocs=world_size,
+    )
+
+
+def test_fill_graph_padding_respects_the_rejection_sampler_chunk():
+    manager = make_manager(
+        np.array([[0.9, 0.9], [0.9, 0.9]], dtype=np.float32),
+        np.ones(7),
+    )
+    manager._max_total_logits = 3  # 2 bonus logits + at most 1 draft
+    num_tokens = manager.get_num_tokens(
+        {"low": 3, "high": 3},
+        {"low": [1, 2], "high": [3, 4]},
+    )
+    assert num_tokens == 3
+    assert manager.fill_graph_padding(6) is None
+
+
+def test_step_timing_times_the_sampler_by_the_logit_rows_it_ran_on(monkeypatch):
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(9),
+    )
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.sampler_start()
+        _FakeCudaEvent.tick += 2.0  # the sampler takes three ticks
+        collector.sampler_end()
+        collector.drafter_start()
+        collector.drafter_end()
+        # A dummy step never samples: no sampler time, not a zero measurement.
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    assert [(s.sampler_ms, s.num_logits) for s in timings] == [(3.0, 9), (0.0, 9)]
+
+
+def test_step_timing_times_the_drafters_eager_context_pass(monkeypatch):
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(9),
+    )
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=False)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.context_start(2048)
+        _FakeCudaEvent.tick += 3.0  # the context pass takes four ticks
+        collector.context_end()
+        collector.drafter_end()
+        # A drafter that ran its context pass inside a graph has none to time.
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+
+    assert [(s.context_kv_ms, s.num_context_tokens) for s in timings] == [
+        (4.0, 2048),
+        (0.0, 0),
+    ]
+
+
+def test_step_timing_keys_steps_by_the_padded_token_count(monkeypatch):
+    # Under DP a rank replays the largest rank's graph; keying by its own
+    # token count would price that graph on a smaller shape.
+    class _SyncableEvent(_FakeCudaEvent):
+        def synchronize(self) -> None:
+            pass
+
+    monkeypatch.setattr(async_utils, "_timing_event", _SyncableEvent)
+    _FakeCudaEvent.tick = 0.0
+    _FakeCudaEvent.available = True
+    collector = StepTimingCollector()
+    batch = SimpleNamespace(
+        num_tokens=10,
+        num_tokens_after_padding=64,
+        num_reqs=5,
+        logits_indices=torch.zeros(7),
+    )
+    with collector.collect() as timings:
+        collector.record_batch(batch, full_cudagraph=True)  # type: ignore[arg-type]
+        collector.forward_start()
+        collector.forward_end()
+        collector.drafter_start()
+        collector.drafter_end()
+    assert [(s.num_target_tokens, s.num_reqs) for s in timings] == [(64, 5)]

@@ -212,6 +212,15 @@ class APIServerProcessManager:
                 SharedAdmissionStats.num_counters(num_servers),
             )
 
+        dp_size = getattr(args, "data_parallel_size", 1) or 1
+        dp_lb_shared_load = None
+        if num_servers > 1 and dp_size > 1 and envs.VLLM_DP_LB_SHARED_LOAD:
+            from vllm.v1.engine.dp_lb_shared import SharedDPLoadStats
+
+            dp_lb_shared_load = spawn_context.RawArray(
+                "q", SharedDPLoadStats.num_counters(num_servers, dp_size)
+            )
+
         # Open connections per API server, to accept on the least loaded one;
         # a server that has not started yet is never the least loaded.
         api_server_loads = (
@@ -239,6 +248,9 @@ class APIServerProcessManager:
                     client_config["api_server_loads"] = api_server_loads
                 if admission_counters is not None:
                     client_config["mp_admission_counters"] = admission_counters
+                if dp_lb_shared_load is not None:
+                    client_config["dp_lb_shared_load"] = dp_lb_shared_load
+                    client_config["dp_lb_shared_load_engines"] = dp_size
                 if stats_update_address is not None:
                     client_config["stats_update_address"] = stats_update_address
                 if tensor_queue is not None:

@@ -55,8 +55,44 @@ Set `enable_adaptive_verification: false` to verify the full block for every req
 
 - The attention backend must tolerate device-decided query lengths, since the CPU lengths only bound them from above. Backends that plan off the CPU lengths are excluded by the attention selector, and rejected at startup for models that hard-wire their backend.
 - Full cudagraphs are required: step costs are profiled from captured graphs, so `--enforce-eager` is rejected at startup.
-- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries) or pipeline parallelism (cost curves and confidences exist only on the last rank).
+- Not supported with LoRA (the per-token LoRA mapping is built from CPU-side boundaries).
+- With pipeline parallelism, every stage trims the same batch and so needs the same inputs: a shape costs the slowest stage's forward time, and the last rank relays the drafter's per-slot confidences to the other stages on every step. The curves therefore price the slowest stage rather than the sum of the stages. A non-last stage trims its step with the relay `VLLM_ADAPTIVE_VERIFICATION_PP_RELAY_LAG` steps before the newest (default 1, capped at the decode stagger minus one), so its forward does not wait for the last stage to finish the previous step; `0` waits for the newest relay.
 - Without a confidence head, `use_local_argmax_reduction` is rejected. The estimator needs the full draft logits, which local argmax reduction never materializes.
+
+## Refreshing the cost profile during serving
+
+The startup profile can drift from what the server actually measures: another process can share the GPU, clocks change, and the served batch mix may not look like the profiled one. Setting `VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL` (in runner steps) rebuilds the cost curves from live timings every N steps. One step in every `VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL` is timed without synchronizing the device (default a 64th of the rebuild interval, at least 1). Each batch shape keeps the median of its last `VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW` samples (default 256), and a shape needs at least four samples before it replaces the startup value, so the sampling interval has to be short enough for a shape to collect four between rebuilds, or across a few of them. `0` (the default) keeps the startup profile only.
+
+The refresh also times the sampler (the logits and rejection sampling, which run after the forward and are not in the verify table) on the last PP stage, by the number of logit rows it ran on, and interpolates between the sizes it has seen. Verifying a draft costs its row in the sampler, so the draft budget prices it: `accepted tokens / (drafter + forward + sampler)`. Until the first rebuild that has timed the sampler there is no sampler term, which is the earlier behavior.
+
+The drafter's eager context K/V pass (storing the target hidden states and precomputing context K/V) is timed the same way, by target-token count. It runs outside the drafter graph only on steps that carry prefill tokens, so its cost is added to the budget only for those steps. Decode-only steps in a FULL graph already include it in the drafter cost. Until it has been timed there is no context term.
+
+The refresh never stops the step loop. The medians and the table build run on a worker thread. The ranks exchange their curves with asynchronous CPU collectives that the loop only issues, on a schedule counted in served steps: TP ranks take rank 0's curves, then PP stages take the slowest stage's cost per shape. The new tables are installed on a fixed step, at most `3 * 8` steps after the rebuild began, so every rank switches together. The loop waits only if a stage has not finished by its step, which is rare with a lag of several steps.
+
+```bash
+# Rebuild the cost tables every 1024 steps, timing one step in 16.
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL=1024
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_SAMPLE_INTERVAL=16
+export VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW=256
+```
+
+## Filling padded rows with drafts
+
+Under data parallelism every rank replays the FULL cudagraph of the largest rank, so a smaller rank's graph has padded rows beyond the draft budget it chose. Setting `VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1` admits the next-best drafts into those rows, which can raise the accepted length without lengthening the graph. Padded rows are cheaper than real ones (real rows read the KV cache, route to experts and are sampled), so the fill is priced rather than unconditional.
+
+The threshold comes from the cost tables, so there is no survival floor to tune. A draft is admitted into a padded row while its survival probability (the cumulative product of its confidences) is at least the step's best accepted tokens per millisecond times the price of the row. The price has two parts:
+
+- **The forward.** The graph runs the padded row anyway, and a padded row runs the same dense and MoE layers as a real one; only attention differs, because a padded row has no context to read. So the forward's part is `VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO` (default 0.5) times the average forward price of the drafts left, roughly the share of a row's cost that depends on having context. `0` makes it free and a large ratio refuses every fill. The average, not the jump at the next graph size, is used because the cost tables are staircases (cost changes only between graph sizes), so a per-row price would charge a whole graph step to one row.
+- **The sampler.** A verified draft takes a logit row whatever the graph padded, and the sampler runs after the forward, so its time adds to the rank's step. It is charged in full from the measured sampler cost (below), and is zero until the sampler has been timed.
+
+The number of drafts that qualify is chosen with the draft budget and agreed across TP ranks with it, so every rank fills the same rows.
+
+The fill applies only to FULL cudagraph steps without microbatching or prefill context parallelism. It is off by default; compare throughput and mean accepted length (`1 + accepted / drafts`) with it on and off before enabling it.
+
+```bash
+export VLLM_ADAPTIVE_VERIFICATION_FILL_PADDING=1
+export VLLM_ADAPTIVE_VERIFICATION_FILL_COST_RATIO=0.5
+```
 
 ## Tuning the cost profile
 

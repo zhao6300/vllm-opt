@@ -428,6 +428,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Context rows a captured draft step stores: one full verify per request.
         return min(num_reqs * (self.num_speculative_steps + 1), self.max_num_tokens)
 
+    def _time_context_kv(self, start: bool, num_tokens: int = 0) -> None:
+        """Time the eager context K/V pass: its cost grows with the target
+        tokens, so a verified draft pays for it too."""
+        timing = self.step_timing
+        if timing is None:
+            return
+        if start:
+            timing.context_start(num_tokens)
+        else:
+            timing.context_end()
+
     def _precompute_context_kv(
         self, start: int, end: int, dummy_run: bool = False
     ) -> None:
@@ -612,10 +623,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         if num_speculative_tokens == 0:
             # No drafts are needed: store the context K/V to keep the drafter in
             # sync, and skip the query pass.
+            self._time_context_kv(True, num_target_tokens)
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            self._time_context_kv(False)
             return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
@@ -655,6 +668,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 dummy_run,
             )
         else:
+            self._time_context_kv(True, num_target_tokens)
             self._store_hidden_states(
                 num_target_tokens, last_hidden_states, aux_hidden_states
             )
@@ -662,6 +676,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_reqs, input_batch.query_start_loc, num_rejected
             )
             self._precompute_context_kv(0, num_target_tokens, dummy_run)
+            self._time_context_kv(False)
 
         is_full_cudagraph = batch_desc.cg_mode == CUDAGraphMode.FULL
         # During FULL cudagraph with a model that supports decode metadata updates,

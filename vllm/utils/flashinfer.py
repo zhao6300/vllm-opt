@@ -350,6 +350,16 @@ flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
     "trtllm_batch_decode_sparse_mla_dsv4",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_dsv41_fp4_quantize_append = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp4_quantize_append_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_dsv41_fp4_quantize_pack = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp4_quantize_pack_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -552,19 +562,47 @@ def prims_ts_sparse_mla_format_error(kv_cache_format: str) -> str | None:
 
 
 @functools.cache
-def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool:
-    """Return whether FlashInfer ships an SM120 DSV4 decode specialization.
+def has_flashinfer_sparse_mla_sm120_config(
+    num_q_heads: int,
+    top_k: int,
+    *,
+    dsv41: bool = False,
+) -> bool:
+    """Return whether FlashInfer has the requested SM120 DSV4 dispatch shape.
 
-    The public sparse MLA API predates some DSV4 shapes, so checking only that
-    the callable exists can select a package that later aborts or rejects a
-    valid vLLM configuration. Inspect FlashInfer's dispatch table until it
-    exposes a public capability query.
+    FlashInfer keeps independent dispatch tables for DSV4 and DSV4.1. The
+    latter is selected by the V4.1 mixed FP8/FP4 cache path, so checking the
+    legacy DSV4 table for that path can accept or reject the wrong shape.
     """
     if not has_flashinfer_sparse_mla_sm120():
         return False
     mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
-    dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
+    dispatch_name = "_DECODE_DSV4_1_DISPATCH" if dsv41 else "_DECODE_DSV4_DISPATCH"
+    dispatch = getattr(mod, dispatch_name, None) if mod else None
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm120_cake(num_q_heads: int) -> bool:
+    """Return whether FlashInfer ships the SM120 DSv4.1 `cake` decode kernel.
+
+    That kernel is the only consumer of the footer-scale V4.1 KV layout, so a
+    build without it cannot serve a cache written in that layout.
+    """
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120.cake_dsv41_mixed")
+    supported_heads = (
+        getattr(mod, "cake_sparse_mla_sm120_dsv41_mixed_supported_heads", None)
+        if mod
+        else None
+    )
+    if not callable(supported_heads):
+        return False
+    try:
+        return int(num_q_heads) in supported_heads()
+    except (TypeError, ValueError):
+        return False
 
 
 @functools.cache
@@ -1496,6 +1534,8 @@ __all__ = [
     "trtllm_fp4_block_scale_moe",
     "flashinfer_trtllm_batch_decode_with_kv_cache_mla",
     "flashinfer_trtllm_batch_decode_sparse_mla_dsv4",
+    "flashinfer_dsv41_fp4_quantize_append",
+    "flashinfer_dsv41_fp4_quantize_pack",
     "flashinfer_xqa_batch_decode_with_kv_cache",
     "flashinfer_recurrent_kda",
     "flashinfer_fused_kda_decode",

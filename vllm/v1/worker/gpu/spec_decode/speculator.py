@@ -52,6 +52,7 @@ from vllm.v1.worker.utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.async_utils import StepTimingCollector
     from vllm.v1.worker.gpu.pcp_manager import PCPManager
     from vllm.v1.worker.gpu.sample.sampler import Sampler
 
@@ -166,6 +167,9 @@ class DraftModelSpeculator(BaseSpeculator):
     # Draft prefill runs on the target's batch, so it can reuse the target
     # forward's attention metadata. Otherwise the drafter rebuilds it.
     can_reuse_target_attn_metadata: bool = True
+    # Set by the model runner, which times the drafter's eager context K/V pass
+    # for the adaptive-verification cost tables; None leaves it untimed.
+    step_timing: "StepTimingCollector | None" = None
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         assert vllm_config.speculative_config is not None

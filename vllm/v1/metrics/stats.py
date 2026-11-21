@@ -238,6 +238,27 @@ class SchedulerStats:
     step_counter: int = 0
     current_wave: int = 0
 
+    pending_prefill_ms: float = 0.0
+    """Time the prefill this engine has not finished takes to drain.
+
+    The steps it needs, from the chunk the scheduler gives each request (shorter
+    on a long context), times what a step takes. Zero when no step time budget is
+    configured; DP load balancing then prices tokens.
+    """
+
+    prefill_ms_per_token: float = 0.0
+    """Time one prefill token takes at this engine's chunk size, to price a
+    request a router has just sent before the engine reports it."""
+
+    pending_prefill_tokens: int = 0
+    """Prompt tokens this engine has not finished prefilling.
+
+    The remainder of every waiting or running request, so a request served
+    from a prefix cache or a KV connector counts only the tokens left to
+    compute. Internal DP load balancing scores an engine by it: a long prompt
+    occupies the steps of whoever prefills it, however few requests that is.
+    """
+
     kv_cache_usage: float = 0.0
     # Iterations to report: timed on the GPU by the output worker, or untimed
     # from EngineCore.

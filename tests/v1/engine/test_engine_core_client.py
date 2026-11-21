@@ -4,6 +4,7 @@
 import asyncio
 import importlib
 import inspect
+import multiprocessing
 import os
 import signal
 import time
@@ -29,6 +30,7 @@ from vllm.pooling_params import LateInteractionParams, PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine import (
+    EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
     EngineCoreRequest,
@@ -41,6 +43,7 @@ from vllm.v1.engine.core_client import (
     MPClient,
     SyncMPClient,
 )
+from vllm.v1.engine.dp_lb_shared import SharedDPLoadStats
 from vllm.v1.engine.utils import CoreEngineProcManager
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.pool.late_interaction import (
@@ -209,14 +212,28 @@ def _make_pooling_request(
     )
 
 
-def _make_dplb_client(num_engines: int = 3, client_count: int = 1) -> DPLBAsyncMPClient:
+def _make_dplb_client(
+    num_engines: int = 3,
+    client_count: int = 1,
+    token_aware: bool = False,
+    prefill_tokens_per_request: int = 1000,
+) -> DPLBAsyncMPClient:
     client = object.__new__(DPLBAsyncMPClient)
     client.client_count = client_count
     client.reqs_in_flight = {}
     client.streaming_reqs = set()
     client.engine_inflight = Counter()
+    client.token_aware_lb = token_aware
+    client.lb_prefill_tokens_per_request = prefill_tokens_per_request
+    client.lb_step_budget_ms = 0.0
+    client.req_pending_prefill = {}
+    client.lb_snapshot_seq = 0
+    client.shared_load = None
+    client.engine_pending_tokens = Counter()
+    client.engine_pending_ms = Counter()
     client.core_engines = [bytes([i, 0]) for i in range(num_engines)]
-    client.lb_engines = [[0, 0, 0.0] for _ in range(num_engines)]
+    # [waiting, running, kv_cache_usage, pending_prefill_tokens]
+    client.lb_engines = [[0, 0, 0.0, 0] for _ in range(num_engines)]
     client.eng_start_index = 0
     client._kv_event_sources = {}
     client.vllm_config = SimpleNamespace(
@@ -408,6 +425,133 @@ def test_dplb_finished_requests_release_inflight():
 
     assert client.engine_inflight[engine] == 0
     assert req.request_id not in client.reqs_in_flight
+
+
+@pytest.mark.parametrize(("token_aware", "expected"), [(False, 0), (True, 1)])
+def test_dplb_token_aware_routing_avoids_an_engine_busy_prefilling(
+    token_aware: bool, expected: int
+):
+    """Both engines run one request, but engine 0 reports 4000 tokens of
+    unfinished prefill. Without them the scores tie and engine 0 wins the scan;
+    with them the request goes to engine 1."""
+    client = _make_dplb_client(num_engines=2, token_aware=token_aware)
+    client.lb_engines = [[0, 1, 0.0, 4000], [0, 1, 0.0, 0]]
+
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=1), [7] * 500)
+    )
+
+    assert chosen == client.core_engines[expected]
+
+
+def test_dplb_token_aware_weighs_tokens_against_requests():
+    """Reported prefill tokens trade off against the request count at
+    `lb_prefill_tokens_per_request` tokens per request."""
+    client = _make_dplb_client(
+        num_engines=2, token_aware=True, prefill_tokens_per_request=1000
+    )
+    # Engine 0 runs three requests; engine 1 runs one with 5000 tokens pending.
+    # Scores: engine 0 = 3, engine 1 = 1 + 5.
+    client.lb_engines = [[0, 3, 0.0, 0], [0, 1, 0.0, 5000]]
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+
+    # Fewer pending tokens make engine 1 cheaper again: 1 + 1 < 3.
+    client.lb_engines = [[0, 3, 0.0, 0], [0, 1, 0.0, 1000]]
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
+
+
+def test_dplb_token_aware_caps_the_pending_prefill_weight():
+    """An engine already prefilling several requests' worth of tokens is just
+    busy: weighing its whole backlog would leave it unroutable for the length
+    of that prefill while the other engines pile up."""
+    client = _make_dplb_client(
+        num_engines=2, token_aware=True, prefill_tokens_per_request=1000
+    )
+    # Engine 0 runs one request with a 100-request backlog, engine 1 six
+    # requests with none. The backlog counts as four requests, so 1 + 4 < 6
+    # and engine 0 wins; uncapped it would score 101 and lose.
+    client.lb_engines = [[0, 1, 0.0, 100_000], [0, 6, 0.0, 0]]
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+
+    # Past the cap the backlog stops mattering: equal scores again.
+    client.lb_engines = [[0, 4, 0.0, 100_000], [0, 8, 0.0, 0]]
+    client.eng_start_index = 0
+    assert (
+        client.get_core_engine_for_request(make_request(SamplingParams()))
+        == client.core_engines[0]
+    )
+
+
+def test_dplb_token_aware_uses_the_engine_reported_remainder():
+    """The engine reports the prefill tokens it still has to compute, so a
+    request served from cache does not count against the engine it lands on;
+    the client keeps no bookkeeping of its own to fall out of sync."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    # Engine 0 reports no unfinished prefill: it prefilled from cache.
+    client.lb_engines = [[0, 1, 0.0, 0], [0, 1, 0.0, 0]]
+    request = make_request(SamplingParams(max_tokens=4), [1] * 3000)
+    chosen = client.get_core_engine_for_request(request)
+    # Equal scores: the scan start decides, and nothing about this request's
+    # own length is charged to either engine.
+    assert chosen == client.core_engines[0]
+    assert not hasattr(client, "engine_pending_prefill_tokens")
+
+    # A snapshot from before the stat existed still routes.
+    client.lb_engines = [[0, 1, 0.0], [0, 0, 0.0]]
+    assert (
+        client.get_core_engine_for_request(
+            make_request(SamplingParams(max_tokens=4), [1] * 10)
+        )
+        == client.core_engines[1]
+    )
+
+
+def test_dplb_token_aware_prices_the_backlog_in_budget_steps():
+    """With a prefill step time budget, the engine reports its backlog in
+    modelled ms and it is measured in steps of that budget: ten tokens left of
+    a long-context prompt can cost a whole step, while the token count reads as
+    nearly free."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_step_budget_ms = 600.0
+    # Engine 0 needs one more step of prefill (600 ms) and runs three
+    # requests; engine 1 runs four requests with nothing pending. Priced in
+    # steps: 3 + 1 == 4 ties with 4, and the rotating scan start decides.
+    client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
+    client.eng_start_index = 1
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
+
+    # The same snapshot without a budget prices the ten tokens as nothing:
+    # engine 0 scores 3 against 4 and wins.
+    client.lb_step_budget_ms = 0.0
+    client.req_pending_prefill = {}
+    client.lb_snapshot_seq = 0
+    client.engine_pending_tokens = Counter()
+    client.engine_pending_ms = Counter()
+    client.lb_engines = [[0, 3, 0.0, 10, 600.0], [0, 4, 0.0, 0, 0.0]]
+    client.eng_start_index = 1
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[0]
+
+    # Three steps of pending work behind a single request lose to two requests.
+    client.lb_step_budget_ms = 600.0
+    client.lb_engines = [[0, 1, 0.0, 10, 1800.0], [0, 2, 0.0, 0, 0.0]]
+    client.eng_start_index = 0
+    chosen = client.get_core_engine_for_request(make_request(SamplingParams()))
+    assert chosen == client.core_engines[1]
+
+
+def test_dplb_without_token_aware_ignores_the_remainder():
+    client = _make_dplb_client(num_engines=2, token_aware=False)
+    client.lb_engines = [[0, 1, 0.0, 8000], [0, 1, 0.0, 0]]
+    chosen = client.get_core_engine_for_request(
+        make_request(SamplingParams(max_tokens=4), [1] * 300)
+    )
+    # Ties break on the rotating scan start, whatever the prefills hold.
+    assert chosen == client.core_engines[0]
 
 
 @pytest.mark.parametrize("final_sent", [False, True])
@@ -1635,3 +1779,351 @@ def test_apply_ready_response_retains_kv_event_sources():
     )
     client._apply_ready_response(ready(1, rank1_again))
     assert client.get_kv_event_sources() == {1: rank1_again}
+
+
+@pytest.mark.parametrize("lockstep", [False, True])
+def test_dp_lb_publish_carries_the_pending_prefill_tokens(lockstep: bool):
+    """The per-step load snapshot feeds internal DP balancing, so the reported
+    prefill tokens must land in their own field, not in another stat's slot."""
+    import queue
+
+    from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc
+
+    core = object.__new__(DPEngineCoreProc if lockstep else EngineCoreProc)
+    core.publish_dp_lb_stats = True
+    core.last_counts = (0, 0, 0)
+    core.step_counter = 7
+    core.current_wave = 3
+    core.output_queue = queue.Queue()
+    core.scheduler = SimpleNamespace(
+        get_request_counts=lambda: (2, 3),
+        get_pending_prefill_tokens=lambda: 4096,
+        get_pending_prefill_ms=lambda max_age_s=0.0: 1200.0,
+        get_prefill_ms_per_token=lambda: 0.75,
+        get_kv_cache_usage=lambda: 0.5,
+    )
+
+    core._maybe_publish_request_counts()
+
+    _, outputs = core.output_queue.get_nowait()
+    stats = outputs.scheduler_stats
+    assert stats.pending_prefill_tokens == 4096
+    assert stats.pending_prefill_ms == 1200.0
+    assert stats.prefill_ms_per_token == 0.75
+    assert stats.num_running_reqs == 2
+    assert stats.num_waiting_reqs == 3
+    assert stats.num_skipped_waiting_reqs == 0
+    assert stats.kv_cache_usage == 0.5
+    if lockstep:
+        assert (stats.step_counter, stats.current_wave) == (7, 3)
+    # The pending tokens alone make the snapshot new, so a chunked prefill
+    # advancing between steps is still published.
+    assert core.last_counts == (2, 3, 4096, 1200)
+
+
+def test_dp_prefill_cap_is_agreed_over_the_group(monkeypatch):
+    """Each DP rank takes the group's smallest time-budget prefill chunk before
+    stepping, so no rank idles waiting for another's longer chunk."""
+    from vllm.v1.engine.core import DPEngineCoreProc
+
+    core = object.__new__(DPEngineCoreProc)
+    core.dp_group = object()  # any non-None group
+    calls = []
+
+    def fake_all_reduce_int(group, value, op=None):
+        calls.append((group, value))
+        return 64  # the group's MIN
+
+    monkeypatch.setattr("vllm.distributed.utils.all_reduce_int", fake_all_reduce_int)
+    core.scheduler = SimpleNamespace(
+        prefill_cost_model=object(),
+        prefill_target=None,
+        time_budget_prefill_cap=lambda: 112,
+        set_prefill_cap_override=lambda cap: calls.append(("override", cap)),
+    )
+    core._align_prefill_cap_over_dp()
+    assert calls == [(core.dp_group, 112), ("override", 64)]
+
+    # A shared token target already equalizes the ranks: no collective.
+    calls.clear()
+    core.scheduler.prefill_target = object()
+    core._align_prefill_cap_over_dp()
+    assert calls == []
+    core.scheduler.prefill_target = None
+
+    # No budget configured: no collective, no override.
+    calls.clear()
+    core.scheduler.prefill_cost_model = None
+    core._align_prefill_cap_over_dp()
+    assert calls == []
+
+
+def test_dplb_uses_its_own_dispatches_as_a_pending_floor():
+    """A burst routes before any engine snapshot lands, so the size of what
+    this client just sent is the only load signal it has: it must floor the
+    reported backlog, or every engine simply takes every fourth request and
+    mixed sizes land wherever."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    # Tokens per request-equivalent is 1000; a 8000-token prompt is 8 of them,
+    # above the 4 the term counts.
+    client.lb_prefill_tokens_per_request = 1000
+
+    # First request: nothing known, the scan start decides.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert client.get_core_engine_for_request(first) == client.core_engines[0]
+    assert client.engine_pending_tokens[client.core_engines[0]] == 8000
+
+    # Second request sees no snapshot change, but the local floor now makes
+    # engine 0 look busy, so it goes elsewhere.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    second = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert client.get_core_engine_for_request(second) == client.core_engines[1]
+
+    # The first output ends the pending prefill and drops the floor.
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=first.request_id, new_token_ids=[5])]
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert client.engine_pending_tokens[client.core_engines[0]] == 0
+    assert first.request_id not in client.req_pending_prefill
+
+    # Finishing without an output (an abort) releases it too, and only once.
+    outputs = EngineCoreOutputs(finished_requests={second.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_tokens.values()) == 0
+    assert not client.req_pending_prefill
+
+
+def _deliver_snapshot(client, counts):
+    """What the stats task does when a load snapshot arrives."""
+    client.lb_engines = counts
+    client._on_lb_snapshot()
+
+
+def test_dplb_pending_floor_waits_for_a_snapshot_that_has_seen_the_dispatch():
+    """The first snapshot after a dispatch may have been computed before the
+    engine received the request, so it cannot replace the floor; the second
+    one can."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    request = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    engine = client.get_core_engine_for_request(request)
+    idle = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+
+    _deliver_snapshot(client, idle)
+    assert client.engine_pending_tokens[engine] == 8000
+    assert request.request_id in client.req_pending_prefill
+
+    _deliver_snapshot(client, idle)
+    assert client.engine_pending_tokens[engine] == 0
+    assert client.engine_pending_ms[engine] == 0
+    assert not client.req_pending_prefill
+
+
+def test_dplb_engine_report_decides_once_it_has_seen_the_dispatch():
+    """A prompt that is a prefix-cache hit has nothing left to prefill, which
+    the engine reports. Once a snapshot has seen it, the full prompt size this
+    client dispatched must no longer weigh the engine down."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_prefill_tokens_per_request = 1000
+    cached = make_request(SamplingParams(max_tokens=4), [1] * 3000)
+    assert client.get_core_engine_for_request(cached) == client.core_engines[0]
+    # Engine 1 runs two small requests, engine 0 only the cached one.
+    client.engine_inflight[client.core_engines[1]] += 2
+    report = [[0, 1, 0.0, 0, 0.0], [0, 2, 0.0, 0, 0.0]]
+
+    # One snapshot is not enough: the floor still keeps new work off engine 0.
+    _deliver_snapshot(client, report)
+    client.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 10)
+    assert client.get_core_engine_for_request(probe) == client.core_engines[1]
+    # Undo that dispatch so the next probe sees the same load.
+    client.engine_inflight[client.core_engines[1]] -= 1
+    client.reqs_in_flight.pop(probe.request_id)
+    client._release_pending_prefill(probe.request_id)
+
+    # The second one has seen it: engine 0 reports nothing to prefill and has
+    # fewer requests, so it wins.
+    _deliver_snapshot(client, report)
+    client.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 10)
+    assert client.get_core_engine_for_request(probe) == client.core_engines[0]
+
+
+def test_dplb_pending_floor_expires_in_dispatch_order():
+    """Each dispatch is released by the snapshot that follows its own second
+    one, not by one that arrived before it was sent, and a later first output
+    does not release it twice."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    idle = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 5000)
+    client.get_core_engine_for_request(first)
+    _deliver_snapshot(client, idle)
+    second = make_request(SamplingParams(max_tokens=4), [1] * 2000)
+    client.get_core_engine_for_request(second)
+
+    _deliver_snapshot(client, idle)
+    assert first.request_id not in client.req_pending_prefill
+    assert second.request_id in client.req_pending_prefill
+    assert sum(client.engine_pending_tokens.values()) == 2000
+
+    _deliver_snapshot(client, idle)
+    assert not client.req_pending_prefill
+    assert sum(client.engine_pending_tokens.values()) == 0
+
+    outputs = EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id=first.request_id, new_token_ids=[5])],
+        finished_requests={second.request_id},
+    )
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(client, outputs))
+    assert sum(client.engine_pending_tokens.values()) == 0
+    assert sum(client.engine_pending_ms.values()) == 0
+
+
+def _make_shared_dplb_clients(num_engines=2, client_count=2, capacity=None):
+    """DPLB clients, like API server processes, over one shared load array."""
+    capacity = capacity or num_engines
+    counters = multiprocessing.RawArray(
+        "q", SharedDPLoadStats.num_counters(client_count, capacity)
+    )
+    clients = []
+    for index in range(client_count):
+        client = _make_dplb_client(
+            num_engines=num_engines, client_count=client_count, token_aware=True
+        )
+        client.shared_load = SharedDPLoadStats(counters, client_count, index, capacity)
+        clients.append(client)
+    return clients
+
+
+def test_shared_dp_load_sums_the_other_live_servers(monkeypatch):
+    counters = multiprocessing.RawArray("q", SharedDPLoadStats.num_counters(3, 2))
+    servers = [SharedDPLoadStats(counters, 3, i, 2) for i in range(3)]
+    now = 10_000_000_000
+    monkeypatch.setattr("vllm.v1.engine.dp_lb_shared.time.monotonic_ns", lambda: now)
+    servers[0].publish(0, 1, 100, 2.5)
+    servers[1].publish(0, 2, 300, 1.0)
+    servers[1].publish(1, 4, 0, 0.0)
+
+    # Server 2 never wrote, so it is not counted; a server never counts itself.
+    assert servers[0].others(2) == [(2, 300, 1.0), (4, 0, 0.0)]
+    assert servers[2].others(2) == [(3, 400, 3.5), (4, 0, 0.0)]
+
+    # A server that stops beating is a dead one, and its load is dropped.
+    monkeypatch.setattr(
+        "vllm.v1.engine.dp_lb_shared.time.monotonic_ns", lambda: now + 3_000_000_000
+    )
+    servers[0].heartbeat()
+    assert servers[0].others(2) == [(0, 0, 0.0), (0, 0, 0.0)]
+    assert servers[2].others(2) == [(1, 100, 2.5), (0, 0, 0.0)]
+
+
+def test_shared_dp_load_ignores_engines_past_its_capacity():
+    counters = multiprocessing.RawArray("q", SharedDPLoadStats.num_counters(2, 2))
+    first, second = (SharedDPLoadStats(counters, 2, i, 2) for i in range(2))
+    first.publish(1, 5, 50, 1.0)
+    first.publish(2, 9, 90, 9.0)  # no such slot: ignored, not written over a neighbour
+    assert second.others(3) == [(0, 0, 0.0), (5, 50, 1.0), (0, 0, 0.0)]
+    assert SharedDPLoadStats.slot_counters(2) % SharedDPLoadStats.COUNTERS_PER_LINE == 0
+
+
+def test_dplb_routes_around_another_servers_dispatches():
+    """Server B has dispatched nothing, but sees A's long prompt through the
+    shared slots at once, so a burst split over two servers is still spread."""
+    a, b = _make_shared_dplb_clients()
+    for client in (a, b):
+        client.lb_prefill_tokens_per_request = 1000
+    first = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    assert a.get_core_engine_for_request(first) == a.core_engines[0]
+
+    # B's own request count matches A's, so only the prompt A sent tells them apart.
+    b.engine_inflight[b.core_engines[1]] += 1
+    b.eng_start_index = 0
+    probe = make_request(SamplingParams(max_tokens=4), [1] * 100)
+    assert b.get_core_engine_for_request(probe) == b.core_engines[1]
+
+    # Without the shared slots B has no way to know and takes engine 0.
+    b.shared_load = None
+    b.eng_start_index = 0
+    alone = make_request(SamplingParams(max_tokens=4), [1] * 100)
+    assert b.get_core_engine_for_request(alone) == b.core_engines[0]
+
+
+def test_dplb_shared_load_follows_a_finished_request():
+    a, b = _make_shared_dplb_clients()
+    request = make_request(SamplingParams(max_tokens=4), [1] * 8000)
+    a.get_core_engine_for_request(request)
+    assert b.shared_load.others(2)[0][:2] == (1, 8000)
+
+    a_outputs = EngineCoreOutputs(finished_requests={request.request_id})
+    asyncio.run(DPLBAsyncMPClient.process_engine_outputs(a, a_outputs))
+    assert b.shared_load.others(2)[0] == (0, 0, 0.0)
+
+
+def test_dplb_shared_load_is_not_scaled_by_the_server_count():
+    """With the other servers' load exact, one request in flight on engine 0
+    weighs one request, not four: engine 1, already running two, is busier."""
+    a, b, *_ = _make_shared_dplb_clients(client_count=4)
+    a.get_core_engine_for_request(make_request(SamplingParams(max_tokens=4), [1] * 10))
+    snapshot = [[0, 0, 0.0, 0, 0.0], [0, 2, 0.0, 0, 0.0]]
+
+    b.lb_engines = [list(counts) for counts in snapshot]
+    b.eng_start_index = 0
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[0])
+    )
+
+    # The estimate it replaces: scaled by four, engine 0 looks busier.
+    b.shared_load = None
+    b.lb_engines = [list(counts) for counts in snapshot]
+    b.eng_start_index = 0
+    b.engine_inflight.clear()
+    b.engine_inflight[b.core_engines[0]] = 1
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[1])
+    )
+
+
+def test_dplb_stats_poll_keeps_the_server_alive_to_the_others():
+    a, b = _make_shared_dplb_clients()
+    assert b.shared_load.others(2) == [(0, 0, 0.0), (0, 0, 0.0)]
+    a.shared_load._counters[0 + 1] = 3  # engine 0 in flight, written before any beat
+    assert b.shared_load.others(2)[0] == (0, 0, 0.0)  # never beat: not counted
+    a._on_stats_poll()
+    assert b.shared_load.others(2)[0] == (3, 0, 0.0)
+
+
+def test_dplb_counts_the_other_servers_in_flight_requests():
+    """Without token-aware routing, only the request counts of the other servers
+    tell B that engine 0 is already taken."""
+    a, b = _make_shared_dplb_clients()
+    for client in (a, b):
+        client.token_aware_lb = False
+    a.get_core_engine_for_request(make_request(SamplingParams(max_tokens=4)))
+
+    b.eng_start_index = 0
+    assert (
+        b.get_core_engine_for_request(make_request(SamplingParams()))
+        == (b.core_engines[1])
+    )
+
+
+def test_dplb_prices_a_dispatch_as_its_engine_prices_its_backlog():
+    """The floor a router puts on an engine until its report catches up is in
+    the same units as that report: the engine says what a prefill token costs
+    it, and the configured cost is only the fallback."""
+    client = _make_dplb_client(num_engines=2, token_aware=True)
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0, 0.5], [0, 0, 0.0, 0, 0.0, 0.0]]
+    first = make_request(SamplingParams(max_tokens=4), [1] * 1000)
+    assert client.get_core_engine_for_request(first) == client.core_engines[0]
+    assert client.engine_pending_ms[client.core_engines[0]] == pytest.approx(500.0)
+
+    # An engine that reports no price, or an older snapshot without the field.
+    client.lb_engines = [[0, 0, 0.0, 0, 0.0], [0, 0, 0.0, 0, 0.0, 0.0]]
+    client.eng_start_index = 1
+    second = make_request(SamplingParams(max_tokens=4), [1] * 1000)
+    assert client.get_core_engine_for_request(second) == client.core_engines[1]
+    assert client.engine_pending_ms[client.core_engines[1]] == 0.0

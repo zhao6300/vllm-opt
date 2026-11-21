@@ -121,6 +121,9 @@ from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
 
+# Pricing a deep backlog takes milliseconds: a load snapshot reuses it this long.
+_PENDING_PREFILL_MS_MAX_AGE_S = 0.025
+
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
@@ -1403,7 +1406,7 @@ class EngineCoreProc(EngineCore):
             # Only publish request queue stats to coordinator for "internal"
             # and "hybrid" LB modes.
             self.publish_dp_lb_stats = internal_dp_balancing
-            self.last_counts = (0, 0)
+            self.last_counts = (0, 0, 0, 0)
 
             self.addresses = addresses
             self.process_input_queue_block = True
@@ -1828,12 +1831,23 @@ class EngineCoreProc(EngineCore):
         if not self.publish_dp_lb_stats:
             return
 
-        # Publish our request counts (if they've changed).
-        counts = self.scheduler.get_request_counts()
+        # Publish our request counts (if they've changed). The pending prefill
+        # tokens change on their own while a chunked prefill advances, so they
+        # are part of the change key.
+        counts = (
+            *self.scheduler.get_request_counts(),
+            self.scheduler.get_pending_prefill_tokens(),
+            round(self.scheduler.get_pending_prefill_ms(_PENDING_PREFILL_MS_MAX_AGE_S)),
+        )
         if counts != self.last_counts:
             self.last_counts = counts
             stats = SchedulerStats(
-                *counts, kv_cache_usage=self.scheduler.get_kv_cache_usage()
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                pending_prefill_tokens=counts[2],
+                pending_prefill_ms=float(counts[3]),
+                prefill_ms_per_token=self.scheduler.get_prefill_ms_per_token(),
+                kv_cache_usage=self.scheduler.get_kv_cache_usage(),
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
@@ -2754,17 +2768,52 @@ class DPEngineCoreProc(EngineCoreProc):
             return
 
         # Publish our request counts (if they've changed), stamped with the
-        # lockstep-synchronized step counter and wave number.
-        counts = self.scheduler.get_request_counts()
+        # lockstep-synchronized step counter and wave number. The pending
+        # prefill tokens change on their own while a chunked prefill advances,
+        # so they are part of the change key.
+        counts = (
+            *self.scheduler.get_request_counts(),
+            self.scheduler.get_pending_prefill_tokens(),
+            round(self.scheduler.get_pending_prefill_ms(_PENDING_PREFILL_MS_MAX_AGE_S)),
+        )
         if counts != self.last_counts:
             self.last_counts = counts
             stats = SchedulerStats(
-                *counts,
+                num_running_reqs=counts[0],
+                num_waiting_reqs=counts[1],
+                pending_prefill_tokens=counts[2],
+                pending_prefill_ms=float(counts[3]),
+                prefill_ms_per_token=self.scheduler.get_prefill_ms_per_token(),
                 kv_cache_usage=self.scheduler.get_kv_cache_usage(),
                 step_counter=self.step_counter,
                 current_wave=self.current_wave,
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+
+    def _align_prefill_cap_over_dp(self) -> None:
+        """Agree on the DP group's smallest prefill chunk.
+
+        Every MoE step waits for its slowest rank, so a rank whose budget
+        admits a long chunk makes the others idle. Taking the MIN keeps the
+        prefill work of a step equal across ranks. Runs with the DP state sync
+        (every `dp_sync_interval` steps), so the agreed cap can trail the local
+        one by that many steps.
+        """
+        scheduler = self.scheduler
+        # A shared token target equalizes the token part of the ranks' steps, and
+        # each rank caps its own attention part; there is no minimum to agree on.
+        if (
+            scheduler.prefill_cost_model is None
+            or scheduler.prefill_target is not None
+            or self.dp_group is None
+        ):
+            return
+        cap = scheduler.time_budget_prefill_cap()
+        if cap is None:
+            return
+        from vllm.distributed.utils import all_reduce_int
+
+        scheduler.set_prefill_cap_override(all_reduce_int(self.dp_group, cap))
 
     def _should_throttle_prefills(self) -> bool:
         # Throttle new prefills to cadence-aligned steps for DP balancing.
@@ -2805,6 +2854,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
+            # The step id every DP rank gives the same pass, for the cost fit.
+            self.scheduler.dp_step = (self.current_wave << 24) | self.step_counter
             executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
@@ -2868,6 +2919,8 @@ class DPEngineCoreProc(EngineCoreProc):
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
         self.step_counter += 1
+        if (fitter := getattr(self.scheduler, "cost_fit", None)) is not None:
+            fitter.tick(self.dp_group, self.step_counter)
         if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
             return True
 
@@ -2877,6 +2930,9 @@ class DPEngineCoreProc(EngineCoreProc):
             has_unfinished=local_unfinished,
             pending_pause=self.pending_pause,
         )
+        # Same cadence as the sync above: one more small collective per DP
+        # interval, not per step.
+        self._align_prefill_cap_over_dp()
 
         if pause_consensus:
             self.ignore_start_dp_wave = True

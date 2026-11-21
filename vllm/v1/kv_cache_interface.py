@@ -199,6 +199,15 @@ class KVCacheSpec:
     `MultipleOf(n)`: whole kernel blocks, when blocks are split into kernel
     blocks of up to `n` tokens."""
 
+    prefix_replay_tokens: int = field(default=0, kw_only=True)
+    """Tokens recomputed after a prefix hit to rebuild this cache's window
+    instead of prefix caching it (DeepSeek-V4.1 SWA bounded replay).
+
+    Mirrors the allocating manager's window at construction, for consumers that
+    only see specs: KV connectors classify groups this way, and a connector that
+    restores the window lets the scheduler skip the replay.
+    """
+
     def __post_init__(self):
         alignment = self.block_stride_alignment
         if isinstance(alignment, int) and alignment <= 0:

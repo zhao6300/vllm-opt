@@ -39,7 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
 )
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.async_utils import StepTimingCollector, async_copy_to_np
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.ec_connector import NO_OP_EC_CONNECTOR
@@ -145,6 +145,8 @@ def test_idle_dp_dummy_batch_respects_max_model_len(
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback(monkeypatch):
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.is_last_pp_rank = False
+    runner.step_timing = StepTimingCollector()
+    runner.adaptive_verification = None
     local_batch = object()
     global_batch = SimpleNamespace(idx_mapping=object())
     # Keep handles on the mocks: the runner's attributes are typed as the real
@@ -179,7 +181,9 @@ def test_non_last_pp_rank_uses_global_batch_for_sample_feedback(monkeypatch):
 
     runner.sample_tokens(None)
 
-    pp_receive.assert_called_once_with(global_batch, recv_drafts=False)
+    pp_receive.assert_called_once_with(
+        global_batch, recv_drafts=False, adaptive_verification=None
+    )
     postprocess_num_computed_tokens.assert_called_once_with(global_batch)
     postprocess_state.assert_called_once_with(global_batch.idx_mapping, 0)
     restore_for_sampling.assert_not_called()
@@ -283,6 +287,8 @@ def test_dummy_run_requests_fit_in_budget(
     runner.is_last_pp_rank = False
     runner.kv_connector = Mock()
     runner.eplb = Mock()
+    # A non-last stage closes its step timing in _dummy_run.
+    runner.step_timing = StepTimingCollector()
     runner.execute_model = lambda scheduler_output, **kwargs: scheduled.append(
         list(scheduler_output.num_scheduled_tokens.values())
     )
@@ -308,6 +314,7 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
     runner.vllm_config = SimpleNamespace(
         parallel_config=parallel_config,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
+        pp_num_microbatches=1,
     )
     runner.jit_warmup_registry = JitWarmupRegistry(runner.vllm_config)
     runner.model_state = SimpleNamespace(
@@ -315,6 +322,8 @@ def test_qsa_circular_group_uses_custom_slot_mapping(monkeypatch):
         num_new_sampled_tokens_per_step=1,
     )
     runner.speculator = None
+    runner.speculative_config = None
+    runner.is_last_pp_rank = True
     runner.batch_sharder = None
     runner.req_states = []
     runner.input_buffers = SimpleNamespace(query_start_loc=None)
@@ -509,6 +518,7 @@ def _make_capture_runner(
     runner.lora_config = None
     monkeypatch.setattr(runner, "maybe_setup_dummy_loras", _no_dummy_loras)
     runner.speculator = None
+    runner.use_pp = False
     runner.adaptive_verification = None
     runner.model = None
     runner.input_buffers = object()
@@ -787,3 +797,35 @@ def test_speculator_request_hooks(gpu_model_runner_for_requests):
     runner.finish_requests(scheduler_output)
 
     assert events == [("add", "a"), ("add", "b"), ("finished", "a")]
+
+
+@pytest.mark.parametrize("dp_rank", [0, 3])
+def test_profile_capture_sizes_broadcasts_from_the_last_stage(monkeypatch, dp_rank):
+    """The cost-profiling sizes come from the last PP stage of this DP replica.
+
+    broadcast_object takes the source as a rank within the PP group; passing
+    the global last_rank only worked on the first DP replica.
+    """
+    from vllm.v1.worker.gpu import model_runner as model_runner_module
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+    pp_size = 2
+    ranks = [dp_rank * pp_size + i for i in range(pp_size)]
+    calls = []
+
+    class FakePPGroup:
+        world_size = pp_size
+        last_rank = ranks[-1]
+
+        def broadcast_object(self, obj, src=0):
+            assert src < self.world_size, f"Invalid src rank ({src})"
+            calls.append(src)
+            return [8, 16]
+
+    monkeypatch.setattr(model_runner_module, "get_pp_group", lambda: FakePPGroup())
+    runner = SimpleNamespace(
+        use_pp=True,
+        cudagraph_manager=SimpleNamespace(captured_token_counts=lambda: [8]),
+    )
+    assert GPUModelRunner._profile_capture_sizes(runner) == [8, 16]
+    assert calls == [pp_size - 1]
