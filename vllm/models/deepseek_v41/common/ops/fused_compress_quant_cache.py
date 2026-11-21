@@ -14,8 +14,10 @@ from vllm.models.deepseek_v41.common.ops.cache_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
+    dsv41_fp8_cache_writer_enabled,
     flashinfer_dsv41_fp4_quantize_append,
     flashinfer_dsv41_fp4_quantize_pack,
+    flashinfer_dsv41_fp8_quantize_append,
 )
 
 if current_platform.is_rocm():
@@ -545,6 +547,32 @@ def rope_quant_insert(
             footer_scale=footer_scale,
         )
         return
+    if (
+        kv_cache.dtype == torch.uint8
+        and kv_cache.shape[-1] == 528
+        and slot_mapping.dim() == 1
+        and dsv41_fp8_cache_writer_enabled()
+    ):
+        roped_latent = torch.empty_like(latent)
+        _gptj_rotate_latent_kernel[(num_tokens,)](
+            latent,
+            positions,
+            cos_sin_cache,
+            roped_latent,
+            COS_STRIDE=cos_sin_cache.stride(0),
+            COMPRESS_RATIO=compress_ratio,
+            num_warps=4,
+            **launch_kwargs,
+        )
+        _append_fp8_records(
+            roped_latent,
+            slot_mapping,
+            kv_cache,
+            positions,
+            compress_ratio,
+            footer_scale=footer_scale,
+        )
+        return
     if kv_cache.dtype == torch.uint8:
         kernel = {
             584: _rope_quant_insert_kernel,
@@ -677,6 +705,40 @@ def _insert_fp4_packed_or_append(
             kv_cache,
             inline_scale=not footer_scale,
         )
+
+
+def _append_fp8_records(
+    roped_latent: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    positions: torch.Tensor,
+    compress_ratio: int,
+    footer_scale: bool = False,
+) -> None:
+    """Publish rotated latents with FlashInfer's SM120 FP8 record writer.
+
+    The records can differ from `_rope_quant_insert_mxfp8_kernel`'s by one
+    `float8_e4m3fn` ULP in the RoPE dims: the shared rotation kernel rounds
+    them to `bfloat16` and the writer quantizes from there, while the Triton
+    kernel quantizes the float32 rotation. The group scales are unchanged.
+    """
+    if compress_ratio != 1:
+        slot_mapping = slot_mapping.masked_fill(
+            (positions + 1) % compress_ratio != 0, -1
+        )
+    # FlashInfer addresses an inline-scale record as a flat row of the whole
+    # cache, so padded pages need the slot rewritten to the row the token
+    # occupies. Footer-scale pages are addressed by paged slot id.
+    append_slots = slot_mapping
+    if not footer_scale:
+        append_slots = paged_slots_to_cache_rows(
+            slot_mapping,
+            paged_cache_page_rows(kv_cache),
+            paged_cache_block_span(kv_cache),
+        )
+    flashinfer_dsv41_fp8_quantize_append(
+        roped_latent, append_slots, kv_cache, inline_scale=not footer_scale
+    )
 
 
 def _whole_page_runs(slots: np.ndarray, page_tokens: int) -> list[tuple[int, int]]:

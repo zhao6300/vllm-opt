@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_SM120_PREFILL_IMPL: str = "auto"
     VLLM_FLASHINFER_DSV41_SM120_CAKE: bool = False
     VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS: int = 256
+    VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE: bool = False
+    VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS: bool = False
+    VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1250,6 +1253,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # topk 2048).
     "VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_FLASHINFER_DSV41_SM120_CAKE_MAX_TOKENS", "256")
+    ),
+    # Opt-in SM120 routing: run the DeepSeek-V4.1 gate as FlashInfer's fused
+    # square-root-softplus gate (`experimental.sm12x_mega_gate`) instead of a
+    # separate gate GEMM plus top-k. Falls back to the stock router whenever
+    # the shape, dtype, or parallel layout is outside the fused kernel's
+    # contract. Off keeps the stock router.
+    "VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE", "0"))
+    ),
+    # Opt-in SM120 indexer decode logits: compute the paged FP8 MQA logits with
+    # FlashInfer's SM120 kernels instead of DeepGEMM's. The two agree bit for
+    # bit except where logits cancel to near zero; off keeps DeepGEMM.
+    "VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS", "0"))
+    ),
+    # Opt-in SM120 main-cache writer: publish the 528-byte V4.1 latent with
+    # FlashInfer's `dsv41_fp8_quantize_*` kernels instead of the Triton
+    # RoPE + MXFP8 insert. Off keeps the Triton writer.
+    "VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

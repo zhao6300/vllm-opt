@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
@@ -303,6 +304,27 @@ class MoERunner(MoERunnerInterface):
                 enable_dbo=enable_dbo,
                 mk_can_overlap_shared_experts=can_overlap,
             )
+
+        # An SM12x fused-gate router computes the gate itself, so drop the
+        # runner's copy to avoid a redundant GEMM. Only where the runner's
+        # router logits are not consumed elsewhere (naive dispatch, PCP) and
+        # routing sees the unquantized activations.
+        if envs.VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE:
+            from vllm.model_executor.layers.fused_moe.router.sm12x_mega_gate_router import (  # noqa: E501
+                Sm12xMegaGateRouter,
+            )
+
+            if isinstance(router, Sm12xMegaGateRouter) and gate is not None:
+                skip_gate = (
+                    not self._fse_fuse_gate
+                    and not self.do_naive_dispatch_combine
+                    and moe_config.pcp_size == 1
+                    and not routed_experts.quant_method.accepts_quantized_input
+                    and not routed_experts.quant_method.is_monolithic
+                )
+                router.attach_gate(gate, skipped=skip_gate)
+                if skip_gate:
+                    self.gate = None
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name

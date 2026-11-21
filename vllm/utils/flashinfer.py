@@ -360,6 +360,31 @@ flashinfer_dsv41_fp4_quantize_pack = _lazy_import_wrapper(
     "dsv41_fp4_quantize_pack_sparse_mla_cache",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_dsv41_fp8_quantize_append = _lazy_import_wrapper(
+    "flashinfer.mla._sparse_mla_sm120",
+    "dsv41_fp8_quantize_append_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_sm120_fp8_paged_mqa_logits = _lazy_import_wrapper(
+    "flashinfer.sm120_paged_mqa_logits",
+    "fp8_paged_mqa_logits",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_sm120_paged_logits_stride = _lazy_import_wrapper(
+    "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa",
+    "paged_logits_stride",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_sm120_paged_mqa_route_available = _lazy_import_wrapper(
+    "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits.sm120_paged_mqa",
+    "route_available",
+    fallback_fn=_missing_sparse_mla,
+)
+flashinfer_sm12x_mega_gate_plan = _lazy_import_wrapper(
+    "flashinfer.experimental.sm12x_mega_gate.mega_gate",
+    "MegaGateSm12xPlan",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -603,6 +628,91 @@ def has_flashinfer_sparse_mla_sm120_cake(num_q_heads: int) -> bool:
         return int(num_q_heads) in supported_heads()
     except (TypeError, ValueError):
         return False
+
+
+@functools.cache
+def has_flashinfer_sm12x_mega_gate() -> bool:
+    """Return whether FlashInfer ships the SM12x fused BF16 routing gate.
+
+    The kernel contract checked here is the one vLLM relies on: a prepared plan
+    whose `run()` returns `(expert_indices int64, weights FP32)` normalized
+    over the top-k, plus the `sqrtsoftplus` scoring the DeepSeek-V4.1 gate
+    uses. Whether the installed CuTe DSL can target the current device is a
+    separate, per-device question answered at plan construction.
+    """
+    mod = _get_submodule("flashinfer.experimental.sm12x_mega_gate.mega_gate")
+    return (
+        mod is not None
+        and callable(getattr(mod, "MegaGateSm12xPlan", None))
+        and "sqrtsoftplus" in getattr(mod, "SCORING_FUNCS", ())
+    )
+
+
+@functools.cache
+def sm12x_mega_gate_arch_error() -> str | None:
+    """Why the SM12x Mega Gate cannot run on this device, else None."""
+    if not has_flashinfer_sm12x_mega_gate():
+        return "FlashInfer has no SM12x Mega Gate"
+    mod = _get_submodule("flashinfer.experimental.sm12x_mega_gate.mega_gate")
+    device_facts = getattr(mod, "device_facts", None)
+    if not callable(device_facts):
+        return "FlashInfer SM12x Mega Gate has no device_facts"
+    try:
+        device_facts(torch.accelerator.current_device_index())
+    except (RuntimeError, TypeError, ValueError) as e:
+        return str(e)
+    return None
+
+
+@functools.cache
+def has_flashinfer_sm120_paged_mqa_logits() -> bool:
+    """Return whether FlashInfer ships the SM120 paged FP8 MQA logits pair.
+
+    Needs both the logits program and its scheduler: the scheduler's buffer is
+    not interchangeable with DeepGEMM's, so the two must come from the same
+    build.
+    """
+    mod = _get_submodule("flashinfer.sm120_paged_mqa_logits")
+    return mod is not None and all(
+        callable(getattr(mod, name, None))
+        for name in (
+            "get_paged_mqa_logits_metadata",
+            "fp8_paged_mqa_logits",
+        )
+    )
+
+
+@functools.cache
+def sm120_indexer_logits_enabled() -> bool:
+    """Whether the opt-in SM120 paged FP8 MQA logits may replace DeepGEMM's."""
+    if not envs.VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS:
+        return False
+    if not current_platform.is_cuda() or not (
+        current_platform.is_device_capability_family(120)
+    ):
+        return False
+    return has_flashinfer_sm120_paged_mqa_logits()
+
+
+@functools.cache
+def dsv41_fp8_cache_writer_enabled() -> bool:
+    """Whether the opt-in SM120 writer may publish DeepSeek-V4.1 FP8 records."""
+    if not envs.VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER:
+        return False
+    if not current_platform.is_cuda() or not (
+        current_platform.is_device_capability_family(120)
+    ):
+        return False
+    return has_flashinfer_dsv41_fp8_cache_writer()
+
+
+@functools.cache
+def has_flashinfer_dsv41_fp8_cache_writer() -> bool:
+    """Return whether FlashInfer ships the DeepSeek-V4.1 FP8 record writer."""
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
+    return mod is not None and callable(
+        getattr(mod, "dsv41_fp8_quantize_append_sparse_mla_cache", None)
+    )
 
 
 @functools.cache
@@ -1553,6 +1663,17 @@ __all__ = [
     "has_flashinfer_bf16_fp4",
     "has_flashinfer_b12x_moe",
     "has_flashinfer_b12x_gemm",
+    "flashinfer_dsv41_fp8_quantize_append",
+    "flashinfer_sm120_fp8_paged_mqa_logits",
+    "flashinfer_sm120_paged_logits_stride",
+    "flashinfer_sm120_paged_mqa_route_available",
+    "flashinfer_sm12x_mega_gate_plan",
+    "has_flashinfer_sm12x_mega_gate",
+    "sm12x_mega_gate_arch_error",
+    "has_flashinfer_sm120_paged_mqa_logits",
+    "sm120_indexer_logits_enabled",
+    "has_flashinfer_dsv41_fp8_cache_writer",
+    "dsv41_fp8_cache_writer_enabled",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",

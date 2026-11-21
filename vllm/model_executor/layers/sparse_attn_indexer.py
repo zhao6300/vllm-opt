@@ -3,7 +3,7 @@
 """Custom Sparse Attention Indexer layers."""
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING
 
 import torch
@@ -66,6 +66,12 @@ from vllm.utils.deep_gemm import (
     has_deep_gemm,
     mqa_logits_mx_inputs,
     mqa_logits_use_mx_scales,
+)
+from vllm.utils.flashinfer import (
+    flashinfer_sm120_fp8_paged_mqa_logits,
+    flashinfer_sm120_paged_logits_stride,
+    flashinfer_sm120_paged_mqa_route_available,
+    sm120_indexer_logits_enabled,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import round_up
@@ -559,6 +565,100 @@ def kv_cache_as_quant_view(
             stride=(page_bytes, fp4_bytes, fp4_bytes, 1),
         )
     return kv_cache.unsqueeze(-2)
+
+
+def _sm120_paged_logits_width(
+    q: torch.Tensor,
+    q_scale: torch.Tensor | None,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_model_len: int,
+    indices: torch.Tensor | None,
+    logits_dtype: torch.dtype,
+    dcp_world_size: int,
+    use_fp4_cache: bool,
+) -> int | None:
+    """Logits row width for FlashInfer's SM120 paged MQA logits, else None.
+
+    Restates the plan's argument checks so an unsupported batch falls back to
+    DeepGEMM instead of raising mid-decode. None when the opt-in is off, which
+    keeps the default path untouched. The row width is capped at the KV the
+    block table can address -- smaller than `max_model_len` where the cache
+    stores compressed states -- and is what the compressed lengths index.
+    """
+    if not sm120_indexer_logits_enabled():
+        return None
+    if (
+        use_fp4_cache
+        or dcp_world_size != 1
+        or indices is not None
+        or logits_dtype != torch.float32
+        or q_scale is not None
+        or q.dtype != torch.float8_e4m3fn
+        or not q.is_contiguous()
+        or q.dim() != 4
+        or q.shape[3] != 128
+        or kv_cache.dtype != torch.uint8
+    ):
+        return None
+    batch, next_n, num_heads = (int(v) for v in q.shape[:3])
+    if (
+        kv_cache.dim() != 4
+        or kv_cache.shape[2] != 1
+        or kv_cache.shape[3] != 132
+        or kv_cache.stride(3) != 1
+    ):
+        return None
+    page_kv = int(kv_cache.shape[1])
+    if (
+        page_kv not in (64, 128)
+        or (page_kv > 1 and kv_cache.stride(1) != 132)
+        or kv_cache.stride(0) < page_kv * 132
+        or kv_cache.stride(0) % 16
+    ):
+        return None
+    rows = batch * next_n
+    if (
+        weights.dtype != torch.float32
+        or not weights.is_contiguous()
+        or tuple(weights.shape) != (rows, num_heads)
+    ):
+        return None
+    if (
+        seq_lens.dtype != torch.int32
+        or not seq_lens.is_contiguous()
+        or tuple(seq_lens.shape) != (batch, next_n)
+    ):
+        return None
+    if (
+        block_table.dtype != torch.int32
+        or block_table.dim() != 2
+        or int(block_table.shape[0]) != batch
+        or block_table.stride(1) != 1
+    ):
+        return None
+    max_context_len = min(max_model_len, int(block_table.shape[1]) * page_kv)
+    try:
+        stride = flashinfer_sm120_paged_logits_stride(max_context_len)
+        if rows * stride >= 2**31:
+            return None
+        if not _sm120_paged_logits_route(num_heads, page_kv, next_n, batch):
+            return None
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    return max_context_len
+
+
+@lru_cache(maxsize=128)
+def _sm120_paged_logits_route(
+    num_heads: int, page_kv: int, next_n: int, batch: int
+) -> bool:
+    """Shipped SM120 routes are per geometry; the query is host-only."""
+    return bool(
+        flashinfer_sm120_paged_mqa_route_available(num_heads, page_kv, next_n, batch)
+    )
 
 
 def should_skip_indexer_scoring(
@@ -1165,17 +1265,44 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 logits_dtype,
             )
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                logits_dtype=logits_dtype,
-                indices=decode_metadata.indices,
-            )
+            sm120_width = None
+            if decode_metadata.flashinfer_schedule_metadata is not None:
+                sm120_width = _sm120_paged_logits_width(
+                    padded_q_quant_cast,
+                    padded_q_scale,
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    max_model_len,
+                    decode_metadata.indices,
+                    logits_dtype,
+                    dcp_world_size,
+                    use_fp4_cache,
+                )
+            if sm120_width is not None:
+                logits = flashinfer_sm120_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.flashinfer_schedule_metadata,
+                    sm120_width,
+                    page_kv=kv_cache.shape[1],
+                )
+            else:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    logits_dtype=logits_dtype,
+                    indices=decode_metadata.indices,
+                )
             # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
             # one context length per row.
             if dcp_world_size != 1 or not get_indexer_topk(

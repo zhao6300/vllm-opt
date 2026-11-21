@@ -262,4 +262,30 @@ several launches, and prefill stays on the sparse kernels that read the same
 cache. The layout is part of the cache, so a prefix cache or KV-transfer
 snapshot written with one setting cannot be loaded with the other.
 
+Three further SM120/SM121 FlashInfer kernels are opt-in and independent of the
+decode backend above. Each defaults off, and when it is off — or declines the
+operands it was handed — vLLM runs the path it ran before, which makes them
+safe to A/B against the default:
+
+- `VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE=1` fuses the DeepSeek-V4.1 MoE gate
+  GEMM, the `sqrtsoftplus` score, the correction bias, the top-k and the
+  renormalization into one kernel. It only takes over when the runner's router
+  logits are not consumed elsewhere (no naive dispatch, no PCP) and the experts
+  do not take quantized router input, so the separate gate GEMM can be dropped.
+- `VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS=1` computes the DSA indexer
+  decode logits with FlashInfer's paged FP8 MQA logits instead of DeepGEMM's.
+  Both the logits and their scheduler buffer come from FlashInfer — the two
+  schedulers' buffers are not interchangeable — so this path needs an FP8
+  (132-byte) indexer K cache, FP32 logits, one context length per row, and no
+  DCP. Its
+  logits rows are as wide as the addressable KV rather than `max_model_len`,
+  and its non-device routes flush denormals, so logits can differ from
+  DeepGEMM's on denormal inputs.
+- `VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER=1` writes the 528-byte
+  DeepSeek-V4.1 FP8 records (compressed main cache) with FlashInfer's record
+  writer, in both the inline-scale and the `cake` page-footer layouts. Its
+  records can differ from the Triton writer's by one `float8_e4m3fn` ULP in
+  the RoPE dims, because the shared rotation kernel rounds them to `bfloat16`
+  before quantizing; the group scales are identical.
+
 --8<-- "gen:table-mla-v4-decode"

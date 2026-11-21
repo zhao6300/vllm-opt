@@ -33,6 +33,10 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
     RoutingSimulatorRouter,
 )
+from vllm.model_executor.layers.fused_moe.router.sm12x_mega_gate_router import (
+    Sm12xMegaGateRouter,
+    sm12x_mega_gate_available,
+)
 from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
     ZeroExpertRouter,
 )
@@ -67,6 +71,7 @@ def create_fused_moe_router(
     bias_vl: torch.Tensor | None = None,
     image_sentinel_lo: int = 0,
     skip_padding: bool = False,
+    gate: torch.nn.Module | None = None,
 ) -> FusedMoERouter:
     """Factory function to create the appropriate FusedMoERouter subclass based on
     the provided parameters.
@@ -230,6 +235,25 @@ def create_fused_moe_router(
                 eplb_state=eplb_state,
                 custom_routing_function=custom_routing_function,
                 renormalize=renormalize,
+            )
+
+        elif (
+            e_score_correction_bias is not None
+            and hash_indices_table is None
+            and bias_vl is None
+            and num_fused_shared_experts == 0
+            and gate is not None
+            and scoring_func == "sqrtsoftplus"
+            and sm12x_mega_gate_available()
+        ):
+            router = Sm12xMegaGateRouter(
+                top_k=top_k,
+                global_num_experts=global_num_experts,
+                eplb_state=eplb_state,
+                e_score_correction_bias=e_score_correction_bias,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                scoring_func=scoring_func,
             )
 
         elif e_score_correction_bias is not None or hash_indices_table is not None:

@@ -32,6 +32,7 @@ from vllm.utils.deep_gemm import (
     has_deep_gemm,
     native_next_n_supported,
 )
+from vllm.utils.flashinfer import sm120_indexer_logits_enabled
 from vllm.utils.math_utils import round_down
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
@@ -731,6 +732,9 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    # FlashInfer's scheduler buffer for the opt-in SM120 paged logits; not
+    # interchangeable with `schedule_metadata`. None when the opt-in is off.
+    flashinfer_schedule_metadata: torch.Tensor | None = None
     global_seq_lens: torch.Tensor | None = None
     per_req_decode_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
@@ -1187,6 +1191,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # build() narrows it to whatever the kernel actually schedules.
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
+        )
+        # FlashInfer's scheduler writes this buffer itself on every logits
+        # call, so only its shape (the CTA budget) is established here.
+        self.flashinfer_scheduler_metadata_buffer = (
+            torch.empty((self.num_sms + 1, 2), dtype=torch.int32, device=self.device)
+            if sm120_indexer_logits_enabled()
+            else None
         )
 
         # Each compressed state must live on a single rank, so the DCP
@@ -1939,6 +1950,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
+                flashinfer_schedule_metadata=self.flashinfer_scheduler_metadata_buffer,
                 indices=decode_indices,
                 global_seq_lens=global_seq_lens_for_decode,
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
