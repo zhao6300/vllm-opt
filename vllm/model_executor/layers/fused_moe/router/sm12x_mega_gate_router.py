@@ -28,10 +28,16 @@ from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
-# Plans bind operand addresses, so a new step buffer needs a new plan. Graphs
-# reuse their buffers, and eager steps cycle through a few; keep the recently
-# used ones and rebuild past that.
+# Plans bind operand addresses, so a captured step needs one per graph-pool
+# operand. Graphs reuse their buffers; keep the recently used ones and rebuild
+# past that.
 _MAX_PLANS = 32
+
+# Eager steps copy their hidden states into a plan-owned operand buffer, so they
+# only get one while that copy stays cheaper than building a plan (~80 us), and
+# few shapes keep the buffers small. Larger batches rebuild instead.
+_EAGER_MAX_TOKENS = 1024
+_MAX_EAGER_PLANS = 8
 
 
 @dataclass
@@ -41,6 +47,8 @@ class _PlanEntry:
     weights: torch.Tensor
     scratch: torch.Tensor
     barriers: torch.Tensor
+    x: torch.Tensor
+    mask: torch.Tensor | None
 
 
 class Sm12xMegaGateRouter(FusedTopKBiasRouter):
@@ -72,6 +80,7 @@ class Sm12xMegaGateRouter(FusedTopKBiasRouter):
         self._gate_skipped = False
         self._unavailable: str | None = None
         self._plans: OrderedDict[tuple, _PlanEntry] = OrderedDict()
+        self._eager_plans: OrderedDict[tuple, _PlanEntry] = OrderedDict()
         self._buffers: dict[int, tuple[torch.Tensor, ...]] = {}
         self._route_masks: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
 
@@ -156,11 +165,7 @@ class Sm12xMegaGateRouter(FusedTopKBiasRouter):
         ):
             return None
 
-        mask = get_moe_padding_mask(x.shape[0])
-        if mask is not None:
-            # FlashInfer's mask marks the rows to route; vLLM's marks padding.
-            mask = self._route_mask(mask)
-        entry = self._entry(x, weight, bias, mask)
+        entry = self._entry(x, weight, bias, get_moe_padding_mask(x.shape[0]))
         if entry is None:
             return None
         ids, weights = entry.plan.run()
@@ -172,8 +177,23 @@ class Sm12xMegaGateRouter(FusedTopKBiasRouter):
         x: torch.Tensor,
         weight: torch.Tensor,
         bias: torch.Tensor | None,
-        mask: torch.Tensor | None,
+        padding: torch.Tensor | None,
     ) -> _PlanEntry | None:
+        """The plan for this batch, bound to operands that outlive the call.
+
+        A captured step hands in its graph-pool operands, which stay put for the
+        life of the graph, so each graph keeps an entry of its own; preparation
+        runs during capture and is the only way the fused gate reaches a replay.
+        An eager step hands in a fresh hidden-states tensor every call, so small
+        batches share one entry per shape and copy into the plan's own buffer;
+        larger ones rebuild against the tensor they were given.
+        """
+        if not torch.cuda.is_current_stream_capturing() and (
+            x.shape[0] <= _EAGER_MAX_TOKENS
+        ):
+            return self._eager_entry(x, weight, bias, padding)
+
+        mask = None if padding is None else self._route_mask(padding)
         key = (
             x.shape[0],
             x.shape[1],
@@ -184,11 +204,50 @@ class Sm12xMegaGateRouter(FusedTopKBiasRouter):
         if entry is not None:
             self._plans.move_to_end(key)
             return entry
+        entry = self._build(x, weight, bias, mask)
+        if entry is None:
+            return None
+        self._plans[key] = entry
+        while len(self._plans) > _MAX_PLANS:
+            self._plans.popitem(last=False)
+        return entry
 
-        # Preparation runs during CUDA-graph capture too: the plan is the only
-        # way the fused gate reaches a captured decode step, and every tensor
-        # it allocates lives on in `_plans`, so a captured allocation stays
-        # valid for the life of the graph.
+    def _eager_entry(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        padding: torch.Tensor | None,
+    ) -> _PlanEntry | None:
+        key = (x.shape[0], x.shape[1], padding is not None)
+        entry = self._eager_plans.get(key)
+        if entry is None:
+            operand = torch.empty_like(x)
+            mask = (
+                torch.empty(x.shape[0], dtype=torch.bool, device=x.device)
+                if padding is not None
+                else None
+            )
+            entry = self._build(operand, weight, bias, mask)
+            if entry is None:
+                return None
+            self._eager_plans[key] = entry
+            while len(self._eager_plans) > _MAX_EAGER_PLANS:
+                self._eager_plans.popitem(last=False)
+        if entry.x.data_ptr() != x.data_ptr():
+            entry.x.copy_(x)
+        if padding is not None:
+            # FlashInfer's mask marks the rows to route; vLLM's marks padding.
+            torch.logical_not(padding, out=entry.mask)
+        return entry
+
+    def _build(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None,
+        mask: torch.Tensor | None,
+    ) -> _PlanEntry | None:
         from vllm.utils.flashinfer import flashinfer_sm12x_mega_gate_plan
 
         # The kernel state (k/sqrt(m) scaling) must match the stock gate's
@@ -226,11 +285,7 @@ class Sm12xMegaGateRouter(FusedTopKBiasRouter):
             self._unavailable = str(e)
             return None
 
-        entry = _PlanEntry(plan, ids, weights, scratch, barriers)
-        self._plans[key] = entry
-        while len(self._plans) > _MAX_PLANS:
-            self._plans.popitem(last=False)
-        return entry
+        return _PlanEntry(plan, ids, weights, scratch, barriers, x, mask)
 
     def _route_mask(self, padding: torch.Tensor) -> torch.Tensor:
         """Invert `padding` into a stable buffer the kernel can bind.

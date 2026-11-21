@@ -118,6 +118,28 @@ def test_mega_gate_falls_back_when_the_kernel_declines(monkeypatch):
     torch.testing.assert_close(weights, ref_weights, atol=1e-6, rtol=1e-5)
 
 
+@pytest.mark.parametrize("rows", [16, 64, 1025])
+def test_mega_gate_routes_fresh_hidden_states_each_call(monkeypatch, rows):
+    """An eager step hands in a new hidden-states tensor every call.
+
+    The gate reuses a plan for small batches, so each call must rank its own
+    rows; `1025` covers the shapes that still rebuild a plan per tensor.
+    """
+    _, fused, stock = _routers(monkeypatch)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.router."
+        "sm12x_mega_gate_router.get_moe_padding_mask",
+        lambda _: None,
+    )
+    gate = fused._gate()
+    for _ in range(3):
+        x = (torch.randn(rows, HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+        ref_weights, ref_ids = _stock_routing(stock, gate, x)
+        weights, ids = fused._compute_routing(x, None, None)
+        assert torch.equal(ids.long(), ref_ids.long())
+        torch.testing.assert_close(weights, ref_weights, atol=1e-6, rtol=1e-5)
+
+
 def test_indexer_logits_match_deepgemm(monkeypatch):
     from vllm.utils.deep_gemm import (
         fp8_fp4_paged_mqa_logits,
