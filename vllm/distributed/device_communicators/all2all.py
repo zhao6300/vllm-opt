@@ -54,6 +54,59 @@ class PassThroughAll2AllManager(All2AllManagerBase):
         )
 
 
+def _pack_rows(
+    tensors: list[torch.Tensor],
+) -> tuple[torch.Tensor, list[tuple[int, torch.dtype, torch.Size]]]:
+    """Copy `tensors` into one `[rows, row_bytes]` uint8 buffer.
+
+    Each row holds the concatenation of every tensor's row bytes, so a single
+    collective moves all of them and each part comes back as one slice.
+    """
+    rows = tensors[0].shape[0]
+    widths = [t.numel() // rows * t.element_size() for t in tensors]
+    packed = torch.empty(
+        (rows, sum(widths)), dtype=torch.uint8, device=tensors[0].device
+    )
+    offset = 0
+    for tensor, width in zip(tensors, widths):
+        packed[:, offset : offset + width] = tensor.reshape(rows, -1).view(torch.uint8)
+        offset += width
+    return packed, [(w, t.dtype, t.shape[1:]) for t, w in zip(tensors, widths)]
+
+
+def _unpack_rows(
+    packed: torch.Tensor, layout: list[tuple[int, torch.dtype, torch.Size]]
+) -> list[torch.Tensor]:
+    out = []
+    offset = 0
+    for width, dtype, tail in layout:
+        part = packed[:, offset : offset + width].contiguous().view(dtype)
+        out.append(part.view(-1, *tail) if tail else part.view(-1))
+        offset += width
+    return out
+
+
+def _gather_rows(
+    dist_group: Any, tensors: list[torch.Tensor], sizes: list[int]
+) -> list[torch.Tensor]:
+    """All-gatherv `tensors` along dim 0.
+
+    With `VLLM_MOE_AG_RS_PACKED_DISPATCH` the rows are packed into a single
+    buffer first: a ragged all-gatherv costs one broadcast per rank, so N
+    tensors cost N x world_size broadcasts unpacked against world_size packed.
+    """
+    rows = tensors[0].shape[0]
+    if (
+        rows > 0
+        and envs.VLLM_MOE_AG_RS_PACKED_DISPATCH
+        and all(t.shape[0] == rows for t in tensors)
+    ):
+        packed, layout = _pack_rows(tensors)
+        (gathered,) = dist_group.all_gatherv([packed], dim=0, sizes=sizes)
+        return _unpack_rows(gathered, layout)
+    return dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
+
+
 class AgRsAll2AllManager(All2AllManagerBase):
     """An implementation of all2all communication based on
     all-gather (dispatch) and reduce-scatter (combine).
@@ -105,11 +158,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        gathered_tensors = _gather_rows(dist_group, tensors_to_gather, sizes)
 
         if extra_tensors is not None:
             return (gathered_tensors[0], gathered_tensors[1], gathered_tensors[2:])
@@ -135,11 +184,7 @@ class AgRsAll2AllManager(All2AllManagerBase):
         if extra_tensors is not None:
             tensors_to_gather.extend(extra_tensors)
 
-        gathered_tensors = dist_group.all_gatherv(
-            tensors_to_gather,
-            dim=0,
-            sizes=sizes,
-        )
+        gathered_tensors = _gather_rows(dist_group, tensors_to_gather, sizes)
 
         hidden_states = gathered_tensors[0]
         topk_weights = gathered_tensors[1]

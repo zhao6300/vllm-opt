@@ -92,3 +92,15 @@ def test_flashinfer_mxfp8_linear_numerics(
 @torch.inference_mode()
 def test_selected_mxfp8_linear_numerics(m: int, n: int) -> None:
     _check_linear_numerics(init_mxfp8_linear_kernel(weight_shape=(n, 256)), m)
+
+
+@pytest.mark.parametrize("backend", ["cutlass", "auto"])
+@pytest.mark.parametrize("m", [1, 64])
+@torch.inference_mode()
+def test_mxfp8_linear_numerics_by_backend(
+    backend: str, m: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`VLLM_MXFP8_GEMM_BACKEND` must stay numerically valid, not just run."""
+    monkeypatch.setattr("vllm.envs.VLLM_MXFP8_GEMM_BACKEND", backend)
+    config = Mxfp8LinearLayerConfig(weight_shape=(1792, 5120))
+    _check_linear_numerics(FlashInferCutlassMxfp8LinearKernel(config), m)

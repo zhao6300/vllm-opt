@@ -171,6 +171,7 @@ if TYPE_CHECKING:
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+    VLLM_MXFP8_GEMM_BACKEND: str = "cutlass"
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE: str = "fp32"
@@ -271,6 +272,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_MOE_AG_RS_PACKED_DISPATCH: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 512
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1589,6 +1591,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
         in ("true", "1")
     ),
+    # GEMM runner the FlashInfer MXFP8 linear kernel passes to
+    # `flashinfer.mm_mxfp8`. "cutlass" pins one runner and skips FlashInfer's
+    # per-shape autotuner; "auto" lets it pick per shape (CUDA/ROCm `cudnn` on
+    # SM12x, where it is 2-7x faster than the pinned CUTLASS runner for the
+    # small-M decode GEMMs). See docs/configuration/env_vars.md.
+    "VLLM_MXFP8_GEMM_BACKEND": lambda: os.getenv("VLLM_MXFP8_GEMM_BACKEND", "cutlass"),
     # Disable aiter ops unless specifically enabled.
     # Acts as a parent switch to enable the rest of the other operations.
     "VLLM_ROCM_USE_AITER": lambda: (
@@ -2230,6 +2238,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when the installed FlashInfer MoeAlltoAll kernel supports it.
     "VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE", "0"))
+    ),
+    # Pack the `dispatch` tensors of the allgather-reducescatter MoE all2all
+    # backend (hidden states, top-k weights/ids, and any per-token extras) into
+    # one buffer so the AllGatherv moves them in a single collective. With
+    # ragged per-rank token counts the ragged AllGatherv is emulated with one
+    # broadcast per rank, so packing cuts N x world_size broadcasts down to
+    # world_size. Numerically identical either way. Default off.
+    "VLLM_MOE_AG_RS_PACKED_DISPATCH": lambda: bool(
+        int(os.getenv("VLLM_MOE_AG_RS_PACKED_DISPATCH", "0"))
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for

@@ -6,7 +6,10 @@ import pytest
 import torch
 
 from vllm.config import ParallelConfig
-from vllm.distributed.device_communicators.all2all import AgRsAll2AllManager
+from vllm.distributed.device_communicators.all2all import (
+    AgRsAll2AllManager,
+    _gather_rows,
+)
 from vllm.forward_context import DPMetadata
 from vllm.v1.attention.ops.pcp import maybe_gather_mla_latent_cache_inputs
 
@@ -124,6 +127,96 @@ def test_ag_rs_dispatch_and_combine_use_dp_pcp_sizes(monkeypatch, enable_ep):
     assert combined.tolist() == local_tokens
     sizes = [1, 1, 2, 2] if enable_ep else [2, 4]
     assert calls == [("gather", sizes), ("scatter", sizes)]
+
+
+@pytest.mark.parametrize(
+    "dtypes",
+    [
+        (torch.bfloat16, torch.float32, torch.int32),
+        (torch.float8_e4m3fn, torch.float32, torch.int64),
+    ],
+)
+@pytest.mark.parametrize("packed", [True, False])
+def test_ag_rs_dispatch_rows_survive_packing(
+    dtypes, packed, monkeypatch: pytest.MonkeyPatch
+):
+    """Packed dispatch must hand the MoE the same rows as the unpacked path.
+
+    The remote rank contributes one more token than the local one, i.e. the
+    ragged case where the all-gatherv is emulated per rank.
+    """
+    hidden_dtype, weight_dtype, id_dtype = dtypes
+    rows, remote_rows, hidden = 3, 4, 8
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.all2all.envs"
+        ".VLLM_MOE_AG_RS_PACKED_DISPATCH",
+        packed,
+    )
+
+    def make(n: int) -> list[torch.Tensor]:
+        return [
+            torch.randn(n, hidden, dtype=torch.float32).to(hidden_dtype),
+            torch.rand(n, 2, dtype=weight_dtype),
+            torch.arange(n * 2, dtype=id_dtype).reshape(n, 2),
+        ]
+
+    local, remote = make(rows), make(remote_rows)
+
+    class TwoRankGroup:
+        """All-gatherv over a local and a fixed remote contribution."""
+
+        world_size = 2
+        rank_in_group = 0
+
+        def __init__(self, remote: list[torch.Tensor]):
+            self.remote = remote
+            self.calls = 0
+
+        def all_gatherv(self, tensors, dim, sizes):
+            assert dim == 0
+            assert sizes == [rows, remote_rows]
+            self.calls += 1
+            return [torch.cat((t, r), dim=0) for t, r in zip(tensors, self.remote)]
+
+    from vllm.distributed.device_communicators.all2all import _pack_rows
+
+    remote_payload = [_pack_rows(remote)[0]] if packed else remote
+    group = TwoRankGroup(remote_payload)
+
+    gathered = _gather_rows(group, local, [rows, remote_rows])
+
+    assert group.calls == 1
+    for got, loc, rem in zip(gathered, local, remote):
+        assert got.dtype == loc.dtype
+        assert got.shape == (rows + remote_rows, *loc.shape[1:])
+        torch.testing.assert_close(got, torch.cat((loc, rem), dim=0), rtol=0, atol=0)
+
+
+def test_ag_rs_dispatch_with_empty_local_batch(monkeypatch: pytest.MonkeyPatch):
+    """A DP rank with no tokens must not try to pack (and divide by) zero rows."""
+    monkeypatch.setattr(
+        "vllm.distributed.device_communicators.all2all.envs"
+        ".VLLM_MOE_AG_RS_PACKED_DISPATCH",
+        True,
+    )
+    local = [
+        torch.zeros((0, 8), dtype=torch.bfloat16),
+        torch.zeros((0, 2)),
+        torch.zeros((0, 2), dtype=torch.int32),
+    ]
+    remote = [
+        torch.ones((4, 8), dtype=torch.bfloat16),
+        torch.ones(4, 2),
+        torch.ones(4, 2, dtype=torch.int32),
+    ]
+
+    class Group:
+        def all_gatherv(self, tensors, dim, sizes):
+            return [torch.cat((t, r), dim=0) for t, r in zip(tensors, remote)]
+
+    gathered = _gather_rows(Group(), local, [0, 4])
+    for got, rem in zip(gathered, remote):
+        torch.testing.assert_close(got, rem, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("slots", [[3, 4], [3, 4, -1, -1, -1, -1]])

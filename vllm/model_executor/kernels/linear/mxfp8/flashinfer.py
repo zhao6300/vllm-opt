@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
@@ -63,7 +64,11 @@ def _pad_n(
 
 
 class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
-    """MXFP8 W8A8 GEMM via FlashInfer CUTLASS (SM100+)."""
+    """MXFP8 W8A8 GEMM via FlashInfer's `mm_mxfp8` (SM100+).
+
+    The GEMM runner comes from `VLLM_MXFP8_GEMM_BACKEND` (default `cutlass`);
+    the weight layout packed at load time is the one every runner expects.
+    """
 
     supports_pre_processed_weights = True
 
@@ -149,7 +154,7 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
             input_scale,
             weight_scale,
             out_dtype=out_dtype,
-            backend="cutlass",
+            backend=envs.VLLM_MXFP8_GEMM_BACKEND,
         )
         if padded_n != N:
             output = output[:, :N].contiguous()

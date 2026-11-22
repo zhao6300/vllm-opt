@@ -530,6 +530,42 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
 - P0-4（目标命中率）：待测
 - P1-5（decode 每步 CPU）：待测
 - P1-8（多 rank 方差）：待测
+- 步级耗时拆分（§6 第 1 步）：线上 PP2 × TP2 × DP2 的实测已完成，数字见
+  [`TIMING.md`](TIMING.md)（2026-11-21）：1 请求 decode 约 19–20 ms 一次更新且与
+  context 无关；现网 iteration 口径实测 20.3 ms/iteration、2.13 token/iteration、
+  TPOT 9.5 ms；PP1 比 PP0 多忙 10–25%。步内构成已用离线重建补上（同文件 §8）：
+  专家权重流式 44–50%（1054 GB/s，已在带宽墙上）、注意力投影 28–32%、
+  EP 集合通信 9–20%、mHC 5–6%、lm_head 2–3%，合计 12.0–13.7 ms——高于
+  iteration/2，差额来自 MoE 的 L2 命中或投影与集合通信窗口的重叠，需一次带
+  profiler 的重启定死。投影与集合通信这两行都是按线上 kernel、线上 shape 直接
+  实测的（同文件 §8.1 / §8.2）：投影 194 µs/层（写死的 `backend="cutlass"`），
+  换 `auto` 是 90 µs/层；集合通信等长 54 µs/层、不等长 135 µs/层，打包后 65 µs/层。
+  两处已分别做成 `VLLM_MXFP8_GEMM_BACKEND` 与 `VLLM_MOE_AG_RS_PACKED_DISPATCH`
+  （2026-11-21 落地），合计 −2.9 ms/步，可优化空间 ~3–3.5 ms
+- 两个开关的实现与离线验证（2026-11-21）：`VLLM_MXFP8_GEMM_BACKEND` 经
+  `FlashInferCutlassMxfp8LinearKernel.apply_weights` 验证三个线上 shape 逐位相同
+  （`/tmp/verify_mxfp8_env.py`）；`VLLM_MOE_AG_RS_PACKED_DISPATCH` 在 4 rank NCCL 上
+  验证行逐位相同（`/tmp/verify_packed_dispatch.py`）。单测：
+  `tests/test_pcp_dp.py`、`tests/kernels/quantization/test_flashinfer_mxfp8_unaligned_n.py`。
+  **14:45 重启已同时带上两个开关**（`VLLM_MXFP8_GEMM_BACKEND=auto`、
+  `VLLM_MOE_AG_RS_PACKED_DISPATCH=1`）：重启后 1 请求/引擎 ITL p50 17.5 ms、
+  均值 18.5 ms（之前 19–20 ms），方向对但两条同时开无法分项归因
+- 一轮不改代码的引擎侧实测（2026-11-21，`/tmp/probe_live.py`、`/tmp/bench_indexer_topk.py`，
+  数字见 TIMING.md §5.3 / §5.5 / §6.1）：
+    - 冷 prefill 常态 0.072–0.094 ms/token（16k→1.55 s、128k→10.3 s、256k→22.6 s），
+      与引擎 cost fit 一致；旧记录「0.47–0.52 ms/token」是**未解的 5× 慢态**
+      （6.8–8.1 s / 16k，出现在一串请求的头一两个冷 prefill），不是 LMCache 写入，
+      排除项与下一步见 TIMING.md §5.3
+    - decode 行数 ×4（1→4 请求/引擎）步长只 +56%（18.6→29 ms），验证专家流式假设，
+      批大小与 k 都便宜
+    - indexer top-k 换 `per_row`/`flashinfer` 在 128k 上省 0.30/0.32 ms/步（5 层），
+      短 context 收益小；16:00/16:50 两次重启试过、17:12 回退：prefill +40 ms（2.7%），
+      且与慢态无关（TIMING.md §5.3.1），净收益还没单独验证
+- 16:00 → 17:12 的线上 A/B（k=7 + `per_row` → 两者都去掉，2026-11-21/22）：
+  **k=7 是真赚且与 TTFT 无关**——同一探针 1 请求 × 256 输出，k=7 客户端 0.95 s、
+  k=5 1.78 s，ITL p50 都是 17.5 ms，token/iteration 6.24 vs 2.94（1.87×），
+  代价只有 KV 容量 −6.3%；被和 `per_row` 一起回退了。下一个窗口应单变量重启、
+  只加 k=7（TIMING.md §5.3.1）
 
 ---
 
@@ -554,6 +590,8 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
 ### 本分支
 
 - `examples/deployment/deepseek_v41_pp2_dp4_ep4_sm120/README.md`：部署与阶段说明
+- `examples/deployment/deepseek_v41_pp2_dp4_ep4_sm120/TIMING.md`：线上链路耗时
+  实测（decode step、prefill、PP 平衡、索引器、profiler 补测方式）
 - `vllm/config/cache.py:372`：`swa_bounded_replay`
 - `vllm/config/compilation.py:652`：`decoder_replay_trim_threshold`
 - `vllm/v1/kv_cache_interface.py:1048`：`prefix_replay_tokens`
