@@ -744,11 +744,22 @@ class ModelCudaGraphManager(CudaGraphManager):
                 for k, v in intermediate_tensors.tensors.items():
                     self.intermediate_tensors[k][:num_tokens] = v
 
+        capture_ops_warmup = getattr(model, "warmup_capture_ops", None)
+        if not callable(capture_ops_warmup):
+            capture_ops_warmup = None
+
         def create_forward_fn(
             desc: BatchExecutionDescriptor, warmup: bool
         ) -> Callable[[CUDAGraphMode], None]:
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+
+            if warmup and capture_ops_warmup is not None:
+                # Ops that only the captured path runs never execute in the
+                # eager warmup below, and building their kernels host-side is
+                # unsafe under capture. Run them once, outside the graph.
+                with torch.inference_mode():
+                    capture_ops_warmup(num_tokens)
 
             # Set LoRA state before capture so kernels see correct adapters.
             if lora_capture_hook is not None:

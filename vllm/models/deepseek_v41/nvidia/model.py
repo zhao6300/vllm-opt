@@ -2058,6 +2058,18 @@ class DeepseekV41LLMForCausalLM(
         )
         return self.specialized_decode
 
+    def warmup_capture_ops(self, num_tokens: int) -> None:
+        """Run the ops a graph at `num_tokens` executes but eager runs skip.
+
+        The indexer's short-context early return is disabled while capturing,
+        so its `wq_b` MXFP8 GEMM only ever runs inside the graph. FlashInfer
+        builds that GEMM's cuDNN plan host-side and refuses to do it under
+        capture.
+        """
+        from ..attention import autotune_indexer_wq_b
+
+        autotune_indexer_wq_b(self.model, num_tokens)
+
     def get_model_state_cls(self):
         if self.specialized_decode_config is not None:
             from .specialized_decode.runtime.model_state import (
