@@ -441,17 +441,24 @@ class Scheduler(SchedulerInterface):
                     "VLLM_PREFILL_FILL_TARGET needs VLLM_PREFILL_STEP_BUDGET_MS "
                     "as the step period to steer toward"
                 )
+            # The target only takes sizes a prefill graph was captured for, so
+            # each full step replays one instead of running above the cap.
+            compilation_config = self.vllm_config.compilation_config
             self.prefill_target = PrefillTarget.from_env(
                 self.prefill_cost_model.budget_ms,
                 self.scheduler_config.max_num_batched_tokens,
+                compilation_config.prefill_cudagraph_capture_token_sizes,
+                self.prefill_cost_model.fixed_ms,
             )
-            if not envs.VLLM_PREFILL_COST_FIT:
-                self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
+            # Every rank moves its own target from its own steps, which the
+            # lockstep gives it; the merged steps of a cost fit round re-agree
+            # them on one value.
+            self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
             logger.info(
                 "Prefill chunks fill each step to a shared token target "
                 "(now %d, at most %d) that follows a %s ms step period",
                 self.prefill_target.tokens,
-                self.prefill_target.max_tokens,
+                self.prefill_target.ceiling,
                 self.prefill_cost_model.budget_ms,
             )
         # Online fit of the cost model; the DP engine core drives its exchange.
@@ -859,11 +866,15 @@ class Scheduler(SchedulerInterface):
                 window.median_period_ms,
             )
         if self.prefill_target is not None:
-            for sample in samples:
+            self.prefill_target.fixed_ms = fixed_ms
+            seqs = [
                 self.prefill_target.ingest(
                     sample.period_ms / 1000, sample.tokens, sample.prefill_tokens
                 )
-            self.prefill_target.update()
+                for sample in samples
+            ]
+            if seqs:
+                self.prefill_target.update(since=min(seqs))
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1

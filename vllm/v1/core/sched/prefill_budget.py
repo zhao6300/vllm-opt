@@ -29,6 +29,9 @@ class PrefillCostModel:
         ms_per_token_context: Time a prefill token adds per token of context.
         min_chunk_tokens: Fewest prefill tokens a step still carries when the
             decodes alone fill the budget, so a prefill always advances.
+        min_attention_share: Share of the budget attention may still use when
+            the token term alone prices a step above it, so the attention cap
+            stays continuous in the fitted context cost.
 
     """
 
@@ -37,6 +40,7 @@ class PrefillCostModel:
     ms_per_token: float
     ms_per_token_context: float = 0.0
     min_chunk_tokens: int = 256
+    min_attention_share: float = 0.1
 
     def __post_init__(self) -> None:
         if self.budget_ms <= 0:
@@ -50,6 +54,8 @@ class PrefillCostModel:
             raise ValueError(f"The step cost coefficients must be >= 0: {self}")
         if self.min_chunk_tokens < 1:
             raise ValueError(f"The minimum chunk must be >= 1 token: {self}")
+        if not 0 <= self.min_attention_share < 1:
+            raise ValueError(f"The attention share must be in [0, 1): {self}")
 
     @classmethod
     def from_env(cls) -> "PrefillCostModel | None":
@@ -115,8 +121,15 @@ class PrefillCostModel:
         c = self.ms_per_token_context
         if c <= 0:
             return sys.maxsize
-        if room_ms <= 0:
-            return self.min_chunk_tokens
+        # A token term fitted above the budget leaves no room for attention.
+        # That fit contradicts the token target, which the measured step
+        # periods chose; clamping the chunk to the floor there would cut it by
+        # tens of times whenever the fit returns a meaningless positive cost
+        # (~1e-7 ms/token/context), and steps that small carry too few tokens to
+        # fill the target, so nothing could correct the target or the fit. Keep
+        # a share of the budget for attention instead: the cap stays continuous
+        # in the fitted cost, and an over-budget step informs both.
+        room_ms = max(room_ms, self.min_attention_share * self.budget_ms)
         linear = c * context
         tokens = (2 * room_ms) / (linear + math.sqrt(linear * linear + 2 * c * room_ms))
         chunk = int(tokens)

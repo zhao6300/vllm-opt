@@ -154,10 +154,12 @@ class StepCostSolver:
         )
 
     def fit(self) -> tuple[float, float, float]:
-        """The coefficients, the prior until `min_samples` steps are in."""
-        if len(self._rows) < self.min_samples:
+        """The coefficients, the prior until `min_samples` steps that carried
+        prefill are in: the prefill terms are what this prices, and a window of
+        decode-only steps would fit them to the decode step's own overhead."""
+        rows = np.array([row for row in self._rows if row[4]])
+        if len(rows) < self.min_samples:
             return self.prior
-        rows = np.array(self._rows)
         y = rows[:, 0]
         z = rows[:, 1:4] * self._scale
         age = np.arange(len(rows) - 1, -1, -1)

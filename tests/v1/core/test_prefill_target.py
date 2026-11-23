@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from vllm.config.compilation import prefill_cudagraph_capture_grid
 from vllm.v1.core.sched.prefill_target import PrefillTarget
 
 BUDGET_MS = 600
@@ -47,27 +48,35 @@ def test_ranks_with_fewer_decodes_take_more_prefill_and_end_together():
     assert max(totals) <= target.tokens
 
 
-def test_target_grows_when_steps_are_faster_than_the_budget():
-    target = make_target(4096)
-    feed(target, 0.1, 6)
-    assert target.update() == round(4096 * 1.25)
-    feed(target, 0.1, 6, clock=100.0)
-    assert target.update() == round(round(4096 * 1.25) * 1.25)
+def test_an_update_solves_for_the_target_that_fills_the_budget():
+    """A step that took a twelfth of the budget needs twelve times the tokens
+    to fill it; the update goes straight there, bounded by the ceiling."""
+    target = make_target(2048)
+    feed(target, 0.05, 6)
+    assert target.update() == MAX_TOKENS
 
 
 def test_target_shrinks_when_steps_are_slower_than_the_budget():
     target = make_target(4096)
-    # 800 ms against a 600 ms budget: the period is 4/3 of the budget, the
-    # target falls by the gain of one half times the error, to 7/8.
+    # 800 ms against a 600 ms budget: three quarters of the tokens fill it.
     feed(target, 0.8, 6)
-    assert target.update() == round(4096 * 0.875)
+    assert target.update() == 3072
+
+
+def test_the_solve_leaves_out_the_fixed_cost_of_a_step():
+    """A 200 ms step is 190 ms of tokens and 10 ms of fixed cost: filling 600 ms
+    takes 590/190 times the tokens, not 3 times of the whole period."""
+    target = PrefillTarget(BUDGET_MS, 2048, MIN_TOKENS, MAX_TOKENS, fixed_ms=10.0)
+    feed(target, 0.2, 6)
+    assert target.update() == 6400
 
 
 def test_target_stays_within_its_bounds():
-    high = make_target(MAX_TOKENS - 10)
+    high = make_target(MAX_TOKENS - 100)
+    assert high.tokens == MAX_TOKENS - high.quantum
     feed(high, 0.01, 6)
     assert high.update() == MAX_TOKENS
-    low = make_target(MIN_TOKENS + 10)
+    low = make_target(MIN_TOKENS + 100)
     feed(low, 2.0, 6)
     assert low.update() == MIN_TOKENS
 
@@ -88,7 +97,7 @@ def test_target_waits_for_enough_steps():
     feed(target, 0.1, 4)  # the first output has no period: three samples
     assert target.update() == 4096
     feed(target, 0.1, 1, clock=10.0)
-    assert target.update() == round(4096 * 1.25)
+    assert target.update() == MAX_TOKENS
 
 
 def test_a_stall_cannot_collapse_the_target():
@@ -96,7 +105,65 @@ def test_a_stall_cannot_collapse_the_target():
     feed(target, 100.0, 6)
     # A stall counts as four budgets, so the target falls by the limit of one
     # update, not to its floor.
-    assert target.update() == round(4096 * 0.8)
+    assert target.update() == 1024
+
+
+def test_the_target_moves_on_a_grid_that_repeats():
+    """Chunk lengths become kernel shapes, so the target moves on a coarse grid:
+    a handful of shapes repeat instead of a new one after every update."""
+    target = make_target(MIN_TOKENS, quantum=MIN_TOKENS)
+    clock = 0.0
+    seen = []
+    for _ in range(40):
+        clock = feed(target, 0.05, 6, clock)
+        seen.append(target.update())
+    assert all(tokens % MIN_TOKENS == 0 for tokens in seen)
+    # Cheap steps take it from the floor to the ceiling, one grid step at a
+    # time: a snapped value equal to the target must still move it.
+    assert seen[0] > MIN_TOKENS
+    assert seen[-1] == MAX_TOKENS
+    assert len(set(seen)) <= MAX_TOKENS // MIN_TOKENS
+
+
+def test_the_target_moves_between_captured_prefill_graph_sizes():
+    """A step replays a captured graph only at a captured size, so the target
+    takes only the sizes the runner captured, and every captured size."""
+    grid = prefill_cudagraph_capture_grid(MAX_TOKENS)
+    target = make_target(grid=grid)
+    clock = 0.0
+    seen = [target.tokens]
+    for _ in range(20):
+        clock = feed(target, 0.05, 6, clock)
+        seen.append(target.update())
+    assert all(tokens in set(grid) for tokens in seen)
+    assert seen[-1] == MAX_TOKENS
+
+
+def test_the_target_stops_at_the_last_captured_graph():
+    target = make_target(4096, grid=prefill_cudagraph_capture_grid(1024))
+    assert target.tokens == 1024
+    assert target.ceiling == 1024
+    feed(target, 0.05, 6)
+    assert target.update() == 1024
+
+
+def test_a_change_smaller_than_the_grid_moves_one_point():
+    target = make_target(1024, grid=[512, 1024, 2048])
+    # 10% fast, a 5% gain: 1126 rounds back to 1024, which would freeze it.
+    feed(target, 0.545, 6)
+    assert target.update() == 2048
+    # 8% slow: 1968 rounds back to 2048, so it moves down one point instead.
+    feed(target, 0.65, 6, clock=10.0)
+    assert target.update() == 1024
+
+
+def test_an_update_covers_only_the_samples_it_is_given():
+    """A cost fit round judges its own merged steps: the local ones a target
+    already moved on say nothing about the period the group measured."""
+    target = make_target(4096)
+    feed(target, 0.1, 6)
+    seqs = [target.ingest(0.8, 4096, 2048) for _ in range(4)]
+    assert target.update(since=min(seqs)) == 3072
 
 
 def test_steps_are_not_counted_twice():
@@ -147,6 +214,8 @@ def test_background_thread_moves_the_target():
         {"min_tokens": MAX_TOKENS + 1},
         {"gain": 0},
         {"max_factor": 1.0},
+        {"fixed_ms": -1.0},
+        {"deadband": 1.0},
     ],
 )
 def test_invalid_settings_are_rejected(kwargs):

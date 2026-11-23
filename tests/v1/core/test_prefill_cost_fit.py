@@ -60,6 +60,18 @@ def test_the_prior_holds_until_enough_steps_are_in():
     assert solver.fit() == PRIOR
 
 
+def test_a_window_without_prefill_holds_the_prior():
+    """Decode-only steps would fit the prefill terms to the decode step's own
+    overhead, so a window without prefill steps keeps the configured ones."""
+    solver = make_solver()
+    for key in range(64):
+        solver.add(StepSample(key, 9.9, 96, 0.0, 0))
+    assert solver.fit() == PRIOR
+    for step in make_steps(64, noise=0.0):
+        solver.add(step)
+    assert solver.fit() != PRIOR
+
+
 def test_a_term_the_data_does_not_vary_stays_at_its_prior():
     solver = make_solver()
     for step in make_steps(300):
@@ -313,9 +325,23 @@ def test_a_context_that_costs_nothing_has_no_attention_cap():
     assert make_model(c=0.0).max_attention_tokens(500.0, 400_000) == sys.maxsize
 
 
-def test_no_room_left_keeps_the_minimum_chunk():
-    assert make_model().max_attention_tokens(0.0, 1000) == 16
-    assert make_model().max_attention_tokens(-5.0, 1000) == 16
+def test_no_room_left_still_prices_attention_from_a_share_of_the_budget():
+    # A token term fitted above the budget leaves no room for attention. That
+    # fit contradicts the token target the measured step periods chose, so the
+    # cap keeps a tenth of the budget instead of dropping the chunk to the
+    # floor: 60 ms over a 1e-3 ms/token/context context of 1000 tokens.
+    assert make_model().max_attention_tokens(0.0, 1000) == 58
+    assert make_model().max_attention_tokens(-5.0, 1000) == 58
+
+
+def test_a_meaningless_context_cost_does_not_cut_the_chunk():
+    # The online fit emits ~1e-7 ms/token/context from idle windows. With a
+    # negative room it used to cut an 8192-token chunk to the 256-token floor;
+    # the cap must stay close to the chunk instead.
+    model = make_model(c=8e-7)
+    assert model.max_attention_tokens(-300.0, 8192) > 4096
+    # Positive room shows how far the negative one is: a few times, not 32.
+    assert model.max_attention_tokens(454.0, 8192) > 8192
 
 
 def test_fitted_coefficients_keep_the_budget_and_the_minimum_chunk():

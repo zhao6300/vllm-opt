@@ -9733,6 +9733,27 @@ def test_fill_target_chunks_shrink_with_the_attention_cost_of_the_context(
         scheduler.shutdown()
 
 
+def test_fill_target_chunks_survive_a_token_term_fitted_above_the_budget(
+    monkeypatch,
+):
+    """A fitted token term that prices the target over the budget leaves no room
+    for attention. It used to cut every chunk to the 16-token floor on a
+    meaningless 1e-7 context cost, and steps that small never fill the target,
+    so nothing could correct it."""
+    _set_fill_target(monkeypatch, 512)
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", "1.2")
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "1e-07")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, max_model_len=4096
+    )
+    try:
+        (request,) = create_requests(num_requests=1, num_tokens=2000, req_ids=["p0"])
+        scheduler.add_request(request)
+        assert _prefill_chunks(scheduler, request) == [512, 512, 512, 464]
+    finally:
+        scheduler.shutdown()
+
+
 def test_fill_target_grows_from_the_outputs_it_sees(monkeypatch):
     """Steps that fill the target and finish far inside the budget raise it, and
     the next chunk is sized with the new value."""
