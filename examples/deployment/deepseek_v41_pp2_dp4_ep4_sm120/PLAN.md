@@ -246,7 +246,7 @@ p99 TPOT 不退化；预算 kernel 自身耗时小于省下的 decode 时间。
 
 ### P0-3 融合采样主路径
 
-- [ ] 完成
+- [x] 已量并关闭（2026-11-22）：整条采样链 16–20 µs = 0.2% 步长，上限 <1%，达不到 >5% 门槛
 
 **现状（已验证）：** `Sampler` 是多段流水：penalties（独立）、min-p、
 top-k/top-p（FlashInfer `flashinfer_sample`）、log-softmax / 采样、
@@ -266,11 +266,21 @@ log-softmax、SplitMix64 采样、投机 rejection；grammar mask 单独；
 
 **做法：**
 
-1. 先量：每步采样 launch 数与耗时占比（固定 batch 与 DSpark 5）。
+1. ~~先量：每步采样 launch 数与耗时占比（固定 batch 与 DSpark 5）。~~
+   已完成，见下。
 2. 融合“温度 + top-k/top-p + log-softmax + 采样 + rejection”；
    penalty/min-p 保留为可选前置 kernel；mask 继续独立。
 3. 只在无 penalty、无 min-p、无 logprob 的路径启用融合主路径，
    其余路径回退。
+
+**实测（2026-11-22，`TIMING.md` §6.2）：** 离线微基准直接调用线上同一批
+kernel，按 DSpark k=5（6 行/请求）用 CUDA graph 回放计时。temp=0 的整条
+采样链（5×draft `greedy_argmax` + 1×verify `gumbel_sample`）是 16 µs（1 请求）/
+20 µs（4 请求）；temperature>0 的完整链路（`apply_temperature` → 可选 min_p →
+fused 或 `apply_top_k_top_p` + gumbel）是 6–222 µs。相对 9.5–20 ms 的步长，
+采样段占 0.06–2.3%。fused 只在纯 top-p 批上明显更快（72 vs 222 µs），
+`k+p` 与纯 `k` 反而更慢（SM120 上 `top_k_sampling_from_probs` 偏慢）。
+**结论：上限 <1%，不满足 >5% 的门槛，第 2、3 步不做。**
 
 **验收：** 固定 seed 下与现路径输出一致（greedy 与 top-p）；
 launch 数下降；采样段耗时下降；带 penalty/min-p 的行为不变。
@@ -282,50 +292,78 @@ FlashInfer 采样器版本差异。
 
 ### P0-4 SWA state 持久化，前缀命中跳过重放
 
-- [ ] 完成
+- [x] 完成（2026-11-22，由 LMCache 侧实现，未改 vLLM 代码）
 
-**现状（已验证）：** `swa_bounded_replay=True`（`vllm/config/cache.py:372`），
-`prefix_replay_tokens = sliding_window`（`vllm/v1/kv_cache_interface.py:1048`），
-前缀命中时 scheduler 把命中长度回退一个窗口重算
-（`vllm/v1/core/sched/scheduler.py:3649-3656`）。PP 部署中 stage 1 的
-layer 21-39 每次命中都要重放最后 128 token（README “Stage 1 in prefill”）。
+**现状（已验证）：** `swa_bounded_replay=True`（`vllm/config/cache.py:371`），
+`SlidingWindowManager.prefix_replay_tokens = sliding_window`，且该组不进 APC
+（`vllm/v1/core/single_type_kv_cache_manager.py:1100-1109`）；前缀命中时
+scheduler 把命中长度回退一个窗口重算（`_mark_prefix_replay`，
+`vllm/v1/core/sched/scheduler.py:1445-1465`、`3972-3990`）。线上 layer 20 是
+最后一个 KV source，stage 1 的 layer 21-39 只有 128-token SWA cache
+（`--block_size 64` → 2 个 block），所以每次命中原本要重放 128 token
+（README “Stage 1 in prefill”）。
 
-**DeepInfer 做法：** state block 分
+**结论（2026-11-22）：现有实现已经覆盖，不需要新代码。** 启动配置里的
+`lmcache.mp.store_replay_windows: true` 把 prefix-replay 组注册成可存组，connector
+存/取窗口并经 `get_loaded_kv_cache_group_ids` 报告
+（`lmcache/integration/vllm/lmcache_mp_connector.py:1768-1783`），于是
+`_load_restores_replay_window()`（`scheduler.py:3963-3970`）为 True、
+`window_loaded=True`，`_mark_prefix_replay` 返回 0。实测（`/tmp/probe_p04.py`，
+地址与口径见 `TIMING.md` §5.6）：
+
+- 满命中 computed tokens = **2**（1 个末 token 重算 + 1 个采样）；若有 replay 会是 129。
+- 命中 TTFT **84 ms**（16k 本地）/ **103 ms**（64k 本地）/ 161、318 ms（跨引擎），
+  比冷 128 token 的 **151 ms** 还低。
+- 16k + 300 新 = 301、16k + 1200 新 = 1201，均无 replay（否则 429 / 1329）。
+
+**残余缝隙：** 不配 LMCache、只用本地 APC 的部署；LMCache 窗口未存/被驱逐/重启；
+本地命中与 LMCache 命中相距不足一个窗口（`num_computed_tokens <= ret - window`
+不成立）。这些部署才需要下面的原方案。
+
+**原方案（DeepInfer 做法）：** state block 分
 `[stored: SWA][dropped: YOCO consumer SWA | compression state]`；
 按 `KVSTORE_GRAIN=128` 只在最后一个 prefill chunk 落盘；
 20 层 × 134 × 528 B = 1,415,040 B/seq；命中时直接从 state 恢复，
 不再重放。（`deepinfer/worker/cache_engine.py:32, 224-306`、
 `doc/inference_deployment_qa.md` 的 SWA 章节）
 
-**本分支落点：**
+**若要做，落点：** `vllm/v1/kv_cache_interface.py:202`、
+`single_type_kv_cache_manager.py:1100`、`scheduler.py:3963-3990`、
+`vllm/models/deepseek_v41/decoder_replay_layers.py`、
+`vllm/models/deepseek_v41/nvidia/model_state.py`。
 
-- `vllm/v1/kv_cache_interface.py:231, 1048`
-- `vllm/v1/core/sched/scheduler.py:3649-3656`
-- `vllm/models/deepseek_v41/decoder_replay_layers.py`
-- `vllm/models/deepseek_v41/nvidia/model_state.py`
-
-**做法：**
-
-1. 先量：在目标命中率下，replay 占 TTFT 的比例。低于 5% 就先不做。
-2. 若值得做：在主机层按 block hash 存 SWA state，128 粒度，
-   只在最后一个 prefill chunk 写；命中时装载并跳过 replay。
-3. 首版可只覆盖 stage 1 的 21-39 层，layer 20 仍然全量写 KV。
-
-**验收：** 前缀命中 TTFT 改善；命中率不变；输出一致；
-主机内存增量可接受；PP 两段的 state 边界正确。
-
-**风险：** PP stage 边界与 mHC 状态；state 布局必须与 KV 精确匹配；
-与 CUDA graph replay 尺寸的交互。
+**验收：** ✅ 2026-11-22 — 命中 computed = 2；命中 TTFT 低于冷 128 token；
+输出一致；无新增主机内存（窗口本来就在 LMCache 里）；PP 两段边界无新增状态。
+agent 场景的后续杠杆转向会话亲和（P1-8）与小 chunk 固定开销，见 `TIMING.md` §5.6。
 
 ---
 
 ### P1-5 decode 元数据单 kernel 化
 
-- [ ] 完成
+- [x] 已量并关闭（2026-11-22）：关键路径上 ≤0.2–0.5 ms/步（1–2.4%，含 128k 上下文），达不到 >5% 门槛
 
 **现状：** 仍有 NumPy 记账：`vllm/v1/worker/gpu/input_batch.py:173`、
 `vllm/v1/worker/gpu/model_runner.py:1500, 1525, 1597` 的
 `np.cumsum` / `np.add`，以及每步的 list/dict 组装。
+
+**已量（2026-11-22，无重启；数字见 `TIMING.md` §7.6）：**
+
+1. `/tmp/probe_cpu_step2.py`（/proc 口径）：EngineCore 主线程 user CPU/步 =
+   15.6 / 11.4 / 9.3 ms（1 / 4 / 16 请求/engine），步长 19.4 / 14–16 / 12–13 ms；
+   **CPU/步不随请求数增长** ⇒ 主体是等 stage 的忙轮询，不是元数据记账。
+2. `VLLM_PP_STEP_PROFILE_INTERVAL=1` 的每步 span（`/tmp/probe_step_profile.py`
+   等）：`execute` 的 CUDA 事件包住整个 `execute_model`，元数据只要拖慢首个
+   kernel 就会计入 execute。实测 `step − execute − sample` = 0.20 ms（1 请求）、
+   0.01 ms（16）、0.01 ms（32 请求/engine，打满 `max_num_seqs 64`）。
+3. 加长上下文复核（32 请求/engine，64k 与 128k，`/tmp/probe_step_profile_long.py`）：
+   pp0 的 step 18.2 → 19.8 → 21.6 ms，增量全在 execute（GPU attention/indexer +
+   更大的 block table）；host 缝隙仍 0.00 / 0.00–0.47 ms。block table 从
+   256 → 2048 块/seq 只换来 ≤0.5 ms。
+
+**结论：关闭。** 调度与元数据真正加到关键路径上的部分 ≤0.5 ms，占 11–22 ms
+步长的 1–2.4%。单 kernel 化省的是被 GPU 覆盖的 CPU（worker 1.0–1.45 核），
+不是步长；改完最多赚 ~0.2 ms/步，达不到 5%。`sample` 里 `draft` 2.3–2.6 ms 是
+3 层 draft + lm_head 的真算力（不随 batch/ctx 变），也不是 host 开销。
 
 **DeepInfer 做法：** decode 元数据 2 个 TileLang kernel：
 每序列一个 CTA 的主 kernel + block table 拷贝，无 CPU-GPU 同步
@@ -388,6 +426,13 @@ profiler 自身扰动 7–11%（DeepInfer 文档口径）。
 （`vllm/entrypoints/launchers/launcher.py:79-110`）；DP rank 的选择在
 `DPLBAsyncMPClient.get_core_engine_for_request`（`vllm/v1/engine/core_client.py`），
 只看 waiting + running 请求数。已加开关 `VLLM_DP_LB_TOKEN_AWARE`（待 A/B）。
+
+**已定量（2026-11-22，`TIMING.md` §5.6.2）：** 引擎侧已经支持用
+`X-data-parallel-rank` 钉住（`serving.py:196`），所以本项**不需要改 vLLM**。
+第一次落到没有 device 副本的 rank，命中 TTFT 8k/16k/32k 从 96/96/100 涨到
+134/178/229 ms（+38/+82/+129），第二轮就恢复本地速度。落地工作是路由器侧
+的 session/前缀 → rank 粘滞 + 回退，以及按 token 而不是请求数分流（P1-8
+原有的"按 token 亲和"结论不变）。
 
 **DeepInfer 做法：** prefill 按 4 档上下文长度（<16K / 16–64K /
 64–256K / ≥256K）分层，按上一轮算力配额拉取，组内按最低配额路由，
@@ -510,8 +555,9 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
    再决定是否改默认。
 3. **P0-2**：PP 支持已实现（曲线取最慢 stage、置信度每步 relay），
    下一步直接做 32/64/96 并发 A/B（`ADAPTIVE_VERIFICATION=1`）。
-4. **P0-3**：只有采样段占比 >5% 才做。
-5. **P0-4**：只有 replay 占 TTFT >5% 才做。
+4. **P0-3**：已量（见 §7 与 `TIMING.md` §6.2），采样段 0.2–2.3%，关闭，不做。
+5. **P0-4**：已关闭——LMCache `store_replay_windows` 已跳过 replay（`TIMING.md`
+   §5.6）；agent 流量转做 P1-8 会话亲和。
 6. **P1**：按 profile 结果排序，P1-8 / P1-9 可与 P0 并行。
 7. 每完成一项，更新第 7 节。
 
@@ -526,10 +572,31 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
   `test_pp_utils.py`、`test_config.py -k adaptive` 全通过；32/64/96 并发 A/B 待测
 - P0-1（threshold 256→512，decode 全量 token）：2026-11-11 测得
   decode 吞吐与 TPOT 无显著变化，默认仍关闭，不再调阈值
-- P0-3（固定 seed）：待测
-- P0-4（目标命中率）：待测
-- P1-5（decode 每步 CPU）：待测
-- P1-8（多 rank 方差）：待测
+- P0-3（采样段占比，2026-11-22）：离线微基准直接调用线上 kernel，CUDA graph
+  回放（`/tmp/bench_sampler_ops.py`、`/tmp/bench_sampler_temp.py`，数字与
+  方法见 `TIMING.md` §6.2）。temp=0 整条采样链 16 µs / 20 µs（1 / 4 请求），
+  temperature>0 完整链路 6–222 µs，采样段占步长 0.06–2.3%；fused 只在纯
+  top-p 批上更快（72 vs 222 µs），`k+p`、纯 `k` 更慢。**达不到 >5% 门槛，
+  P0-3 关闭**；顺带记录 `apply_min_p` 单算子 71 µs 是最贵的一项
+- P0-4（跳过命中时的 SWA replay，2026-11-22）：**已完成，未改 vLLM 代码**。线上
+  `lmcache.mp.store_replay_windows: true` 让 connector 报告已恢复 replay 窗口，
+  `_mark_prefix_replay` 返回 0（`/tmp/probe_p04.py`，数字见 `TIMING.md` §5.6）：
+  满命中 computed = 2（有 replay 会是 129），16k/64k 本地命中 TTFT 84 / 103 ms，
+  跨引擎 161 / 318 ms，冷 128 token 151 ms。残余只在"不配 LMCache"或"窗口没存住"
+  的部署；agent 场景剩下的杠杆是会话亲和（P1-8，跨引擎命中 16k +77 ms、64k
+  +215 ms）和小 chunk 的 ~50 ms 固定开销
+- P1-5（decode 每步 CPU，2026-11-22）：两层证据（`TIMING.md` §7.6）。/proc：
+  主线程 user CPU/步 15.6 / 11.4 / 9.3 ms（1 / 4 / 16 请求），不随请求数增长 ⇒
+  忙轮询主导。每步 span：`step − execute − sample` = 0.20 / 0.01 / 0.01 ms
+  （1 / 16 / 32 请求/engine），128k 上下文、32 请求下仍 0.00–0.47 ms ⇒
+  元数据+launch+调度在关键路径上 ≤0.5 ms，占 11–22 ms 步长 1–2.4%。
+  **关闭：达不到 5% 门槛**
+- P1-8（会话亲和）：**已定量，不需要改 vLLM**（`TIMING.md` §5.6.2）。固定
+  `X-data-parallel-rank` 时命中 TTFT 8k/16k/32k = 96/96/100 ms；没打过的 rank
+  首轮 134/178/229 ms（+38/+82/+129），第二轮回到 96/115 ms——溢价是"该 rank
+  没有 device 副本"而不是"引擎号不同"。agent 6 轮负载：不固定 rank 有 2 轮
+  242/177 ms，固定后 145–150 ms。`serving.py:196` 已读该 header，剩下的是路由器
+  侧 session→rank 粘滞 + 回退，属于网关工作
 - 步级耗时拆分（§6 第 1 步）：线上 PP2 × TP2 × DP2 的实测已完成，数字见
   [`TIMING.md`](TIMING.md)（2026-11-21）：1 请求 decode 约 19–20 ms 一次更新且与
   context 无关；现网 iteration 口径实测 20.3 ms/iteration、2.13 token/iteration、
@@ -550,6 +617,9 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
   **14:45 重启已同时带上两个开关**（`VLLM_MXFP8_GEMM_BACKEND=auto`、
   `VLLM_MOE_AG_RS_PACKED_DISPATCH=1`）：重启后 1 请求/引擎 ITL p50 17.5 ms、
   均值 18.5 ms（之前 19–20 ms），方向对但两条同时开无法分项归因
+- `VLLM_PP_MICROBATCH_BALANCE=balance` 的效果已实测（现役进程，两引擎 49,190 次
+  ITL 更新）：`pack` 时期 31.5% 的 50–75 ms 峰**归零**，≤25 ms 占 98.9%，均值
+  **22.7 ms**（TIMING.md §5.4）。调度附加基本清掉，但 TTFT/吞吐代价还没量
 - 一轮不改代码的引擎侧实测（2026-11-21，`/tmp/probe_live.py`、`/tmp/bench_indexer_topk.py`，
   数字见 TIMING.md §5.3 / §5.5 / §6.1）：
     - 冷 prefill 常态 0.072–0.094 ms/token（16k→1.55 s、128k→10.3 s、256k→22.6 s），
@@ -562,10 +632,105 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
       短 context 收益小；16:00/16:50 两次重启试过、17:12 回退：prefill +40 ms（2.7%），
       且与慢态无关（TIMING.md §5.3.1），净收益还没单独验证
 - 16:00 → 17:12 的线上 A/B（k=7 + `per_row` → 两者都去掉，2026-11-21/22）：
-  **k=7 是真赚且与 TTFT 无关**——同一探针 1 请求 × 256 输出，k=7 客户端 0.95 s、
-  k=5 1.78 s，ITL p50 都是 17.5 ms，token/iteration 6.24 vs 2.94（1.87×），
-  代价只有 KV 容量 −6.3%；被和 `per_row` 一起回退了。下一个窗口应单变量重启、
-  只加 k=7（TIMING.md §5.3.1）
+  **k=7 在单请求探针上更快、在线上不一定**——1 请求 × 256 输出，k=7 客户端
+  0.95 s、k=5 1.78 s，ITL p50 都是 17.5 ms，token/iteration 6.24 vs 2.94（1.87×），
+  当时与 `per_row` 一起回退。**但线上开过 k=7 后整体变慢**：draft 链按 step
+  串行（`speculator.py:334`），k=7 要跑 7 段 draft（每段 3 层 + 129k lm_head），
+  而第 6/7 位的逐位接受率只有 ~0.19 及以下——多出的两段是"用整段 draft 换
+  ~0.1-0.2 个 token"，只在 1 请求/引擎时因步长被权重流式主导而划算，批一大就亏
+  （TIMING.md §5.3.1）。正确旋钮是 `enable_adaptive_verification`（按置信度
+  在整个 batch 上分配 verify 槽位，缺省关闭），不是固定 k=7
+- 一次带 profiler 的重启（2026-11-22 04:19，`VLLM_PP_STEP_PROFILE_INTERVAL=1` +
+  `--profiler-config`；窗口方法、崩溃链与读数口径见 TIMING.md §7）：
+    - prefill 16k（PP0）：attention 23.9%、gemm 18.2%、ep_all2all 16.6%、
+      **other_nccl 13.4%**、moe 13.4%、other 7.0%、mhc 4.2%、pp_p2p 2.9%、
+      indexer 0.4%。other_nccl 是 **TP=2 多出来的 all-reduce**，§8 的离线重建按
+      TP1 做，原来没有这一项。旧脚本把专家 GEMM 误分到 attention（`flash` 匹配
+      `flashinfergemm`），已修（TIMING.md §7.3）
+    - decode 32k（1 请求/引擎）：真实 GPU **7.86 ms/step**——专家段 3.67 ms
+      （170 µs/层，按 DRAM 墙反推 ≈10 个 distinct expert；§8 的 6.04 ms 按 18 个
+      `(row, expert)` 对算，是上界）、EP 1.40 ms、gemm 1.06、mHC 0.42、
+      **attention 只有 0.23 ms**（不是旧表的 2.3 ms）。**"12–13.7 ms 模型比步长
+      高"定死了一半**：模型重复计入了 overlap 的部分；7.86 ms 与实测 9.5–10 ms
+      之间的 ~2 ms 主要是 stage 0 等 stage 1（stage 1 折算 ~9.0 ms），只剩 ≤1 ms
+      可能是 launch/同步/采样
+    - **stage 1 补齐**（10 步窗口）：纯计算 9.45 vs stage 0 7.88 ms/step，多出的
+      1.6 ms 是 lm_head ~1.0、多 2 层 indexer +0.35、DSpark draft ~0.5，**MoE 反
+      而略少**（4.35 vs 4.83）→ stage 1 的优化空间在 indexer/draft/lm_head
+    - **decode trace 在 `profiler_stop` 时可能 `double free` 打死整个服务**
+      （rank 0 兼 TCPStore 宿主 → 其余 rank store unavailable → `EngineDeadError`，
+      退出码 None），eager prefill trace 不会。40 步窗口挂了；10 步窗口（flush 在
+      压测中完成）8 个 rank 全部干净写盘。**08:36 又挂一次，且是 2 步窗口**：
+      `max_iterations=2` 在空闲时被 1.2 ms 的空转步立刻用完，窗口里只有 dummy
+      decode 的图重放，teardown 照样段错（`~Result`/`~KinetoEvent`，见
+      TIMING.md §7.2）。结论收紧成"只采 eager prefill 窗口"，并注意
+      `max_iterations` 数的是 worker step，不是请求的 step。`nsys` 在本机不可用：
+      2026.1 的 CLI 没有 attach，容器也没有 `CAP_SYS_PTRACE`
+    - 跨引擎对照：DP0 挂 4 请求、DP1 挂 1 请求，ITL 均值 25.7 vs **28.2 ms**——
+      孤请求不比 4 请求的引擎快，EP 组跨 DP 强制 lockstep，**P1-8 必须按 token
+      亲和分流**，按请求数分没有意义。受控波次 5+5 vs 4+6 只差 2%，按行数准入
+      的收益 ≤0.3 ms/步，不值得先做
+    - DP4 推演（`/tmp/dp4_sim.py`，校准到实测偏斜分布）：4 引擎的偏斜明显更深
+      （0 档 46% → 20%，2 档 11% → 29%/31%）而 step p50 17.3 → 17.0 ms、
+      TPOT 10.9 → 10.5 ms——锁步时钟看组内总行数，DP4 的收益在 prefill 容量 /
+      TTFT（K=16 完成数 +52%）。真 DP4 是 TP1，常量会变，只能读方向
+    - 无 trace 基线（新进程）：1k TTFT 140 ms / ITL 21.5 ms，32k TTFT 3.06 s /
+      ITL 20.3 ms（p50 17.5）；16k 前缀命中 TTFT 98–156 ms vs 冷 1451 ms ⇒ replay
+      加装载 ≈50–120 ms/命中。**P0-4 的门槛口径要先定**：占命中 TTFT 远超 5%
+      （命中流量里它就是主项），占冷 TTFT 只有 4–7%。
+      **07:40 复测修正（TIMING.md §5.6）**：那 ≈50–120 ms 里 replay = 0——
+      LMCache `store_replay_windows` 已经把窗口装回来了；本地命中 84 ms 是
+      84 ms floor + 少量外部装载，跨引擎（块不在本 engine）才是 77–215 ms
+- 两个未解释数的收口（2026-11-22 08:3x–12:3x，TIMING.md §5.2 / §5.3 / §5.6）：
+    - **84 ms 命中 floor** 不是常数，是「排队等外部 KV（16k ≈ 90 ms，
+      3–5 µs/token）+ 一次 decode 形态 step（26–41 ms）」。lookup 只占 6–20 ms。
+      满命中的 1 个新 token 走 `prefill_runs_as_decode`（`model_runner.py:1497-1504`），
+      所以便宜；冷 1 token 没有 KV，只能走真 prefill。
+    - **小 prompt 的冷 prefill 是每级固定 ~65 ms**（1 token = 68 ms/级，
+      1k = 78 ms/级，4k = 262 ms/级）：token 斜率 ~0.05–0.06 ms/token/级到 2k
+      以上才显出来。重启后进程墙钟复核：64 = 159、1024 = 166、2048 = 288、
+      4096 = 590、8192 = 853 ms。
+    - **空闲 1.4 kW 是状态不是常数**：12:2x 采样空闲态已收敛到 pause——整机
+      698 W、util 0.6–2.7%、单卡 70–104 W；1.2 kW 出现在"刚跑完一批"的头几秒
+      （1206 W → 10 s 内 630 W）或没收敛到 pause 时。host 侧仍恒定 8.7 核忙轮询。
+    - 另外两个读数坑已写进 TIMING.md：空闲 DP engine 的 `step 130 ms /
+      execute 0.00` 是锁步等待，不是丢 span；`prompt_tokens_cached_total` 是裸
+      counter（带 `_total`），早先按 `_sum` 过滤才读出 cached = 0
+- 三项收口（2026-11-22 12:2x–13:0x，TIMING.md §5.6.1 / §5.6.2 / §5.7）：
+    - **本地命中的 46–49 ms queue = 取 127 token 的外部尾巴**，不是空等。
+      device 覆盖 `floor((n-1)/128)*128`（128 = KV 组 LCM，启动日志
+      `kv lcm block sizes 128`），n 是 128 倍数时 LMCache 里还有 127 token：
+      queue 42 / prefill 52 / TTFT 96；没有尾巴时 queue 5 / prefill 135 /
+      TTFT 143。**取比不取省 47 ms**。尾巴的 39 ms `in_progress` 里只有
+      4.55 ms 是 h2d 拷贝，其余是 MP 往返 + 跳过调度步
+    - **跨引擎搬运只有 260–310 MB/s**（16k = 65 chunk/卡、10.1 MB、38.2 ms），
+      比 PCIe 应有值低一个量级；这是跨引擎命中的真实成本，值得单查
+      （`use_vmm_api` 路径 / NUMA）
+    - **小 batch prefill 的 65 ms/级 = eager 逐层 launch**：`torch.compile`
+      不支持该模型 + 无 breakable 图 → 日志 `Overriding to FULL_DECODE_ONLY`
+      → `mixed_mode()` NONE → 不建任何 prefill 图 → `cg_mode=NONE` →
+      `self.model(**model_inputs)`。1–768 token 墙钟平在 138–146 ms、512 网格
+      边界无台阶；同样 1 token 图上 26 ms/级 vs eager 68 ms/级（20 层/级
+      ⇒ ~2 ms/层）；功率停在空闲档。杠杆是 `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+      （配置层唯一入口，需一次带重启的 A/B）。14:14 首跑崩在捕获里建 cuDNN plan
+      （索引器 `wq_b` 短上下文早退在捕获时被绕过，eager warmup 从未跑过该 GEMM）；
+      已加「按 desc 预 warm」钩子，15:16 重启后 27/27 + 41/41 档全部捕获。冷
+      prefill 墙钟：1/128/512/768/1024/2048 token = 31/61/108/138/170/289 ms
+      （基线 138/141/146/~140/166/286），8k 917 ms、16k 1444–1664 ms 与基线
+      持平，decode 步长未退化——即小 prefill 明显变快、大 prefill 不吃亏
+      （TIMING.md §5.7.1、§9.3）
+- 小外部命中同 step 装载（2026-11-22 13:0x，**已实现，默认关**）：把
+  ≤128 token 的命中从异步改成在分配块的同一个 step 里提交并让当前流等待
+  （`DeviceMessagingFuture.wait_on_stream`），去掉"跳过调度步"的 ~35 ms。
+  代码在 `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_mp_sync_load.py`
+  （外部 connector 的子类；`kv_connector_module_path` 指过去，类名仍是
+  `LMCacheMPConnector`），旋钮 `lmcache.mp.sync_load_max_tokens`（0 = 原行为）
+  与 `lmcache.mp.sync_load_timeout_s`。14:53 首次启用跑了 6 分钟流量后崩在
+  scheduler 的 finished-recv assert：worker 按 op 跨度、scheduler 按
+  `need_to_load` 划分同步/异步，APC 命中非 chunk 对齐时两者差最多 255 token。
+  已改为把 scheduler 的判定随 metadata 传给 worker，单测 12 passed；
+  线上 A/B 仍需重启，看 16384 TTFT 96 → 60–70 ms 与 decode 步长不回退
+  （TIMING.md §5.7.2）
 
 ---
 
@@ -591,7 +756,8 @@ DeepInfer 把 grammar 编译放到专用 SO 机器、与 decode 解耦。
 
 - `examples/deployment/deepseek_v41_pp2_dp4_ep4_sm120/README.md`：部署与阶段说明
 - `examples/deployment/deepseek_v41_pp2_dp4_ep4_sm120/TIMING.md`：线上链路耗时
-  实测（decode step、prefill、PP 平衡、索引器、profiler 补测方式）
+  实测（decode step、prefill、PP 平衡、索引器、逐 kernel trace 与 profiler 崩溃
+  纪律）
 - `vllm/config/cache.py:372`：`swa_bounded_replay`
 - `vllm/config/compilation.py:652`：`decoder_replay_trim_threshold`
 - `vllm/v1/kv_cache_interface.py:1048`：`prefix_replay_tokens`

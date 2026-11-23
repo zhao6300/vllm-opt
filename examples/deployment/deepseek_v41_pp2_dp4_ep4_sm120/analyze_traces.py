@@ -35,9 +35,24 @@ CATEGORIES: list[tuple[str, re.Pattern[str]]] = [
     ),
     ("pp_token_relay (nccl broadcast)", re.compile(r"nccl.*Broadcast")),
     ("other_nccl", re.compile(r"nccl")),
+    # MoE before attention: the flashinfer_cutlass expert GEMM is named
+    # "...flashinfergemm...dense_blockscaled_gemm...", which an `attention`
+    # pattern containing bare `flash` would swallow. `blockscaled` alone is
+    # not enough either: the dense MXFP8 projection GEMM
+    # (`flashinfer::gemm::DeviceGemmMxfp8GemmSm120`) is also block-scaled.
+    (
+        "moe",
+        re.compile(
+            r"moe|marlin|m_grouped|fp8_fp4|expert|dense_blockscaled"
+            r"|GroupProblem|flashinfergemm|mxfp8_quantize",
+            re.I,
+        ),
+    ),
     ("indexer", re.compile(r"mqa_logits|indexer|topk", re.I)),
-    ("attention", re.compile(r"sparse_mla|SparseMLA|mla|attention|flash", re.I)),
-    ("moe", re.compile(r"moe|marlin|m_grouped|fp8_fp4|expert", re.I)),
+    (
+        "attention",
+        re.compile(r"sparse_mla|SparseMLA|attention|cake|flash_attn", re.I),
+    ),
     ("mhc", re.compile(r"mhc|hc_|sinkhorn", re.I)),
     ("gemm", re.compile(r"gemm|cutlass|nvjet|xmma|matmul", re.I)),
 ]
@@ -111,7 +126,11 @@ def main() -> int:
         print("no *.pt.trace.json[.gz] files found", file=sys.stderr)
         return 1
     for path in files:
-        print(summarize(path))
+        try:
+            print(summarize(path))
+        except (OSError, EOFError, json.JSONDecodeError) as exc:
+            # A profiler stop that crashed mid-export leaves a truncated gzip.
+            print(f"{path.name}: unreadable ({type(exc).__name__}), skipped")
     return 0
 
 
