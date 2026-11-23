@@ -71,6 +71,16 @@ def test_the_solve_leaves_out_the_fixed_cost_of_a_step():
     assert target.update() == 6400
 
 
+def test_a_fitted_fixed_cost_beyond_the_period_cannot_invert_the_solve():
+    """The fit can report a fixed cost as large as the period it was fitted
+    from (176 ms of a 175 ms step). Bounded to half of each, the solve still
+    moves the target by the ratio of what the tokens really cost."""
+    target = PrefillTarget(250, 2048, MIN_TOKENS, MAX_TOKENS, fixed_ms=140.0)
+    feed(target, 0.1745, 6)
+    # fixed 87.25: (250 - 87.25) / (174.5 - 87.25) = 1.865 -> 3820 -> 3840.
+    assert target.update() == 3840
+
+
 def test_target_stays_within_its_bounds():
     high = make_target(MAX_TOKENS - 100)
     assert high.tokens == MAX_TOKENS - high.quantum

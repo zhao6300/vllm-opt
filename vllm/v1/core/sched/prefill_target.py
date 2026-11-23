@@ -274,10 +274,13 @@ class PrefillTarget:
             self._consumed = max(self._consumed, samples[-1].seq)
         self._step_ms = median(periods) * 1000
         # The period is the fixed cost plus the target's tokens: solve for the
-        # target that spends the rest of the budget.
+        # target that spends the rest of the budget. A fixed cost the fit
+        # reports near or above the period it was fitted from would zero what
+        # is left of it and invert the solve, so it is bounded by both.
+        fixed_ms = min(self.fixed_ms, self._step_ms / 2, self.target_step_ms / 2)
         floor_ms = 0.05 * self.target_step_ms
-        ratio = max(self.target_step_ms - self.fixed_ms, floor_ms) / max(
-            self._step_ms - self.fixed_ms, floor_ms
+        ratio = max(self.target_step_ms - fixed_ms, floor_ms) / max(
+            self._step_ms - fixed_ms, floor_ms
         )
         if abs(ratio - 1) <= self.deadband:
             return target
