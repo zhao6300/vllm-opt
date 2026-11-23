@@ -45,6 +45,9 @@ class PrefillTarget:
         max_tokens: Largest target, normally `max_num_batched_tokens`.
         fixed_ms: Step time the target does not buy, e.g. the fitted fixed cost
             of a step, so each update solves for the tokens that fill the rest.
+        decode_step_ms: Step period used instead of `target_step_ms` while the
+            recent steps carry decode tokens, so a long prefill does not hold
+            them for a whole budget; 0 uses one period for both.
         gain: Share of the relative error corrected per update, in (0, 1]. At
             1 an update solves for the target directly, which a step cost that
             is linear in the tokens reaches in one move.
@@ -82,6 +85,7 @@ class PrefillTarget:
         quantum: int = 0,
         grid: Sequence[int] | None = None,
         fixed_ms: float = 0.0,
+        decode_step_ms: float = 0.0,
     ) -> None:
         if target_step_ms <= 0:
             raise ValueError(
@@ -89,6 +93,10 @@ class PrefillTarget:
             )
         if fixed_ms < 0:
             raise ValueError(f"The fixed step cost must be >= 0 ms: {fixed_ms}")
+        if decode_step_ms < 0:
+            raise ValueError(
+                f"The decode step period must be >= 0 ms: {decode_step_ms}"
+            )
         if not 0 < min_tokens <= max_tokens:
             raise ValueError(
                 f"Need 0 < min_tokens <= max_tokens: {min_tokens}, {max_tokens}"
@@ -105,6 +113,7 @@ class PrefillTarget:
         self.min_tokens = min_tokens
         self.max_tokens = max_tokens
         self.fixed_ms = fixed_ms
+        self.decode_step_ms = decode_step_ms
         self.gain = gain
         self.max_factor = max_factor
         self.deadband = deadband
@@ -137,6 +146,7 @@ class PrefillTarget:
         max_tokens: int,
         grid: Sequence[int] | None = None,
         fixed_ms: float = 0.0,
+        decode_step_ms: float = 0.0,
     ) -> "PrefillTarget":
         """The target the environment configures.
 
@@ -146,6 +156,8 @@ class PrefillTarget:
             grid: Token counts the target may take, normally the captured
                 prefill graph sizes.
             fixed_ms: Part of the step period the target does not buy.
+            decode_step_ms: The period to steer toward while decodes are in the
+                recent steps; 0 uses the budget.
 
         Returns:
             A target starting at `VLLM_PREFILL_TARGET_INIT_TOKENS`, or a quarter
@@ -161,6 +173,7 @@ class PrefillTarget:
             max_tokens,
             grid=grid,
             fixed_ms=fixed_ms,
+            decode_step_ms=decode_step_ms,
         )
 
     @property
@@ -237,7 +250,8 @@ class PrefillTarget:
 
         Only steps that carried prefill and filled the target tell how long a
         full step takes, so the others are ignored. An update solves for the
-        target that brings their median period to `target_step_ms` after the
+        target that brings their median period to `target_step_ms` (to
+        `decode_step_ms` while the recent steps carry decodes) after the
         `fixed_ms` cost, so a step cost that is linear in the tokens lands in
         one move instead of approaching by a fixed share; `max_factor` bounds
         what one update may change. The result lands on a grid point (moving
@@ -260,9 +274,17 @@ class PrefillTarget:
         with self._lock:
             first = self._consumed if since is None else since - 1
             samples = [s for s in self._samples if s.seq > first]
+        if not samples:
+            return self._target
         target = self._target
+        # Steps that carry decodes wait for the whole step, so while the recent
+        # ones do, a longer prefill step is paid by them; with none, it is not.
+        decodes = median(s.total_tokens - s.prefill_tokens for s in samples)
+        period_target = self.target_step_ms
+        if self.decode_step_ms > 0 and decodes > 0:
+            period_target = self.decode_step_ms
         floor = self.fill_fraction * target
-        cutoff = self.stall_factor * self.target_step_ms / 1000
+        cutoff = self.stall_factor * period_target / 1000
         periods = [
             min(s.period_s, cutoff)
             for s in samples
@@ -274,12 +296,12 @@ class PrefillTarget:
             self._consumed = max(self._consumed, samples[-1].seq)
         self._step_ms = median(periods) * 1000
         # The period is the fixed cost plus the target's tokens: solve for the
-        # target that spends the rest of the budget. A fixed cost the fit
-        # reports near or above the period it was fitted from would zero what
-        # is left of it and invert the solve, so it is bounded by both.
-        fixed_ms = min(self.fixed_ms, self._step_ms / 2, self.target_step_ms / 2)
-        floor_ms = 0.05 * self.target_step_ms
-        ratio = max(self.target_step_ms - fixed_ms, floor_ms) / max(
+        # target that spends the rest of the period target. A fixed cost the
+        # fit reports near or above the period it was fitted from would zero
+        # what is left of it and invert the solve, so it is bounded by both.
+        fixed_ms = min(self.fixed_ms, self._step_ms / 2, period_target / 2)
+        floor_ms = 0.05 * period_target
+        ratio = max(period_target - fixed_ms, floor_ms) / max(
             self._step_ms - fixed_ms, floor_ms
         )
         if abs(ratio - 1) <= self.deadband:
@@ -296,12 +318,13 @@ class PrefillTarget:
         if new != target:
             logger.info(
                 "Prefill target %d -> %d tokens (step %.1f ms of %.1f ms, "
-                "%d informing steps)",
+                "%d informing steps, %d decode tokens)",
                 target,
                 new,
                 self._step_ms,
-                self.target_step_ms,
+                period_target,
                 len(periods),
+                int(decodes),
             )
         self._target = new
         return new

@@ -449,6 +449,7 @@ class Scheduler(SchedulerInterface):
                 self.scheduler_config.max_num_batched_tokens,
                 compilation_config.prefill_cudagraph_capture_token_sizes,
                 self.prefill_cost_model.fixed_ms,
+                envs.VLLM_PREFILL_TARGET_DECODE_MS,
             )
             # Every rank moves its own target from its own steps, which the
             # lockstep gives it; the merged steps of a cost fit round re-agree
@@ -456,10 +457,16 @@ class Scheduler(SchedulerInterface):
             self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
             logger.info(
                 "Prefill chunks fill each step to a shared token target "
-                "(now %d, at most %d) that follows a %s ms step period",
+                "(now %d, at most %d) that follows a %s ms step period%s",
                 self.prefill_target.tokens,
                 self.prefill_target.ceiling,
                 self.prefill_cost_model.budget_ms,
+                (
+                    f", {envs.VLLM_PREFILL_TARGET_DECODE_MS:g} ms while steps "
+                    "carry decodes"
+                    if envs.VLLM_PREFILL_TARGET_DECODE_MS > 0
+                    else ""
+                ),
             )
         # Online fit of the cost model; the DP engine core drives its exchange.
         self.cost_fit: StepCostFitter | None = None

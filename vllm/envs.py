@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     VLLM_PREFILL_COST_FIT: bool = False
     VLLM_PREFILL_COST_FIT_INTERVAL: int = 64
     VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
+    VLLM_PREFILL_TARGET_DECODE_MS: float = 0.0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1396,11 +1397,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PREFILL_TARGET_INIT_TOKENS", "0")
     ),
     # How often a background thread moves the target toward the budget, in
-    # milliseconds. The scheduler only reads the current value. Not used with
-    # VLLM_PREFILL_COST_FIT, which moves the target from the steps of the whole
-    # DP group.
+    # milliseconds. The scheduler only reads the current value; the cost fit
+    # round moves the target from the merged steps of the DP group as well.
     "VLLM_PREFILL_TARGET_UPDATE_MS": lambda: float(
         os.getenv("VLLM_PREFILL_TARGET_UPDATE_MS", "200")
+    ),
+    # With VLLM_PREFILL_FILL_TARGET: the step period the target steers toward
+    # while the recent steps carry decode tokens, so a long prefill is split
+    # into steps that leave the decodes waiting for this period rather than the
+    # whole budget. With no decodes in the recent steps it steers toward the
+    # budget again, where a bigger chunk costs nothing else. 0 (default) uses
+    # the budget in both cases.
+    "VLLM_PREFILL_TARGET_DECODE_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_TARGET_DECODE_MS", "0")
     ),
     # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
     # (the VLLM_PREFILL_COST_* values are then the starting point, and the fit

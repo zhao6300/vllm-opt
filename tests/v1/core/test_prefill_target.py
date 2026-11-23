@@ -28,6 +28,16 @@ def feed(
     return clock
 
 
+def feed_prefill_only(
+    target: PrefillTarget, period_s: float, count: int, clock: float = 0.0
+) -> float:
+    """Record `count` prefill-only steps that each took `period_s`."""
+    for _ in range(count):
+        clock += period_s
+        target.record_output(clock, target.tokens, prefill_tokens=target.tokens)
+    return clock
+
+
 def test_chunk_fills_the_step_to_the_target():
     target = make_target(4096)
     assert target.max_prefill_tokens(384, min_chunk_tokens=256, align=64) == 3712
@@ -79,6 +89,26 @@ def test_a_fitted_fixed_cost_beyond_the_period_cannot_invert_the_solve():
     feed(target, 0.1745, 6)
     # fixed 87.25: (250 - 87.25) / (174.5 - 87.25) = 1.865 -> 3820 -> 3840.
     assert target.update() == 3840
+
+
+def test_steps_that_carry_decodes_steer_to_the_decode_period():
+    """A step with decodes makes them wait for it, so while the recent steps
+    carry decodes the target fills the shorter period, not the whole budget."""
+    target = PrefillTarget(BUDGET_MS, 2048, MIN_TOKENS, MAX_TOKENS, decode_step_ms=200)
+    feed(target, 0.1, 6)
+    assert target.update() == 4096  # 200 ms buys twice the tokens of 100
+
+
+def test_decode_free_steps_use_the_whole_budget():
+    target = PrefillTarget(BUDGET_MS, 2048, MIN_TOKENS, MAX_TOKENS, decode_step_ms=200)
+    feed_prefill_only(target, 0.1, 6)
+    assert target.update() == MAX_TOKENS  # 600 ms buys six times as many
+
+
+def test_one_period_serves_steps_with_and_without_decodes():
+    target = make_target(2048, decode_step_ms=0)
+    feed_prefill_only(target, 0.3, 6)
+    assert target.update() == 4096  # 600 ms of 300 ms steps
 
 
 def test_target_stays_within_its_bounds():
@@ -226,6 +256,7 @@ def test_background_thread_moves_the_target():
         {"max_factor": 1.0},
         {"fixed_ms": -1.0},
         {"deadband": 1.0},
+        {"decode_step_ms": -1.0},
     ],
 )
 def test_invalid_settings_are_rejected(kwargs):

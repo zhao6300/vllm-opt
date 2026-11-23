@@ -936,6 +936,27 @@ target 1500：8k = 6 块 -> ~740；      16k = 11 块 -> ~1330
 
 **顺带修的鲁棒性**：真实流量下拟合会给出 `fixed 131–176 ms`（01:31、01:32 两轮），而 target 2048 的实测步长只有 174.5 ms。budget 降到 250 时 `period - fixed` 会被压到 5% 下限，比值 ×5.9，一步又跳到 8192。求解现在用 `fixed = min(fit, period/2, budget/2)`，有单测覆盖。
 
+#### 5.7.7 按负载选两种步长：没有 decode 时全速 prefill，有 decode 时压低步长
+
+设计的本意是平衡 prefill 与 decode，但 §5.7.6 说明了单一 budget 做不到：target 就是「一步多久」，而这个「多久」对两种负载的意义相反——
+
+- **没有 decode**：一步里只有 prefill，步长只由吞吐决定，越大越省每块固定成本（~20–40 ms/块，拟合高估到 130–176 ms 时更明显）。
+- **有 decode**：同 rank 的 decode 要等整步结束，步长直接就是 ITL 尖峰。
+
+所以 `PrefillTarget` 现在有两个周期：`target_step_ms`（= budget，decode-free 时用）和 `decode_step_ms`（`VLLM_PREFILL_TARGET_DECODE_MS`，默认 0 = 关）。每次更新用窗口内所有步的 decode 数中位数判模式：中位数 > 0 就解到 `decode_step_ms`，否则解到 budget。判据只看最近的记录步，不引入额外状态；切换由 200 ms 的线程在一次更新内完成（±4× 上限），拟合轮再把这批样本合并给全组对齐。
+
+两个周期都走同一条一次求解公式，所以不动点分别是「decode 步 250 ms」和「无 decode 步 700 ms」。代价是切换时的一步：target 还停在 6144 时来了 decode，那一块仍按 6144 切（~900 ms），下一次更新就缩到 ~1500。
+
+A/B 计划（需重启）：
+
+```text
+A: VLLM_PREFILL_STEP_BUDGET_MS=700                       （现状，已测：见 §5.7.6）
+B: VLLM_PREFILL_STEP_BUDGET_MS=700 VLLM_PREFILL_TARGET_DECODE_MS=250
+C: 同上但 150（若 B 的 ITL 仍然偏高）
+```
+
+测同一组：冷 TTFT 1k/8k/16k（孤立）+ 4 路 decode 伴 1 个 16k prefill 的 engine 侧 ITL 直方图（`/tmp/probe_itl_hist.py`）+ 纯 prefill 突发时的 TTFT（验证「没有 decode 时全速」还在）。
+
 ## 6. 索引器微基准（不是瓶颈）
 
 单层耗时（µs），1 请求 × 6 行，背景有空闲 dummy 循环争用：
