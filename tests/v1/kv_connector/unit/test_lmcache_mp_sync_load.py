@@ -61,11 +61,12 @@ def test_split_skips_stores_and_empty_loads():
     assert deferred == []
 
 
-def _connector(max_tokens: int) -> LMCacheMPConnector:
+def _connector(max_tokens: int, multi_group: bool = False) -> LMCacheMPConnector:
     connector = object.__new__(LMCacheMPConnector)
     connector.sync_load_max_tokens = max_tokens
     connector.sync_load_timeout_s = 60.0
     connector.request_trackers = {}
+    connector._report_request_errors = multi_group
     return connector
 
 
@@ -118,6 +119,21 @@ def test_pending_lookup_and_misses_pass_through(monkeypatch):
     assert _connector(128).get_num_new_matched_tokens(None, 0) == (0, False)
 
 
+class _Health:
+    def __init__(self, healthy: bool) -> None:
+        self.is_healthy = healthy
+
+
+def test_unhealthy_server_keeps_the_load_asynchronous(monkeypatch):
+    # A same-step load has no recovery path, so it must not be admitted while
+    # the server behind the lookup is down.
+    _stub_match(monkeypatch, 127, True)
+    connector = _connector(128)
+    connector.scheduler_adapter = _Health(healthy=False)
+
+    assert connector.get_num_new_matched_tokens(None, 16256) == (127, True)
+
+
 def test_lookup_records_its_decision_on_the_tracker(monkeypatch):
     connector, request, tracker = _tracked_connector(128)
 
@@ -146,13 +162,16 @@ def test_retrieve_metadata_carries_the_decision(monkeypatch):
 
 
 class _Future:
-    def __init__(self, ok: bool) -> None:
-        self.ok = ok
+    def __init__(self, error: Exception | None = None, result=None) -> None:
+        self.error = error
+        self.result = result
         self.waited = False
 
     def wait_on_stream(self, stream, timeout):
         self.waited = True
-        return self.ok
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 class _Adapter:
@@ -164,9 +183,9 @@ class _Adapter:
         self._dropped_retrieves = set()
 
 
-def _wait(monkeypatch, futures):
+def _wait(monkeypatch, futures, multi_group: bool = False):
     monkeypatch.setattr(lmcache_mp_sync_load, "current_stream", lambda: None)
-    connector = _connector(128)
+    connector = _connector(128, multi_group)
     connector.worker_adapter = _Adapter(futures)
     meta = _meta("tail", 16256, 16383)
     connector._wait_for_retrieves([meta])
@@ -174,7 +193,7 @@ def _wait(monkeypatch, futures):
 
 
 def test_wait_consumes_the_future_and_reports_success(monkeypatch):
-    future = _Future(ok=True)
+    future = _Future(result=True)
     adapter, _ = _wait(monkeypatch, {"tail": (future, [7])})
 
     assert future.waited
@@ -183,8 +202,19 @@ def test_wait_consumes_the_future_and_reports_success(monkeypatch):
     assert adapter._failed_request_ids == set()
 
 
+def test_false_server_result_reports_the_blocks_as_invalid(monkeypatch):
+    # The server answers normally when it could not read every key; the
+    # result flag, not the absence of an exception, is the success signal.
+    adapter, meta = _wait(monkeypatch, {"tail": (_Future(result=False), [7, 8])})
+
+    assert adapter.error_block_ids == {7, 8}
+    assert adapter._failed_request_ids == {meta.request_id}
+
+
 def test_failed_copy_reports_the_blocks_as_invalid(monkeypatch):
-    adapter, meta = _wait(monkeypatch, {"tail": (_Future(ok=False), [7, 8])})
+    adapter, meta = _wait(
+        monkeypatch, {"tail": (_Future(error=TimeoutError("no response")), [7, 8])}
+    )
 
     assert adapter.error_block_ids == {7, 8}
     assert adapter._failed_request_ids == {meta.request_id}
@@ -195,6 +225,23 @@ def test_missing_future_reports_the_blocks_as_invalid(monkeypatch):
 
     assert adapter.error_block_ids == {7}
     assert meta.request_id in adapter._failed_request_ids
+
+
+def test_failed_copy_raises_when_blocks_cannot_be_reported(monkeypatch):
+    # Multi-group layouts refuse flat block ids and cannot reschedule a running
+    # request, so the only correct outcome is to stop before the forward pass
+    # reads blocks that never loaded.
+    with pytest.raises(RuntimeError, match="multiple KV cache groups"):
+        _wait(
+            monkeypatch,
+            {"tail": (_Future(error=TimeoutError("no response")), [7, 8])},
+            multi_group=True,
+        )
+
+
+def test_missing_future_raises_when_blocks_cannot_be_reported(monkeypatch):
+    with pytest.raises(RuntimeError, match="server connection was lost"):
+        _wait(monkeypatch, {}, multi_group=True)
 
 
 def test_unscheduled_report_is_cleared_for_same_step_loads(monkeypatch):
