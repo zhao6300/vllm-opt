@@ -301,6 +301,19 @@ def test_unsupported_media_is_a_request_error():
         render([{"role": "user", "content": [{"type": "input_audio"}]}])
 
 
+@pytest.mark.parametrize(
+    "part",
+    [
+        {"type": "file", "file": {"filename": "spec.pdf", "file_data": "data:,"}},
+        {"type": "input_file", "filename": "spec.pdf", "file_data": "data:,"},
+    ],
+)
+def test_file_parts_are_replaced_with_a_note(part):
+    prompt = render([{"role": "user", "content": [part]}], thinking=False)
+    assert "spec.pdf" in prompt
+    assert "无法被服务器解析" in prompt
+
+
 def test_tool_references_render_as_tool_names():
     messages = [
         {"role": "assistant", "tool_calls": [tool_call("tool_search")]},

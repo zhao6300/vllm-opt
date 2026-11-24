@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from .chat_message import (
+    UNSUPPORTED_CONTENT_PART_TYPES,
+    attachment_filename,
     has_non_text_content,
     parse_chat_message_content,
     parse_chat_message_content_parts,
     parse_chat_messages,
     parse_chat_messages_async,
+    unsupported_attachment_note,
 )
 from .chat_template import (
     ChatTemplateConfig,
@@ -38,5 +41,8 @@ __all__ = [
     "parse_chat_message_content_parts",
     "parse_chat_messages",
     "parse_chat_messages_async",
+    "UNSUPPORTED_CONTENT_PART_TYPES",
+    "attachment_filename",
+    "unsupported_attachment_note",
     "PROMPT_EMBEDS_PLACEHOLDER_TOKEN",
 ]

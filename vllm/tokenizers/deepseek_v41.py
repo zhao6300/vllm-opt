@@ -7,7 +7,12 @@ from typing import Any
 
 from transformers import TokenizersBackend
 
-from vllm.renderers.chat_utils import ChatCompletionMessageParam
+from vllm.renderers.chat_utils import (
+    UNSUPPORTED_CONTENT_PART_TYPES,
+    ChatCompletionMessageParam,
+    attachment_filename,
+    unsupported_attachment_note,
+)
 
 from .deepseek_v41_encoding import (
     IMAGE_PLACEHOLDER,
@@ -78,6 +83,10 @@ def _normalize_messages(
                 elif part_type == "tool_reference":
                     parts.append(_replace_image_placeholder(block.get("name", "")))
                     tool_references.append(block.get("name", ""))
+                elif part_type in UNSUPPORTED_CONTENT_PART_TYPES:
+                    parts.append(
+                        unsupported_attachment_note(attachment_filename(block))
+                    )
                 else:
                     raise ValueError(
                         "DeepSeek V4.1 supports text and image content only; "

@@ -68,6 +68,7 @@ class AnthropicContentBlock(BaseModel):
     type: Literal[
         "text",
         "image",
+        "document",
         "tool_use",
         "tool_result",
         "tool_reference",

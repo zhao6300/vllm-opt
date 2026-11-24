@@ -194,6 +194,71 @@ class TestImageContentBlocks:
 
 
 # ======================================================================
+# Document blocks (no parser; substituted with a text note)
+# ======================================================================
+
+
+class TestDocumentContentBlocks:
+    def test_document_block_in_user_message(self):
+        request = _make_request(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Summarize this PDF"},
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": "JVBERi0=",
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+
+        result = _convert(request)
+        parts = result.messages[0]["content"]
+        assert parts[0] == {"type": "text", "text": "Summarize this PDF"}
+        assert parts[1]["type"] == "text"
+        assert "无法被服务器解析" in parts[1]["text"]
+
+    def test_document_block_in_tool_result(self):
+        request = _make_request(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "call_1",
+                            "content": [
+                                {"type": "text", "text": "report attached"},
+                                {
+                                    "type": "document",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "application/pdf",
+                                        "data": "JVBERi0=",
+                                    },
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ]
+        )
+
+        result = _convert(request)
+        tool_msg = result.messages[0]
+        assert tool_msg["role"] == "tool"
+        assert "report attached" in tool_msg["content"]
+        assert "无法被服务器解析" in tool_msg["content"]
+
+
+# ======================================================================
 # vllm_xargs pass-through
 # ======================================================================
 

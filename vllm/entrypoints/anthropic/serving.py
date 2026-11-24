@@ -57,7 +57,10 @@ from vllm.entrypoints.serve.utils.request_logger import RequestLogger
 from vllm.exceptions import VLLMValidationError
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
-from vllm.renderers.chat_utils import ChatTemplateContentFormatOption
+from vllm.renderers.chat_utils import (
+    ChatTemplateContentFormatOption,
+    unsupported_attachment_note,
+)
 from vllm.renderers.chat_utils.types import ConversationMessage
 from vllm.renderers.hf import HfRenderer, resolve_chat_template
 from vllm.renderers.inputs.preprocess import (
@@ -611,6 +614,12 @@ class AnthropicServingMessages(OpenAIServingChat):
         elif block.type == "image" and block.source:
             image_url = cls._convert_image_source_to_url(block.source)
             content_parts.append({"type": "image_url", "image_url": {"url": image_url}})
+        elif block.type == "document":
+            # vLLM has no document parser (PDF/text files); substitute a note
+            # so the model can tell the user the attachment was not read.
+            content_parts.append(
+                {"type": "text", "text": unsupported_attachment_note()}
+            )
         elif block.type == "thinking" and block.thinking is not None:
             reasoning_parts.append(block.thinking)
         elif block.type == "redacted_thinking":
@@ -688,6 +697,8 @@ class AnthropicServingMessages(OpenAIServingChat):
                         tool_reference.append(
                             {"type": "tool_reference", "name": ref_name}
                         )
+                elif item_type == "document":
+                    text_parts.append(unsupported_attachment_note())
             tool_text = "\n".join(text_parts)
 
         tool_content: str | list[dict[str, Any]] = tool_text or ""

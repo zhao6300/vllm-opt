@@ -338,6 +338,11 @@ PART_TYPES_TO_SKIP_NONE_CONTENT = (
     "refusal",
 )
 
+# OpenAI content part types (chat and Responses) that vLLM can parse neither
+# as text nor as multimodal data. Each is replaced by a short text note so the
+# model knows the attachment was not read, and the conversation keeps working.
+UNSUPPORTED_CONTENT_PART_TYPES = frozenset({"file", "input_file"})
+
 # Content part types parsed as text rather than multimodal data.
 TEXT_PART_TYPES = frozenset(
     {"text", "input_text", "output_text", "refusal", "thinking"}
@@ -440,6 +445,33 @@ def _reject_reserved_placeholder_in_text(text: str, model_config: ModelConfig) -
         )
 
 
+def attachment_filename(part: dict[str, Any]) -> str | None:
+    # Chat `file` parts nest metadata under "file"; Responses `input_file`
+    # parts carry "filename" at the top level.
+    filename = part.get("filename")
+    if isinstance(filename, str):
+        return filename
+    file_obj = part.get("file")
+    if isinstance(file_obj, dict):
+        filename = file_obj.get("filename")
+        if isinstance(filename, str):
+            return filename
+    return None
+
+
+def unsupported_attachment_note(filename: str | None = None) -> str:
+    """Text substituted for an attachment the server cannot parse.
+
+    It tells the assistant what happened so it can inform the user instead of
+    answering as if the attachment had been read.
+    """
+    name = f"（{filename}）" if filename else ""
+    return (
+        f"[附件{name}无法被服务器解析，内容未包含在本次对话中。"
+        "请告知用户该附件未被读取，并请用户粘贴文本内容或改发图片。]"
+    )
+
+
 def parse_chat_message_content_part(
     part: ChatCompletionContentPartParam,
     mm_parser: BaseMultiModalContentParser,
@@ -462,6 +494,18 @@ def parse_chat_message_content_part(
         return part
     # Handle structured dictionary parts
     part_type, content = parse_chat_message_content_mm_part(part)
+    if part_type in UNSUPPORTED_CONTENT_PART_TYPES:
+        filename = attachment_filename(part)
+        # `warning_once` keeps a replayed conversation from logging the same
+        # substituted part on every turn.
+        logger.warning_once(
+            "Unsupported chat content part of type %r%s is replaced with a "
+            "text note; vLLM cannot parse this content.",
+            part_type,
+            f" (filename: {filename!r})" if filename else "",
+        )
+        note = unsupported_attachment_note(filename)
+        return {"type": "text", "text": note} if wrap_dicts else note
     # if part_type is text/refusal/image_url/audio_url/video_url/input_audio but
     # content is None, log a warning and skip
     if part_type in PART_TYPES_TO_SKIP_NONE_CONTENT and content is None:
