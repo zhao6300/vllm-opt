@@ -1742,3 +1742,20 @@ def test_short_context_topk_fast_path_only_without_captured_prefill(
             compilation_config=SimpleNamespace(cudagraph_mode=mode)
         )
         assert indexer._short_context_topk_is_uncaptured() is expected
+
+
+def test_padded_decode_rows_leave_the_prefill_rows_alone() -> None:
+    """A mixed step's padded native decode has more rows than decode tokens;
+    the rows past them belong to the step's prefills, written first, so the
+    flat <-> padded mapping must only ever touch `[0, num_decode_tokens)`."""
+    decode_lens = torch.tensor([2, 1, 1], dtype=torch.int32)
+    rows = sparse_indexer._PaddedDecodeRows(decode_lens, 4, width=2)
+    flat = torch.arange(10, dtype=torch.int32).view(5, 2)  # 4 decode + 1 prefill
+
+    padded = rows.pack(flat)
+    assert padded.tolist() == [[0, 1], [2, 3], [4, 5], [-1, -1], [6, 7], [-1, -1]]
+
+    out = torch.full_like(flat, 99)
+    rows.unpack_into(padded, out)
+    assert out[:4].tolist() == flat[:4].tolist()
+    assert out[4].tolist() == [99, 99]
