@@ -844,6 +844,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_ffn_boundary_weight,
         )
+        _debug_dump_tf_rows(self.attn, x, positions, "ffnin")
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)

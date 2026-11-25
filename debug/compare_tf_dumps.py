@@ -16,7 +16,7 @@ import re
 import torch
 
 DUMP = re.compile(
-    r"^(?P<tag>attn|ffn)__(?P<layer>.+?)__r(?P<rank>\d+)"
+    r"^(?P<tag>attn|ffn|ffnin)__(?P<layer>.+?)__r(?P<rank>\d+)"
     r"__dev(?P<dev>\d+)__start(?P<start>\d+)__rows(?P<rows>\d+)\.pt$"
 )
 

@@ -9,6 +9,8 @@ TF stream can be found.
 
 - `vllm/models/deepseek_v41/nvidia/model.py`
   - after attention (after the SP reduce-scatter) dumps `x` as `attn__<layer>`;
+  - before the FFN/MoE (after the mHC post/pre merge) dumps `x` as
+    `ffnin__<layer>`;
   - after the FFN/MoE dumps `x` (tensor only) as `ffn__<layer>`.
   - Rows dumped: `[num_decode_tokens, num_decode_tokens + num_prefill_tokens)`
     (the TF request's rows). The file name carries the TP rank, the CUDA
