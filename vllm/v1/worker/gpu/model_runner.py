@@ -127,6 +127,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
+from vllm.v1.worker.gpu.debug_step_dump import dump_inputs, dump_outputs
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -2213,6 +2214,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.model_config, input_batch.num_tokens, ubatch_slices
         )
 
+        dump_inputs(input_batch, batch_desc, model_inputs, dummy_run)
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
@@ -2271,6 +2273,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        dump_outputs(input_batch, batch_desc, model_output, dummy_run)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
