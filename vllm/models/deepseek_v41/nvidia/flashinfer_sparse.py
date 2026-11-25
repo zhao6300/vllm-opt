@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -78,12 +78,12 @@ _sparse_mla_sm120_wrappers: dict[tuple[torch.device, bool, str], object] = {}
 class _Sm120CallerBuffers:
     """Caller-owned scratch the wrapper must not free.
 
-    ``prepare`` drops the previous plan, and any tensors it owns, whenever a
+    `prepare` drops the previous plan, and any tensors it owns, whenever a
     calibration update changes the resolved plan. A captured graph keeps the
     addresses it baked, so the caller has to hold the scratch for the life of
     the process. All layers share one bundle and use it sequentially on one
     stream. The plan object itself is a host-side descriptor (the C++
-    ``ExecutionPlan`` is plain data), so replacing it frees no device memory.
+    `ExecutionPlan` is plain data), so replacing it frees no device memory.
     """
 
     lse: torch.Tensor
@@ -91,6 +91,11 @@ class _Sm120CallerBuffers:
     mlse: torch.Tensor | None
     stream: torch.cuda.Stream | None = None
     in_use: bool = False
+    # Set by the first attention call; the buffers are frozen from then on.
+    used: bool = False
+    # (topk, extra_topk, kv_scale_format, extra_fp4) of every layer sharing
+    # the bundle: the target and the DSpark drafter resolve different widths.
+    bounds: set[tuple[int, int, str, bool]] = field(default_factory=set)
 
 
 _sparse_mla_sm120_caller_buffers: dict[
@@ -109,9 +114,9 @@ def _sm120_scratch_slots(
     """Upper bound on decode-plan scratch slots and its rounded head count.
 
     Decode plans are the only ones that carve scratch. The FP8 split-K plan
-    sizes ``tokens * decode_scratch_heads(heads) * chunk_capacity`` with a
+    sizes `tokens * decode_scratch_heads(heads) * chunk_capacity` with a
     64-candidate chunk; the compiled resolver's split-K variant tiles at 32 and
-    is selected only while ``2 * tokens * ceil(heads / 32) < SMs``. Its 8-head
+    is selected only while `2 * tokens * ceil(heads / 32) < SMs`. Its 8-head
     CTA is selected at every token count, with the split count capped by the
     wave budget. Taking the maximum covers both.
     """
@@ -153,7 +158,7 @@ def _validate_sm120_caller_buffers(
     stored profiles, the no-profile fallback, and a forced split-K route,
     then compare the worst workspace with the caller buffers. This turns a
     sizing mistake into a startup failure instead of a mid-serving
-    ``prefix_scratch`` error.
+    `prefix_scratch` error.
     """
     from flashinfer.mla._sparse_mla_sm120 import _execution as fi_exec
     from flashinfer.mla._sparse_mla_sm120 import _policy as fi_policy
@@ -291,61 +296,75 @@ def _sm120_caller_buffers_for_layer(
     extra_fp4: bool,
     scratch: bool,
 ) -> _Sm120CallerBuffers:
+    """The process-wide caller buffers of every layer with `padded_heads` heads.
+
+    Layers built with different bounds share one bundle: the DSpark drafter's
+    non-causal SWA index row is wider than the target's. The bundle grows to
+    the largest bound while the model is being built, which is before any
+    attention call or graph capture, and is frozen once a call has used it.
+    """
     key = (device, padded_heads, scratch)
-    cached = _sparse_mla_sm120_caller_buffers.get(key)
-    if cached is not None:
-        if cached.lse.shape[0] < max_tokens:
-            raise RuntimeError(
-                "the SM120 caller LSE buffer was allocated for fewer tokens; "
-                "every caller must size it with the same token bound"
-            )
-        if scratch:
-            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-            slots, _ = _sm120_scratch_slots(
-                padded_heads=padded_heads,
-                max_tokens=max_tokens,
-                topk=topk,
-                extra_topk=extra_topk,
-                sm_count=sm_count,
-            )
-            if (
-                cached.mid is None
-                or cached.mid.numel() < slots * _FLASHINFER_DSV4_VALUE_DIM
-                or cached.mlse is None
-                or cached.mlse.numel() < slots
-            ):
-                raise RuntimeError(
-                    "the SM120 caller scratch was allocated for a smaller "
-                    "plan; every caller must size it with the same bounds"
-                )
-        return cached
-    lse = torch.empty((max_tokens, padded_heads), dtype=torch.float32, device=device)
-    buffers = _Sm120CallerBuffers(lse, None, None)
+    buffers = _sparse_mla_sm120_caller_buffers.get(key)
+    bound = (topk, extra_topk, kv_scale_format, extra_fp4)
+    if buffers is None:
+        buffers = _Sm120CallerBuffers(
+            torch.empty((0, padded_heads), dtype=torch.float32, device=device),
+            None,
+            None,
+        )
+        _sparse_mla_sm120_caller_buffers[key] = buffers
+    elif bound in buffers.bounds and buffers.lse.shape[0] >= max_tokens:
+        return buffers
+
+    lse_rows = max(buffers.lse.shape[0], max_tokens)
+    slots = 0
     if scratch:
         sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-        slots, _ = _sm120_scratch_slots(
-            padded_heads=padded_heads,
-            max_tokens=max_tokens,
-            topk=topk,
-            extra_topk=extra_topk,
-            sm_count=sm_count,
+        slots = max(
+            _sm120_scratch_slots(
+                padded_heads=padded_heads,
+                max_tokens=lse_rows,
+                topk=b_topk,
+                extra_topk=b_extra_topk,
+                sm_count=sm_count,
+            )[0]
+            for b_topk, b_extra_topk, _, _ in buffers.bounds | {bound}
         )
-        buffers.mid = torch.empty(
-            slots * _FLASHINFER_DSV4_VALUE_DIM,
-            dtype=torch.bfloat16,
-            device=device,
+    grow = buffers.lse.shape[0] < lse_rows or (
+        scratch and (buffers.mlse is None or buffers.mlse.numel() < slots)
+    )
+    if grow:
+        if buffers.used or (
+            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "the SM120 caller scratch must grow after it was used; build "
+                "every layer that shares it before the first attention call"
+            )
+        # Layers hold the bundle, not its tensors, so replacing them here
+        # reaches every layer built earlier.
+        buffers.lse = torch.empty(
+            (lse_rows, padded_heads), dtype=torch.float32, device=device
         )
-        buffers.mlse = torch.empty(slots, dtype=torch.float32, device=device)
-        _validate_sm120_caller_buffers(
-            buffers,
-            device=device,
-            padded_heads=padded_heads,
-            topk=topk,
-            extra_topk=extra_topk,
-            kv_scale_format=kv_scale_format,
-            extra_fp4=extra_fp4,
-        )
-    _sparse_mla_sm120_caller_buffers[key] = buffers
+        if scratch:
+            buffers.mid = torch.empty(
+                slots * _FLASHINFER_DSV4_VALUE_DIM,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            buffers.mlse = torch.empty(slots, dtype=torch.float32, device=device)
+    buffers.bounds.add(bound)
+    if scratch:
+        for b_topk, b_extra_topk, b_format, b_extra_fp4 in sorted(buffers.bounds):
+            _validate_sm120_caller_buffers(
+                buffers,
+                device=device,
+                padded_heads=padded_heads,
+                topk=b_topk,
+                extra_topk=b_extra_topk,
+                kv_scale_format=b_format,
+                extra_fp4=b_extra_fp4,
+            )
     return buffers
 
 
@@ -390,6 +409,7 @@ def _sparse_mla_sm120_paged_attention(
                 "call it sequentially."
             )
         caller.in_use = True
+        caller.used = True
     try:
         if (
             caller is not None

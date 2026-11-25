@@ -1382,6 +1382,78 @@ def test_sm120_scratch_slots_cover_rounded_heads_and_splitk(
     assert slots == expect_slots
 
 
+def _caller_buffers_for(topk: int, extra_topk: int, max_tokens: int = 64):
+    return nvidia.flashinfer_sparse._sm120_caller_buffers_for_layer(
+        device=torch.device("cpu"),
+        padded_heads=32,
+        max_tokens=max_tokens,
+        topk=topk,
+        extra_topk=extra_topk,
+        kv_scale_format=_INLINE,
+        extra_fp4=True,
+        scratch=True,
+    )
+
+
+def test_sm120_caller_scratch_grows_for_a_wider_drafter(monkeypatch) -> None:
+    """The DSpark drafter's non-causal SWA row is wider than the target's.
+
+    Its layers are built after the target's and share the target's bundle,
+    which has to grow for them instead of failing model construction.
+    """
+    flashinfer_sparse = nvidia.flashinfer_sparse
+    flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+    validated: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        flashinfer_sparse,
+        "_validate_sm120_caller_buffers",
+        lambda buffers, *, topk, extra_topk, **_: validated.append((topk, extra_topk)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=110),
+    )
+    try:
+        target = _caller_buffers_for(topk=128, extra_topk=512)
+        target_slots = target.mlse.numel()
+        assert _caller_buffers_for(topk=128, extra_topk=512) is target
+
+        drafter = _caller_buffers_for(topk=192, extra_topk=512)
+
+        wider, _ = _sm120_scratch_slots(
+            padded_heads=32, max_tokens=64, topk=192, extra_topk=512, sm_count=110
+        )
+        assert drafter is target
+        assert target_slots < wider == target.mlse.numel()
+        assert target.mid.numel() == target.mlse.numel() * 512
+        # Every layer's bound is re-checked against the grown buffers.
+        assert (128, 512) in validated[-2:] and (192, 512) in validated[-2:]
+    finally:
+        flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+
+
+def test_sm120_caller_scratch_refuses_to_grow_after_use(monkeypatch) -> None:
+    """A graph may already hold the buffers once a call has used them."""
+    flashinfer_sparse = nvidia.flashinfer_sparse
+    flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+    monkeypatch.setattr(
+        flashinfer_sparse, "_validate_sm120_caller_buffers", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=188),
+    )
+    try:
+        buffers = _caller_buffers_for(topk=128, extra_topk=512)
+        buffers.used = True
+        with pytest.raises(RuntimeError, match="must grow after it was used"):
+            _caller_buffers_for(topk=128, extra_topk=512, max_tokens=128)
+    finally:
+        flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_sm120_caller_scratch_drains_on_stream_switch(monkeypatch) -> None:
     _install_sm120_wrapper(monkeypatch)
