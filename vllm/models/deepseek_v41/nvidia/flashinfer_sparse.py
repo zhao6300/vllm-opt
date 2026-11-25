@@ -71,6 +71,7 @@ def _debug_phase_dir(root: str) -> str:
     os.makedirs(path, exist_ok=True)
     return path
 
+
 # FlashInfer resolves its decode plan -- the only plan that carves scratch out
 # of the caller-owned workspace -- for at most this many rows; wider batches
 # resolve to a prefill plan whose scratch is allocated by the caller.
@@ -412,38 +413,59 @@ def _debug_attn_dump(
         return
     if ".layers.0." not in layer_prefix:
         return
+    # Device-to-host copies and file writes are invalid while capturing.
+    if torch.cuda.is_current_stream_capturing():
+        return
     try:
         with open(os.path.join(root, "phase")) as f:
-            phase = f.read().strip() or "default"
+            phase = f.read().strip() or "off"
     except OSError:
-        phase = "default"
+        phase = "off"
+    if phase == "off":
+        return
+    try:
+        torch.cuda.current_stream().synchronize()
+    except RuntimeError as error:
+        raise RuntimeError(
+            f"{layer_prefix} {tag}: the sparse MLA kernel faulted before the "
+            "attention dump read its inputs"
+        ) from error
     out_dir = os.path.join(root, phase)
     os.makedirs(out_dir, exist_ok=True)
     dev = torch.cuda.current_device()
     call = _debug_attn_calls.get((tag, dev), 0)
     _debug_attn_calls[(tag, dev)] = call + 1
 
-    flat = cache.view(torch.uint8).reshape(-1)
-    idx = indices.detach().reshape(-1)
-    uniq = torch.unique(idx[idx >= 0])
-    if uniq.numel():
-        if footer:
-            stride0 = cache.stride(0)
-            pages = uniq // block
-            rows = uniq % block
-            d512 = torch.arange(512, device=flat.device)
-            d16 = torch.arange(16, device=flat.device)
-            v = flat[(pages * stride0 + rows * 512)[:, None] + d512[None, :]]
-            s = flat[
-                (pages * stride0 + block * 512 + rows * 16)[:, None]
-                + d16[None, :]
-            ]
-            recs = torch.cat([v, s], dim=1)
-        else:
-            d528 = torch.arange(528, device=flat.device)
-            recs = flat[(uniq * 528)[:, None] + d528[None, :]]
+    # The cache is a strided view into the shared block allocation (padding
+    # rows, other layers' pages), so a record is addressed in its storage:
+    # flattening the view would compact it and shift every later page.
+    storage = torch.empty(0, dtype=torch.uint8, device=cache.device).set_(
+        cache.untyped_storage()
+    )
+    base = cache.storage_offset() * cache.element_size()
+    page_bytes = cache.stride(0) * cache.element_size()
+    page_rows = _paged_cache_page_rows(cache)
+    idx = indices.detach().reshape(-1).cpu()
+    uniq = torch.unique(idx[idx >= 0]).long()
+    if footer:
+        # Footer pages: `page_rows` 512-byte value rows, then 16-byte scales;
+        # the kernel's indices are paged slot ids.
+        pages, entries = uniq // page_rows, uniq % page_rows
+        starts = base + pages * page_bytes
+        value_off = starts + entries * 512
+        scale_off = starts + page_rows * 512 + entries * 16
     else:
-        recs = torch.empty((0, 528), dtype=torch.uint8, device=flat.device)
+        # Inline records: the kernel's indices are flat cache rows.
+        row_bytes = page_bytes // _packed_block_span(cache)
+        value_off = base + uniq * row_bytes
+        scale_off = value_off + 512
+    in_range = (value_off >= 0) & (scale_off + 16 <= storage.numel())
+    recs = torch.zeros((uniq.numel(), 528), dtype=torch.uint8)
+    if in_range.any():
+        d512, d16 = torch.arange(512), torch.arange(16)
+        v_idx = (value_off[in_range][:, None] + d512).to(storage.device)
+        s_idx = (scale_off[in_range][:, None] + d16).to(storage.device)
+        recs[in_range] = torch.cat([storage[v_idx], storage[s_idx]], 1).cpu()
     torch.save(
         {
             "tag": tag,
@@ -456,11 +478,12 @@ def _debug_attn_dump(
             "scale": float(scale),
             "output": output.detach().cpu(),
             "recs": recs.cpu(),
-            "uniq": uniq.cpu(),
+            "uniq": uniq,
+            "in_range": in_range,
             "footer": footer,
-            "block": int(block),
+            "block": int(page_rows),
             "cache_shape": tuple(cache.shape),
-            "cache_stride": cache.stride(0),
+            "cache_stride": tuple(cache.stride()),
         },
         os.path.join(
             out_dir, f"attn0__{tag}__dev{dev}__rows{q.shape[0]}__call{call}.pt"
@@ -562,9 +585,7 @@ def _sparse_mla_sm120_paged_attention(
             sm_scale,
             output,
             footer=kv_scale_format == "ue8m0_g32",
-            block=swa_kv_cache.shape[1]
-            if swa_kv_cache.dim() > 1
-            else 1,
+            block=swa_kv_cache.shape[1] if swa_kv_cache.dim() > 1 else 1,
         )
 
 
@@ -616,9 +637,7 @@ def _cake_dsv41_sm120_paged_attention(
             sm_scale,
             output,
             footer=True,
-            block=swa_kv_cache.shape[1]
-            if swa_kv_cache.dim() > 1
-            else 1,
+            block=swa_kv_cache.shape[1] if swa_kv_cache.dim() > 1 else 1,
         )
 
 
@@ -1493,8 +1512,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 ]
                 changed = (prefill_before - prefill_after).abs().max().item()
                 print(
-                    f"[mixed] {self.prefix} decode changed prefill output: "
-                    f"{changed}",
+                    f"[mixed] {self.prefix} decode changed prefill output: {changed}",
                     flush=True,
                 )
                 root = os.environ.get("VLLM_DEBUG_TF_DIR")
