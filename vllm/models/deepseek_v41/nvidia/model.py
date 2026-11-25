@@ -392,16 +392,26 @@ def _debug_phase_dir(root: str) -> str:
 
 
 def _debug_dump_tf_rows(
-    attn: nn.Module, tensor: object, positions: torch.Tensor | None, tag: str
+    attn: nn.Module,
+    tensor: object,
+    positions: torch.Tensor | None,
+    tag: str,
+    input_ids: torch.Tensor | None = None,
 ) -> None:
     """Dump the TF request's rows of a layer stream for the mixed-batch bisect.
 
     Run with `VLLM_USE_BREAKABLE_CUDAGRAPH=0` and `FULL_DECODE_ONLY` so the
     mixed prefill+decode step is eager and this Python runs on every step.
     The TF request owns rows `[num_decode_tokens, +num_prefill_tokens)`.
+    With `VLLM_DEBUG_DECODE_DUMP` a decode-only step dumps its own rows too,
+    keyed by the step's first absolute position.
     """
     root = os.environ.get("VLLM_DEBUG_TF_DIR")
     if not root or not isinstance(tensor, torch.Tensor) or positions is None:
+        return
+    # This helper performs device-to-host copies and filesystem I/O. Neither
+    # is valid while CUDA is capturing a graph.
+    if torch.cuda.is_current_stream_capturing():
         return
     if not is_forward_context_available():
         return
@@ -409,21 +419,29 @@ def _debug_dump_tf_rows(
     if not isinstance(attn_metadata, dict):
         return
     swa = attn_metadata.get(attn.swa_cache_layer.prefix)
-    if swa is None or swa.num_prefill_tokens <= 0:
+    if swa is None:
         return
-    phase = _debug_phase(root)
-    if phase == "mixed" and swa.num_decode_tokens == 0:
-        return
-    if phase == "alone" and swa.num_decode_tokens > 0:
+    decode_rows = False
+    if swa.num_prefill_tokens > 0:
+        phase = _debug_phase(root)
+        if phase == "mixed" and swa.num_decode_tokens == 0:
+            return
+        if phase == "alone" and swa.num_decode_tokens > 0:
+            return
+        start = swa.num_decode_tokens
+        stop = start + swa.num_prefill_tokens
+    elif os.environ.get("VLLM_DEBUG_DECODE_DUMP") and swa.num_decode_tokens > 0:
+        decode_rows = True
+        start, stop = 0, int(swa.num_decode_tokens)
+    else:
         return
     layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
     if layers:
         wanted = [x.strip() for x in layers.split(",") if x.strip()]
         if wanted and not any(x in attn.prefix for x in wanted):
             return
-    start = swa.num_decode_tokens
-    stop = start + swa.num_prefill_tokens
     num_batch = positions.shape[0]
+    pos0 = int(positions[0])
     base = 0
     if tensor.shape[0] != num_batch:
         tp = get_tensor_model_parallel_world_size()
@@ -434,13 +452,30 @@ def _debug_dump_tf_rows(
         if stop <= start:
             return
     rows = tensor[start - base : stop - base]
-    path = os.path.join(
-        _debug_phase_dir(root),
-        f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
-        f"__dev{torch.cuda.current_device()}"
-        f"__start{start}__rows{stop - start}.pt",
-    )
-    torch.save(rows.detach().cpu(), path)
+    if decode_rows:
+        name = (
+            f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
+            f"__dev{torch.cuda.current_device()}"
+            f"__dec{swa.num_decode_tokens}__pos{pos0}__rows{stop - start}.pt"
+        )
+        if input_ids is not None and "layers.0." in attn.prefix:
+            ids_path = os.path.join(
+                _debug_phase_dir(root),
+                f"dec_ids__pos{pos0}__rows{num_batch}.pt",
+            )
+            if not os.path.exists(ids_path):
+                torch.save(
+                    {"input_ids": input_ids.detach().cpu(),
+                     "positions": positions.detach().cpu()},
+                    ids_path,
+                )
+    else:
+        name = (
+            f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
+            f"__dev{torch.cuda.current_device()}"
+            f"__start{start}__rows{stop - start}.pt"
+        )
+    torch.save(rows.detach().cpu(), os.path.join(_debug_phase_dir(root), name))
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -820,7 +855,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
             x = sp_reduce_scatter(x)
-        _debug_dump_tf_rows(self.attn, x, positions, "attn")
+        _debug_dump_tf_rows(self.attn, x, positions, "attn", input_ids)
 
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
@@ -844,7 +879,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             reduce_results=self.fuse_mhc_all_reduce,
             boundary_weight=self.hc_ffn_boundary_weight,
         )
-        _debug_dump_tf_rows(self.attn, x, positions, "ffnin")
+        _debug_dump_tf_rows(self.attn, x, positions, "ffnin", input_ids)
         if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
             # The next layer's first boundary finalizes it with the all-reduce.
             x = self.ffn.forward_unfinalized(x, input_ids)
@@ -852,7 +887,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
-        _debug_dump_tf_rows(self.attn, x, positions, "ffn")
+        _debug_dump_tf_rows(self.attn, x, positions, "ffn", input_ids)
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
     def write_kv(

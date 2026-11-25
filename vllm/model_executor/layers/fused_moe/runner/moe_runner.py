@@ -77,6 +77,8 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
     root = os.environ.get("VLLM_DEBUG_TF_DIR")
     if not root or not torch.is_tensor(tensor) or tensor.dim() != 2:
         return
+    if torch.cuda.is_current_stream_capturing():
+        return
     if not is_forward_context_available():
         return
     try:
@@ -99,12 +101,20 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
     )
     if swa is None:
         return
+    seq_lens = getattr(swa, "seq_lens", None)
+    if seq_lens is not None and seq_lens.numel():
+        if int(seq_lens.max()) <= 1:
+            return  # graph-capture / idle dummy step
     nd, npf = int(swa.num_decode_tokens), int(swa.num_prefill_tokens)
-    if npf <= 0:
-        return
-    if phase == "mixed" and nd == 0:
-        return
-    if phase == "alone" and nd > 0:
+    decode_rows = False
+    if npf > 0:
+        if phase == "mixed" and nd == 0:
+            return
+        if phase == "alone" and nd > 0:
+            return
+    elif os.environ.get("VLLM_DEBUG_DECODE_DUMP") and nd > 0:
+        decode_rows = True
+    else:
         return
     bd = getattr(fc, "batch_descriptor", None)
     num_batch = int(getattr(bd, "num_tokens", 0)) if bd is not None else 0
@@ -119,11 +129,24 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
         if n_rows != chunk:
             return
         base = get_tensor_model_parallel_rank() * chunk
-    start, stop = max(nd, base), min(nd + npf, base + n_rows)
+    if decode_rows:
+        start, stop = max(0, base), min(nd, base + n_rows)
+    else:
+        start, stop = max(nd, base), min(nd + npf, base + n_rows)
     if stop <= start:
         return
     path = os.path.join(root, phase)
     os.makedirs(path, exist_ok=True)
+    if decode_rows:
+        # The first decode step after the phase dir is cleared wins.
+        out = os.path.join(
+            path,
+            f"{tag}__{str(layer_name).replace('/', '_')}"
+            f"__dev{torch.cuda.current_device()}__dec{nd}.pt",
+        )
+        if not os.path.exists(out):
+            torch.save(tensor[start - base : stop - base].detach().cpu(), out)
+        return
     torch.save(
         tensor[start - base : stop - base].detach().cpu(),
         os.path.join(
