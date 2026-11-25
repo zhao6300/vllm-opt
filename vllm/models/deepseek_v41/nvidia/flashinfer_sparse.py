@@ -82,7 +82,14 @@ class _Sm120CallerBuffers:
     calibration update changes the resolved plan. A captured graph keeps the
     addresses it baked, so the caller has to hold the scratch for the life of
     the process. All layers share one bundle and use it sequentially on one
-    stream. The plan object itself is a host-side descriptor (the C++
+    stream: the plan runs on this stream, so its kernels consume the scratch
+    before the next step's launch. That holds under pipeline parallelism too --
+    PP microbatches are staggered across steps (a request decodes every M
+    steps), so a worker never runs two forwards at once, and the PP handler's
+    side stream only carries sampled tokens. Two forwards on different streams
+    (dual-batch overlap) would need one bundle per stream; `in_use` fails
+    closed on the Python-level re-entry but cannot see graph replays.
+    The plan object itself is a host-side descriptor (the C++
     `ExecutionPlan` is plain data), so replacing it frees no device memory.
     """
 
@@ -390,7 +397,9 @@ def _sparse_mla_sm120_paged_attention(
 
     has_extra_kv_cache = extra_kv_cache is not None
     extra_kv_flag = extra_kv_fp4 and has_extra_kv_cache
-    device_key = (query.device, extra_kv_flag, kv_scale_format)
+    # `d_v` is baked into the wrapper at construction, so layers with different
+    # value widths need their own; the per-call plans carry heads/topk.
+    device_key = (query.device, query.shape[-1], extra_kv_flag, kv_scale_format)
     wrapper = _sparse_mla_sm120_wrappers.get(device_key)
     if wrapper is None:
         wrapper = SparseMLASm120Wrapper(
@@ -1640,19 +1649,23 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             )
 
             q_chunk = q[query_start:query_end]
+            # Flat cache rows keep the step's global row index: decode rows own
+            # [0, num_decode_tokens), so a mixed step's prefills must not
+            # overwrite them in the shared remap scratch.
+            row_offset = num_decode_tokens + query_start
             swa_indices_chunk = self._storage_offset_indices(
                 swa_metadata.prefill_swa_indices[query_start:query_end],
                 swa_kv_paged,
                 swa_metadata.block_size,
                 "swa",
-                row_offset=query_start,
+                row_offset=row_offset,
             )
             extra_sparse_indices_chunk = self._storage_offset_indices(
                 extra_sparse_indices_chunk,
                 extra_kv_paged,
                 compressed_block_size,
                 "extra",
-                row_offset=query_start,
+                row_offset=row_offset,
             )
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:

@@ -278,7 +278,7 @@ def test_sm120_dsv4_1_uses_explicit_fp8_precision_wrapper(monkeypatch) -> None:
         prefill_impl="auto",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, True, _INLINE
+        query.device, query.shape[-1], True, _INLINE
     ]
 
     assert isinstance(cached, FakeWrapper)
@@ -320,7 +320,7 @@ def test_sm120_dsv4_1_isolate_flag_when_extra_cache_is_absent(
         prefill_impl="auto",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, False, _INLINE
+        query.device, query.shape[-1], False, _INLINE
     ]
 
     assert isinstance(cached, _FakeSm120Wrapper)
@@ -350,7 +350,7 @@ def test_sm120_dsv4_1_requires_extra_cache_for_fp4_extra_wrapper(
         prefill_impl="auto",
     )
     assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
-        (query.device, False, _INLINE)
+        (query.device, query.shape[-1], False, _INLINE)
     }
 
     _paged_attention(
@@ -368,12 +368,12 @@ def test_sm120_dsv4_1_requires_extra_cache_for_fp4_extra_wrapper(
         prefill_impl="auto",
     )
     assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
-        (query.device, False, _INLINE),
-        (query.device, True, _INLINE),
+        (query.device, query.shape[-1], False, _INLINE),
+        (query.device, query.shape[-1], True, _INLINE),
     }
     assert (
         nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-            query.device, True, _INLINE
+            query.device, query.shape[-1], True, _INLINE
         ].kwargs["extra_kv_fp4"]
         is True
     )
@@ -401,7 +401,7 @@ def test_sm120_dsv4_1_reuses_wrapper_for_same_extra_cache_mode(
     )
     _paged_attention(**args)
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, True, _INLINE
+        query.device, query.shape[-1], True, _INLINE
     ]
     first = len(cached.run_kwargs)
 
@@ -431,7 +431,7 @@ def test_sm120_dsv4_1_forwards_prefill_impl_and_sink(monkeypatch) -> None:
         prefill_impl="swapab",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, True, _INLINE
+        query.device, query.shape[-1], True, _INLINE
     ]
 
     assert cached.run_kwargs["sm_scale"] == 0.25
@@ -767,6 +767,91 @@ def test_sm120_dsv41_remaps_sparse_indices_of_padded_swa_cache(monkeypatch) -> N
     )
     assert calls == []
     assert captured["sparse_indices"].data_ptr() == slots.data_ptr()
+
+
+def test_sm120_prefill_remap_starts_after_decode_rows(monkeypatch) -> None:
+    """A mixed step's prefill chunks must not overwrite the decode rows of the
+    shared flat-index scratch: decode owns rows [0, num_decode_tokens)."""
+    calls = []
+
+    def record(indices, cache, block_size, role, row_offset=0):
+        if indices is None:
+            return None
+        calls.append((role, row_offset))
+        return indices
+
+    captured = {}
+    monkeypatch.setattr(
+        nvidia.flashinfer_sparse,
+        "_sparse_mla_sm120_paged_attention",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    attn = DeepseekV4FlashInferSM120Attention.__new__(
+        DeepseekV4FlashInferSM120Attention
+    )
+    attn.kv_cache_torch_dtype = torch.bfloat16
+    attn.scale = 1.0
+    attn.attn_sink = None
+    attn.use_fp4_extra_kv = False
+    attn.max_num_batched_tokens = 8
+    attn.kv_footer_scale = False
+    attn.kv_scale_format = _INLINE
+    attn._sm120_caller_buffers = None
+    attn.compress_ratio = 0
+    attn._storage_offset_indices = record
+
+    metadata = SimpleNamespace(
+        num_decodes=2,
+        num_decode_tokens=2,
+        num_prefills=2,
+        num_prefill_tokens=4,
+        query_start_loc_cpu=[0, 1, 2, 4, 6],
+        prefill_swa_indices=torch.zeros((4, 1, 5), dtype=torch.int32),
+        prefill_swa_lens=torch.full((4,), 5, dtype=torch.int32),
+        block_size=32,
+    )
+    query = torch.zeros((4, 64, 512), dtype=torch.bfloat16)
+    output = torch.zeros_like(query)
+
+    attn._forward_prefill(
+        q=query,
+        compressed_k_cache=None,
+        swa_k_cache=_padded_swa_cache(),
+        output=output,
+        attn_metadata=None,
+        swa_metadata=metadata,
+    )
+
+    assert calls == [("swa", 2)]
+    assert captured["output"].data_ptr() == output.data_ptr()
+
+
+def test_sm120_wrapper_cache_separates_value_dims(monkeypatch) -> None:
+    """`d_v` is fixed when the wrapper is built, so layers with a different
+    value width must not share the cached wrapper."""
+    _install_sm120_wrapper(monkeypatch)
+
+    for d_v in (512, 576):
+        query = torch.zeros((2, 64, d_v), dtype=torch.bfloat16)
+        _paged_attention(
+            query=query,
+            swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8),
+            sparse_indices=torch.empty((2, 5), dtype=torch.int32),
+            output=torch.zeros_like(query),
+            sm_scale=1.0,
+            topk_length=torch.empty((2,), dtype=torch.int32),
+            attn_sink=None,
+            extra_kv_cache=None,
+            extra_sparse_indices=None,
+            extra_sparse_topk_lens=None,
+            extra_kv_fp4=False,
+            prefill_impl="auto",
+        )
+
+    wrappers = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers
+    assert len(wrappers) == 2
+    assert {wrapper.kwargs["d_v"] for wrapper in wrappers.values()} == {512, 576}
 
 
 def _footer_decode_attention(monkeypatch, monkeypatch_env=None):
@@ -1318,7 +1403,7 @@ def test_sm120_paged_attention_passes_caller_owned_scratch(monkeypatch) -> None:
     _run_sm120_paged_attention(caller)
 
     wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        torch.device("cpu"), True, _INLINE
+        torch.device("cpu"), 512, True, _INLINE
     ]
     assert wrapper.run_kwargs["out_lse"] is caller.lse
     assert wrapper.run_kwargs["mid_out"] is caller.mid
@@ -1517,7 +1602,7 @@ def test_captured_decode_plan_stays_frozen() -> None:
 
     run()  # eager warmup
     wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        (query.device, True, _INLINE)
+        (query.device, query.shape[-1], True, _INLINE)
     ]
     captured = {key: plan.plan for key, plan in wrapper._prepared_calls.items()}
     assert captured

@@ -879,3 +879,18 @@ def test_unwrap_recurses_through_nested_wrappers():
 
     assert inner.unwrap() is model
     assert outer.unwrap() is model
+
+
+def test_graph_break_refuses_output_larger_than_its_capture_buffer() -> None:
+    """The break-output buffers are sized by the first (largest) capture; a
+    later, larger call must fail loudly instead of writing a truncated result
+    that the next graph segment would read."""
+    from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+
+    layers = DecoderReplayLayers.__new__(DecoderReplayLayers)
+    layers._break_outputs = [torch.empty((4, 8), dtype=torch.bfloat16)]
+    layers._run = lambda hidden_states, *states: (
+        torch.empty((5, 8), dtype=torch.bfloat16),
+    )
+    with pytest.raises(RuntimeError, match="largest batch descriptor"):
+        layers._run_in_graph_break(torch.empty((5, 8), dtype=torch.bfloat16))

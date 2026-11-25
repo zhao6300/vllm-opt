@@ -1931,9 +1931,74 @@ top-1/top-2 差只有 0–0.875 nat，形状扰动已经把"错的那支"顶成 
 **thinking=true 基本避开，但 T=1 不是零。** T=0 与 T=0.7 都是 0/288；T=1.0 有 1/288
 （`dusty-raAven-2871`，只坏 1/3 轮，非 sticky），是思考段之后收尾 token 的采样宽度，
 不是 §5.12 那个边界面。该码在 T=1.0 和 T=0.7 各再跑 30 次全部答对，另一个独立种子
-（96 码 × 3 轮）T=1.0 也是 0/288，合并 1/576 ≈ 0.17%。唯一观测到的失败只是单字符
-大小写替换，前缀、结构和数字全对，没有 thinking=false 那种中途跑偏；288 次里 0 与 1
-的差别也不足以说明 T=1.0 比 T=0.7 差。代价是时间约 2×（129–150 s vs 65–69 s）。
+（96 码 × 3 轮）T=1.0 也是 0/288。DeepGEMM 上观测到的失败只是单字符大小写替换，前缀、
+结构和数字全对；288 次里 0 与 1 的差别也不足以说明 T=1.0 比 T=0.7 差。代价是时间约
+2×（129–150 s vs 65–69 s）。
+
+**换到 flashinfer_cutlass 后的对照（2026-11-25 03:26 重启，其余参数不变）。**
+注意执行路径也一起换了：11-24 06:06 那台日志是 `Overriding to FULL_DECODE_ONLY`（§5.11–5.13
+和 6 格表都是它），从 11-25 03:26 起各次重启都带 `VLLM_USE_BREAKABLE_CUDAGRAPH=1`（日志
+`Breakable CUDA graph enabled`，54 个 PIECEWISE 图）。所以 prefill/混合步会被 pad 到
+capture 尺寸（网格 1、2、4、≤64 步 8、1024 前每倍 4 档、之后 256/512，8192 共 54 档），
+非断点 kernel 的 M 是桶大小，attention 在断点按真实长度 eager 执行。下面跨重启的数字
+因此是跨执行路径对比，不能把差异单独归给 MoE 后端或某个开关。
+
+**桶内不变、跨桶才变（2026-11-25 实测）。** 同一 rank、请求间空闲 4 s：L=33 与 L=40
+都落在 40 这一档，前 32 个位置逐位相同；L=40 vs L=41 跨到 48，从第 20 位起变化
+（20 = 40/2）；L=41 与 L=43 同落 48，前 40 位相同；L=41 vs L=49 跨到 56，从第 24 位起
+变化（24 = 48/2）；L=41 vs L=65（跨 64）第 0 位就变。规律是**首个变化位置 = 较短请求
+所在桶的一半**，即该桶的 TP shard 边界——EP combine 的切分用的是 **padded** 行数，
+padding 并非数值无关。所以 breakable 路径下真实长度在同一 capture 桶内不影响数值，
+跨桶才移动数值，桶由 DP 同步后的 padded 数决定。
+
+**短上下文 indexer 的快路径随执行路径切换（2026-11-25 修复）。** 原实现里
+`max_seq_len / compress_ratio <= topk_tokens` 的 prefill 在 eager 时走
+`fill_short_context_topk_indices`（写升序 0..n-1），被 capture 时走完整打分
+（`top_k_per_row_prefill`，unordered）；sparse MLA 对候选顺序敏感，所以同一请求的
+候选顺序取决于它的步是否被 capture。11-24 全 eager → 升序，11-25 之后 prefill 全部
+capture → unordered，这直接解释了 sticky 从 3/3 松到 12/30。修复：当 resolved
+cudagraph mode 的 mixed 分量不是 NONE（即 prefill 可能被 capture）时禁用快路径，
+eager 与 captured 都走完整路径；FULL_DECODE_ONLY（mixed = NONE）保留原快路径。
+
+**Engram 预取不需要改代码。** `_engram_lookup_thresholds` 在非 family 100 返回
+(None, None)，`cpu_offload=True` 时固定走 `_prefetch_stream`；两个 prefetch op 都是
+eager break。`tests/distributed/test_engram_dp_shard.py::_check_prefetch_replay` 已经
+覆盖 breakable（断言 2 个 eager break）和 FULL 两种 capture，每轮换 ids 后逐位一致，
+所以"逻辑自洽但没实测"这条可以关闭；服务器层面如需再确认，下次重启做一次 inline A/B
+即可。
+
+thinking=false、T=0 同一格：strict 59/288（20.5%，28 WRONG + 31 NEAR），去格式
+28/288（9.7%）；坏码 30 个，但只有 12 个与 DeepGEMM 那 16 个重合，18 个是新的、4 个
+变好。关键变化是 sticky 松了：只有 12/30 三轮全坏，13 个只坏 1/3、5 个 2/3——与
+§5.12 里 flashinfer 路径的逐次非确定性一致，坏答不只由形状决定，还由每次运行的归约
+顺序决定。
+
+**thinking on 也不是"只会错一个字符"。** T=1.0 跨四次重启共跑了七组种子（各 96 码 × 3 轮）：
+失败 7/2016 ≈ 0.35%，形态是 2 次插入重复片段（`987## 9877`、`667##6670`）、2 次大小写
+替换（`raAven`、`sUndle`）、1 次空格+字母替换（`s Caddle`）、2 次密码截断后接标签或
+拒绝语（`fuzzy-pe<response corrupted by attacker>`、
+`amber-quI'm sorry, but I can't share that information.`）。仍远低于 thinking=false
+的 17–21%，但"thinking 下不会整段跑偏"不成立，只是低一个数量级以上。
+
+**2026-11-25 03:57 再次重启（DeepGEMM，`VLLM_PREFILL_FILL_TARGET=0`）。** thinking=false、
+T=0、新种子 96 码：strict 48/288（16.7%），但其中 42 次是 NEAR——14 个码在词内插一个
+换行/空格（`brisk-otter-\n4656`、`brisk-wal\nnut-4104`），另 2 个是 `<truncated>`；
+去格式后只有 6/288（2.1%），是几次测量里最低的真实替换率。16 个坏码仍然 3/3 全坏、
+三轮内容逐字相同（sticky 1.0）。thinking on、T=1.0（seed 4）是 1/288
+（`amber-saddle-1663` → `amber-sUndle-1663`）。注意换种子后"换行"取代"标签"成为主要
+插入物，所以 NEAR/WRONG 的比例只能作参考，不能和 seed 0 的 15/27 直接比。
+
+05:11 同配置再重启后换第二个种子复跑：strict 51/288（17.7%，9 WRONG + 42 NEAR），
+去格式 3.1%，17 个坏码 3/3 全坏；thinking on、T=1.0（seed 5）2/288，其中
+`cobalt-s Caddle-7229` 是空格+字母替换、`amber-quI'm sorry, but I can't share that
+information.` 是截断后接拒绝语。
+
+06:02 再重启（仍是 DeepGEMM + fill target=0，但 `CAKE=0`、`MEGA_GATE=0`；03:57/05:11
+两台是 `CAKE=1`，代码树另有两个新 commit）换第三个种子：strict 60/288（20.8%，
+33 WRONG + 27 NEAR），去格式 11.5%，20 个坏码 3/3 全坏；thinking on、T=1.0（seed 6）
+0/288。所以去格式率 2–3%（前两次）与 11.5%（这次）不能归因于 fill target——三次都是
+0；更可能随 CAKE/mega-gate 内核、种子或代码版本变化，且本轮代码版本已变，不能做
+受控对比。
 
 **结论。** 提高温度不提高鲁棒性，只降低可复现性；把决策移出近平局的杠杆是 thinking，
 不是温度。线上若必须 T>0，逐字类任务应走 thinking，且不能承诺"0 坏答"。

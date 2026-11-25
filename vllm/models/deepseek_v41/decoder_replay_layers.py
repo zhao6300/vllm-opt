@@ -105,10 +105,16 @@ class DecoderReplayLayers:
         if self._break_outputs is None:
             # Sized by the first call: the largest model graph is captured first.
             self._break_outputs = [torch.empty_like(out) for out in outputs]
-        return tuple(
-            buf[: out.shape[0]].copy_(out)
-            for buf, out in zip(self._break_outputs, outputs)
-        )
+        copied = []
+        for buf, out in zip(self._break_outputs, outputs):
+            if buf.shape[0] < out.shape[0] or buf.shape[1:] != out.shape[1:]:
+                raise RuntimeError(
+                    "a graph break produced an output larger than its capture "
+                    f"buffer ({tuple(out.shape)} vs {tuple(buf.shape)}); the "
+                    "largest batch descriptor must be captured first"
+                )
+            copied.append(buf[: out.shape[0]].copy_(out))
+        return tuple(copied)
 
     def _run(
         self, hidden_states: torch.Tensor | MoEOutput, *states: torch.Tensor | None

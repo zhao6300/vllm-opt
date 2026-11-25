@@ -1712,3 +1712,33 @@ def test_sparse_mqa_logits_accuracy_vs_torch(kv_dtype: str):
     # bf16-level numerics: far below the value gaps that change top-k selection.
     assert norm_err.quantile(0.99).item() < 1e-2
     assert norm_err.max().item() < 2e-2
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (None, True),
+        (CUDAGraphMode.NONE, True),
+        (CUDAGraphMode.FULL, False),
+        (CUDAGraphMode.FULL_DECODE_ONLY, True),
+        (CUDAGraphMode.PIECEWISE, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
+    ],
+)
+def test_short_context_topk_fast_path_only_without_captured_prefill(
+    mode: CUDAGraphMode | None, expected: bool
+) -> None:
+    """The eager short-context path lists candidates ascending while the
+    captured full path leaves the kernel's unordered slots, so a config whose
+    prefills can be captured must not take the fast path in eager steps."""
+    from vllm.models.deepseek_v4.attention import DeepseekV4Indexer as V4Indexer
+    from vllm.models.deepseek_v41.attention import (
+        DeepseekV4Indexer as V41Indexer,
+    )
+
+    for cls in (V41Indexer, V4Indexer):
+        indexer = cls.__new__(cls)
+        indexer.vllm_config = SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_mode=mode)
+        )
+        assert indexer._short_context_topk_is_uncaptured() is expected

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     VllmConfig,
     get_current_vllm_config,
 )
@@ -1062,6 +1063,18 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4=self.use_fp4_kv,
         )
 
+    def _short_context_topk_is_uncaptured(self) -> bool:
+        """Whether no prefill step of this model is replayed from a graph.
+
+        A prefill graph has no Python at replay, so it always runs the full
+        scoring path. Taking the eager short-context fast path in a config
+        whose prefills are captured would give one request two different
+        candidate orders (ascending vs the kernel's unordered slots) depending
+        on whether its step happened to be captured.
+        """
+        mode = self.vllm_config.compilation_config.cudagraph_mode
+        return mode is None or mode.mixed_mode() == CUDAGraphMode.NONE
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1081,6 +1094,7 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
                 and not torch.cuda.is_current_stream_capturing()
+                and self._short_context_topk_is_uncaptured()
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
