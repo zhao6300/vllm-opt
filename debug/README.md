@@ -22,8 +22,18 @@ TF stream can be found.
 - `attention.py` (v4 + v41): when `VLLM_DEBUG_TF_DIR` is set,
   `_short_context_topk_is_uncaptured` returns False, so the indexer runs the
   full scoring path in both the alone and mixed runs.
+- `vllm/v1/worker/gpu/debug_step_dump.py` (also on this branch): with
+  `VLLM_DEBUG_STEP_DUMP=1` it logs one `DSV41DEBUG {json}` line per step
+  (composition, scheduled tokens, input ids/positions, PP payload checksums);
+  with `VLLM_DEBUG_TF_DIR` it additionally saves the TF rows of the runner
+  inputs (`runnerinputs_ids/positions`), the PP intermediate payload
+  (`runnerinputs_intermediate_<key>` / `runneroutputs_<key>`) and the model
+  output, per stage/device.
+- Layer filters: `VLLM_DEBUG_TF_LAYERS=2,20,23,36` limits the per-decoder-layer
+  dumps; `VLLM_DEBUG_MIXED_ATTN_LAYERS=2,20,23,36` limits the
+  `_forward_sparse_impl` prefill-output dumps and `[mixed]` log lines.
 
-The dump helper reads `<VLLM_DEBUG_TF_DIR>/phase` on every call and writes to
+All dumps read `<VLLM_DEBUG_TF_DIR>/phase` on every call and write to
 `<root>/<phase>/`, so one server run can dump both phases.
 
 ## Server config for the debug run
@@ -32,8 +42,11 @@ Eager mixed steps are required for the Python hook to run at every step:
 
 ```bash
 VLLM_USE_BREAKABLE_CUDAGRAPH=0 \
+VLLM_DEBUG_STEP_DUMP=1 \
 VLLM_DEBUG_TF_DIR=/dev/shm/tf_dump \
 VLLM_DEBUG_MIXED_ATTN=1 \
+# optional: VLLM_DEBUG_TF_LAYERS=2,20,23,36
+# optional: VLLM_DEBUG_MIXED_ATTN_LAYERS=2,20,23,36
 # same serve command, but compilation config:
 #   {"cudagraph_mode":"FULL_DECODE_ONLY","custom_ops":["all"]}
 ```
@@ -80,11 +93,16 @@ mixed steps as well.
   relay/MoE·EP).
 - The `[mixed] ...` lines identify the step: `dec=6 pref=37 batch=48` for the
   production mixed step, `dec=0 pref=37` for the alone prefill.
+- `runnerinputs_*` vs `runneroutputs_*` answer whether the input assembly
+  changed: `runnerinputs_ids/positions` identical and both stages' PP payload
+  rows identical → the runner is clean. Stage 0's `runneroutputs_*` vs stage
+  1's `runnerinputs_intermediate_*` (same phase, same device pair) is the PP
+  boundary comparison.
 
 ## Caveats
 
-- Based on `0c5f36a49e`; the working tree's uncommitted indexer helper is not
-  included. The debug hook forces the full indexer path, which is the control
+- Based on `33452c74d5` (includes the committed short-context gate and the
+  step dump). The debug hook forces the full indexer path, which is the control
   we want.
 - `FULL_DECODE_ONLY` still captures the pure-decode FULL graphs; their Python
   only runs at capture. The TF request's prefill/mixed steps are eager and are

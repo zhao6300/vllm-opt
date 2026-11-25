@@ -416,6 +416,11 @@ def _debug_dump_tf_rows(
         return
     if phase == "alone" and swa.num_decode_tokens > 0:
         return
+    layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
+    if layers:
+        wanted = [x.strip() for x in layers.split(",") if x.strip()]
+        if wanted and not any(x in attn.prefix for x in wanted):
+            return
     start = swa.num_decode_tokens
     stop = start + swa.num_prefill_tokens
     num_batch = positions.shape[0]

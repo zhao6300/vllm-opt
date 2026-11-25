@@ -93,6 +93,21 @@ def main():
         b = torch.load(after).float()
         print(f"{layer:56s} max_abs={(a - b).abs().max().item():.6f}")
 
+    print("\nrunner / PP payload rows:")
+    for path in sorted(
+        glob.glob(os.path.join(args.root, "mixed", "runner*.pt"))
+    ):
+        base = os.path.basename(path)
+        alone_path = os.path.join(args.root, "alone", base)
+        if not os.path.exists(alone_path):
+            continue
+        a = torch.load(alone_path).float()
+        b = torch.load(path).float()
+        if a.shape != b.shape:
+            print(f"{base:64s} shape {tuple(a.shape)} vs {tuple(b.shape)}")
+            continue
+        print(f"{base:64s} max_abs={(a - b).abs().max().item():.6f}")
+
     print(f"\nFIRST OVER {args.threshold}: {first}")
 
 

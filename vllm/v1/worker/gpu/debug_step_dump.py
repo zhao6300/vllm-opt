@@ -109,6 +109,58 @@ def _emit(payload: dict[str, Any]) -> None:
     logger.info("DSV41DEBUG %s", json.dumps(payload))
 
 
+def _phase() -> str | None:
+    """`alone`/`mixed` from `<VLLM_DEBUG_TF_DIR>/phase`, None if disabled."""
+    root = os.environ.get("VLLM_DEBUG_TF_DIR")
+    if not root:
+        return None
+    try:
+        with open(os.path.join(root, "phase")) as f:
+            return f.read().strip() or "default"
+    except OSError:
+        return "default"
+
+
+def _phase_allows(phase: str | None, num_decode: int) -> bool:
+    if phase == "mixed":
+        return num_decode > 0
+    if phase == "alone":
+        return num_decode == 0
+    return True
+
+
+def _save_rows(
+    name: str, tensor: Any, num_decode: int, num_prefill: int, phase: str
+) -> None:
+    root = os.environ["VLLM_DEBUG_TF_DIR"]
+    if not torch.is_tensor(tensor) or tensor.dim() < 1 or num_prefill <= 0:
+        return
+    start, stop = num_decode, num_decode + num_prefill
+    if tensor.shape[0] < stop:
+        return
+    path = os.path.join(root, phase)
+    os.makedirs(path, exist_ok=True)
+    torch.save(
+        tensor[start:stop].detach().cpu(),
+        os.path.join(path, f"runner{name}__dev{torch.cuda.current_device()}.pt"),
+    )
+
+
+def _save_payload(tag: str, obj: Any, num_decode: int, num_prefill: int) -> None:
+    phase = _phase()
+    if phase is None or not _phase_allows(phase, num_decode):
+        return
+    tensors = getattr(obj, "tensors", None)
+    if tensors is not None:
+        for key, value in tensors.items():
+            _save_rows(f"{tag}_{key}", value, num_decode, num_prefill, phase)
+    elif torch.is_tensor(obj):
+        _save_rows(tag, obj, num_decode, num_prefill, phase)
+    elif isinstance(obj, tuple):
+        for item in obj:
+            _save_payload(tag, item, num_decode, num_prefill)
+
+
 def dump_inputs(
     input_batch: Any,
     batch_desc: Any,
@@ -120,6 +172,16 @@ def dump_inputs(
         return
     try:
         num_prefill, num_decode = _composition(input_batch)
+        _save_payload("inputs_ids", input_batch.input_ids, num_decode, num_prefill)
+        _save_payload(
+            "inputs_positions", input_batch.positions, num_decode, num_prefill
+        )
+        _save_payload(
+            "inputs_intermediate",
+            model_inputs.get("intermediate_tensors"),
+            num_decode,
+            num_prefill,
+        )
         if _only_mixed() and not (num_prefill and num_decode):
             return
         n = _limit()
@@ -162,6 +224,7 @@ def dump_outputs(
         return
     try:
         num_prefill, num_decode = _composition(input_batch)
+        _save_payload("outputs", model_output, num_decode, num_prefill)
         if _only_mixed() and not (num_prefill and num_decode):
             return
         payload = {

@@ -1333,6 +1333,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             and num_decode_tokens > 0
             and num_prefill_tokens > 0
         )
+        if debug_mixed and (layers := os.environ.get("VLLM_DEBUG_MIXED_ATTN_LAYERS")):
+            wanted = [x.strip() for x in layers.split(",") if x.strip()]
+            if wanted and not any(x in self.prefix for x in wanted):
+                debug_mixed = False
         if debug_mixed:
             fc = get_forward_context()
             bd = getattr(fc, "batch_descriptor", None)
