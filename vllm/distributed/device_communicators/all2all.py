@@ -107,6 +107,74 @@ def _gather_rows(
     return dist_group.all_gatherv(tensors, dim=0, sizes=sizes)
 
 
+def _all_to_all_rows(
+    dist_group: Any,
+    x: torch.Tensor,
+    output_split_sizes: list[int],
+    input_split_sizes: list[int],
+) -> torch.Tensor:
+    """All-to-all over dim 0, on PyNccl when the group has it (graph-safe)."""
+    communicator = dist_group.device_communicator
+    pynccl_comm = getattr(communicator, "pynccl_comm", None)
+    if x.is_cuda and pynccl_comm is not None and not pynccl_comm.disabled:
+        out = x.new_empty((sum(output_split_sizes), *x.shape[1:]))
+        pynccl_comm.all_to_all_single(out, x, output_split_sizes, input_split_sizes)
+        return out
+    return communicator.all_to_all_single(x, output_split_sizes, input_split_sizes)
+
+
+def _sum_rank_major(received: torch.Tensor, world_size: int) -> torch.Tensor:
+    """Sum `world_size` rank-major blocks in ascending rank order in fp32."""
+    rows = received.shape[0] // world_size
+    out = received.new_empty((rows, *received.shape[1:]))
+    if out.numel() == 0:
+        return out
+    if received.is_cuda:
+        from vllm.model_executor.determinism.batch_invariant import (
+            _fixed_order_sum_kernel,
+        )
+        from vllm.triton_utils import triton
+
+        numel = out.numel()
+        _fixed_order_sum_kernel[(triton.cdiv(numel, 1024),)](
+            received.view(-1),
+            out.view(-1),
+            numel,
+            numel,
+            WORLD_SIZE=world_size,
+            BLOCK_SIZE=1024,
+            LARGE=received.numel() > 2**31,
+        )
+        return out
+    blocks = received.view(world_size, rows, *received.shape[1:])
+    acc = blocks[0].float()
+    for rank in range(1, world_size):
+        acc += blocks[rank].float()
+    return out.copy_(acc)
+
+
+def _reduce_scatterv_fixed_order(
+    dist_group: Any, input_: torch.Tensor, sizes: list[int]
+) -> torch.Tensor:
+    """Sum reduce-scatter over dim 0 in which a row's result does not depend on
+    the rank that owns it.
+
+    An all-to-all hands each rank the rows it owns from every rank, rank-major;
+    they are then added in ascending rank order with an fp32 accumulator and
+    rounded once. NCCL's reduce-scatter instead adds them in an order set by
+    the destination rank.
+    """
+    world_size = dist_group.world_size
+    if world_size == 1:
+        return input_
+    assert len(sizes) == world_size and input_.shape[0] == sum(sizes)
+    rows = sizes[dist_group.rank_in_group]
+    received = _all_to_all_rows(
+        dist_group, input_.contiguous(), [rows] * world_size, list(sizes)
+    )
+    return _sum_rank_major(received, world_size)
+
+
 class AgRsAll2AllManager(All2AllManagerBase):
     """An implementation of all2all communication based on
     all-gather (dispatch) and reduce-scatter (combine).
@@ -204,6 +272,8 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        if envs.VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE:
+            return _reduce_scatterv_fixed_order(dist_group, hidden_states, sizes)
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
 
@@ -214,6 +284,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         device: torch.device,
         is_sequence_parallel: bool = False,
     ) -> torch.Tensor | None:
+        if envs.VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE:
+            # The fixed-order combine never reads a symmetric buffer.
+            return None
         dist_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(shape[0] // dist_group.world_size, dist_group)
         if sum(sizes) != shape[0] or any(size != sizes[0] for size in sizes):
@@ -236,6 +309,10 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
+        if envs.VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE:
+            return output.copy_(
+                _reduce_scatterv_fixed_order(dist_group, hidden_states, sizes)
+            )
         return dist_group.reduce_scatterv_into_output(
             hidden_states,
             output,
