@@ -274,6 +274,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
     VLLM_MOE_AG_RS_PACKED_DISPATCH: bool = False
+    VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE: bool = False
     VLLM_XGRAMMAR_CACHE_MB: int = 512
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -2256,6 +2257,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # world_size. Numerically identical either way. Default off.
     "VLLM_MOE_AG_RS_PACKED_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_MOE_AG_RS_PACKED_DISPATCH", "0"))
+    ),
+    # Combine of the allgather-reducescatter MoE all2all backend: sum the
+    # ranks' partial expert outputs in a fixed rank order (fp32 accumulator)
+    # after an all-to-all, instead of NCCL's reduce-scatter. NCCL adds the
+    # partials in an order set by the destination rank, so with three or more
+    # ranks a token's output can move by one ulp when it lands on another
+    # rank (e.g. a sequence-parallel shard boundary shifting with the batch).
+    # Same bytes on the wire as the ring reduce-scatter. Default off.
+    "VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE": lambda: bool(
+        int(os.getenv("VLLM_MOE_AG_RS_FIXED_ORDER_COMBINE", "0"))
     ),
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE CUTLASS Kernel. This value is used to create a buffer for
