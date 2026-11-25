@@ -52,6 +52,27 @@ def _only_mixed() -> bool:
     return os.getenv("VLLM_DEBUG_STEP_ONLY_MIXED", "1") == "1"
 
 
+def force_eager_early_decode(num_computed_tokens_np: Any, batch_req_state: Any) -> bool:
+    """Whether to run this step eagerly so the Python dump hooks see it.
+
+    With ``VLLM_DEBUG_EAGER_DECODE_TOKENS=N`` (> 0), a step runs eager when one
+    of its decoding requests has generated fewer than N tokens since its
+    prefill, e.g. N=1 makes only each request's first verify step after the
+    prefill eager. The decision reads only scheduler-synced request state, so
+    every TP rank and PP stage takes it alike, and the DP sync makes the other
+    DP ranks follow. Every other decode step keeps replaying its graph.
+    """
+    limit = int(os.getenv("VLLM_DEBUG_EAGER_DECODE_TOKENS", "0"))
+    if limit <= 0 or batch_req_state is None:
+        return False
+    decoding = ~batch_req_state.is_prefilling_np
+    if not decoding.any():
+        return False
+    idx = batch_req_state.idx_mapping_np[decoding]
+    since = num_computed_tokens_np[idx] - batch_req_state.prefill_len_np[decoding]
+    return bool((since < limit).any())
+
+
 def _composition(input_batch: Any) -> tuple[int, int]:
     scheduled = input_batch.num_scheduled_tokens
     prefilling = input_batch.is_prefilling_np

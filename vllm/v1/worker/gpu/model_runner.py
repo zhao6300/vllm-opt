@@ -127,7 +127,11 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.cudagraph_utils import (
     profile_cudagraph_memory as _profile_cudagraph_memory,
 )
-from vllm.v1.worker.gpu.debug_step_dump import dump_inputs, dump_outputs
+from vllm.v1.worker.gpu.debug_step_dump import (
+    dump_inputs,
+    dump_outputs,
+    force_eager_early_decode,
+)
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -1970,7 +1974,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile
+            or skip_compiled
+            or force_eager_early_decode(
+                self.req_states.num_computed_tokens_np, batch_req_state
+            ),
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
