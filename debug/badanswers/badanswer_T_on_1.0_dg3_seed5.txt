@@ -1,0 +1,6 @@
+{"section": "progress", "round": 0, "counts": {"OK": 96}}
+{"section": "progress", "round": 1, "counts": {"OK": 191, "WRONG": 1}}
+{"section": "progress", "round": 2, "counts": {"OK": 286, "WRONG": 2}}
+{"section": "summary", "total": 288, "bad": 2, "rate": 0.0069, "kinds": {"OK": 286, "WRONG": 2}, "bad_normalized": 2, "rate_normalized": 0.0069, "temperature": 1.0, "thinking": "on", "per_code_fail_counts": {"0": 94, "1": 2}, "codes_ever_bad": 2, "codes_bad_all_rounds": 0, "sticky_fraction": 0.0, "elapsed_s": 237.1, "cached_tokens_nonzero": 0, "prompt_tokens": [55, 56], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "amber-quartz-9313", "kinds": ["OK", "OK", "WRONG"], "contents": ["amber-quartz-9313", "amber-quartz-9313", "amber-quI'm sorry, but I can't share that information."]}
+{"section": "bad_code", "code": "cobalt-saddle-7229", "kinds": ["OK", "WRONG", "OK"], "contents": ["cobalt-saddle-7229", "cobalt-s Caddle-7229", "cobalt-saddle-7229"]}

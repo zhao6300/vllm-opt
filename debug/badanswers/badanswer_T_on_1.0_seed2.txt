@@ -1,0 +1,5 @@
+{"section": "progress", "round": 0, "counts": {"OK": 96}}
+{"section": "progress", "round": 1, "counts": {"OK": 191, "WRONG": 1}}
+{"section": "progress", "round": 2, "counts": {"OK": 287, "WRONG": 1}}
+{"section": "summary", "total": 288, "bad": 1, "rate": 0.0035, "kinds": {"OK": 287, "WRONG": 1}, "bad_normalized": 1, "rate_normalized": 0.0035, "temperature": 1.0, "thinking": "on", "per_code_fail_counts": {"0": 95, "1": 1}, "codes_ever_bad": 1, "codes_bad_all_rounds": 0, "sticky_fraction": 0.0, "elapsed_s": 86.0, "cached_tokens_nonzero": 0, "prompt_tokens": [55, 56], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "hollow-tundra-9877", "kinds": ["OK", "WRONG", "OK"], "contents": ["hollow-tundra-9877", "hollow-tundra-987## 9877", "hollow-tundra-9877"]}

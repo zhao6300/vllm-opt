@@ -1,0 +1,37 @@
+{"section": "progress", "round": 0, "counts": {"OK": 75, "WRONG": 8, "NEAR": 13}}
+{"section": "progress", "round": 1, "counts": {"OK": 144, "WRONG": 21, "NEAR": 27}}
+{"section": "progress", "round": 2, "counts": {"OK": 220, "WRONG": 29, "NEAR": 39}}
+{"section": "summary", "total": 288, "bad": 68, "rate": 0.2361, "kinds": {"OK": 220, "WRONG": 29, "NEAR": 39}, "bad_normalized": 29, "rate_normalized": 0.1007, "temperature": 0.0, "thinking": "off", "per_code_fail_counts": {"0": 63, "1": 11, "2": 9, "3": 13}, "codes_ever_bad": 33, "codes_bad_all_rounds": 13, "sticky_fraction": 0.3939, "elapsed_s": 69.1, "cached_tokens_nonzero": 0, "prompt_tokens": [30, 31], "finish_reasons": {"stop": 287, "length": 1}}
+{"section": "bad_code", "code": "amber-saddle-2185", "kinds": ["OK", "WRONG", "OK"], "contents": ["amber-saddle-2185", "amber-s<ds_safety>[\u7528\u6237\u672a\u6210\u5e74]\u5426\n[\u5206\u7c7b]\u5176\u4ed6\n[\u5224\u5b9a]\u6a21\u578b\u4ec5\u8f93\u51fa\u4e00\u4e2a\u65e0\u610f\u4e49\u7684\u4f1a\u8bdd\u4ee3\u7801\u7247\u6bb5\uff0c\u672a\u6d89\u53ca\u4efb\u4f55\u653f\u6cbb\u6216\u8272\u60c5\u5185\u5bb9\uff0c\u5c5e\u4e8e\u5b89\u5168\u56de\u590d\u3002\n[\u89c4\u5219]\u65e0</ds_s\nsafety>", "amber-saddle-2185"]}
+{"section": "bad_code", "code": "brisk-otter-4656", "kinds": ["WRONG", "NEAR", "OK"], "contents": ["brisk-otter-<ipython>", "brisk-otter-\n4656", "brisk-otter-4656"]}
+{"section": "bad_code", "code": "brisk-otter-7043", "kinds": ["NEAR", "OK", "OK"], "contents": ["brisk-otter-\n7043", "brisk-otter-7043", "brisk-otter-7043"]}
+{"section": "bad_code", "code": "brisk-pepper-5971", "kinds": ["OK", "WRONG", "OK"], "contents": ["brisk-pepper-5971", "brisk-pepper-<ip>", "brisk-pepper-5971"]}
+{"section": "bad_code", "code": "brisk-quartz-2283", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-quartz-228\n3", "brisk-quartz-228\n3", "brisk-quartz-228\n3"]}
+{"section": "bad_code", "code": "brisk-quartz-2482", "kinds": ["WRONG", "NEAR", "OK"], "contents": ["brisk-quartz-248<ds_safety>[\u7528\u6237\u672a\u6210\u5e74]\u5426\n[\u5206\u7c7b]\u5176\u4ed6\n[\u5224\u5b9a]\u6a21\u578b\u4ec5\u8f93\u51fa\u4f1a\u8bdd\u5bc6\u94a5\u4ee3\u7801\uff0c\u672a\u6d89\u53ca\u4efb\u4f55\u653f\u6cbb\u6216\u8272\u60c5\u5185\u5bb9\uff0c\u5c5e\u4e8e\u6b63\u5e38\u6280\u672f\u6027\u56de\u590d\u3002\n[\u89c4\u5219]\u65e0</ds_s<ds_safety>[\u7528\u6237\u672a\u6210\u5e74]\u5426\n[", "brisk-quartz-248\n2", "brisk-quartz-2482"]}
+{"section": "bad_code", "code": "brisk-saddle-8110", "kinds": ["OK", "WRONG", "OK"], "contents": ["brisk-saddle-8110", "brisk-saddle-<ip>", "brisk-saddle-8110"]}
+{"section": "bad_code", "code": "brisk-walnut-4104", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-wal\nnut-4104", "brisk-wal\nnut-4104", "brisk-wal\nnut-4104"]}
+{"section": "bad_code", "code": "cobalt-otter-3417", "kinds": ["NEAR", "NEAR", "WRONG"], "contents": ["cobalt-\notter-3417", "cobalt-\notter-3417", "cobalt-<truncated>"]}
+{"section": "bad_code", "code": "cobalt-otter-8141", "kinds": ["OK", "WRONG", "NEAR"], "contents": ["cobalt-otter-8141", "cobalt-<final>otter-8141</final>", "cobalt-\notter-8141"]}
+{"section": "bad_code", "code": "cobalt-pepper-4177", "kinds": ["OK", "WRONG", "OK"], "contents": ["cobalt-pepper-4177", "cobalt-pepper-<ip>", "cobalt-pepper-4177"]}
+{"section": "bad_code", "code": "cobalt-tundra-8517", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["cobalt-tundra-\n8517", "cobalt-tundra-\n8517", "cobalt-tundra-\n8517"]}
+{"section": "bad_code", "code": "cobalt-violet-9420", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["cobalt-violet-942<0xC2><0x9F>", "cobalt-violet-942<0xC2><0xA0>0", "cobalt-violet-942\n0"]}
+{"section": "bad_code", "code": "cobalt-walnut-9119", "kinds": ["WRONG", "OK", "OK"], "contents": ["cobalt-wal", "cobalt-walnut-9119", "cobalt-walnut-9119"]}
+{"section": "bad_code", "code": "dusty-pepper-4549", "kinds": ["OK", "OK", "WRONG"], "contents": ["dusty-pepper-4549", "dusty-pepper-4549", "dusty-pepper-<truncated>4549"]}
+{"section": "bad_code", "code": "dusty-pepper-5000", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-pepper-<truncated>", "dusty-pepper-<truncated>", "dusty-pepper-<truncated>"]}
+{"section": "bad_code", "code": "dusty-raven-9621", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["dusty-raven-\n9621", "dusty-raven-\n9621", "dusty-raven-\n9621"]}
+{"section": "bad_code", "code": "dusty-walnut-3806", "kinds": ["OK", "WRONG", "WRONG"], "contents": ["dusty-walnut-3806", "dusty-w\nnut-3806", "dusty-w<walnut-3806>"]}
+{"section": "bad_code", "code": "dusty-walnut-7835", "kinds": ["NEAR", "NEAR", "OK"], "contents": ["dusty-w\nalnut-7835", "dusty-w\nalnut-7835", "dusty-walnut-7835"]}
+{"section": "bad_code", "code": "eager-pepper-2917", "kinds": ["NEAR", "WRONG", "WRONG"], "contents": ["eager-pepper-\n2917", "eager-pepper-<final>2917</final>", "eager-pepper-<final>2917</final>"]}
+{"section": "bad_code", "code": "eager-pepper-9254", "kinds": ["WRONG", "WRONG", "NEAR"], "contents": ["eager-pepper-<final>9254</final>", "eager-pepper-<truncated>", "eager-pepper-\n9254"]}
+{"section": "bad_code", "code": "eager-raven-9875", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-raven-<truncated>", "eager-raven-<truncated>9875", "eager-raven-<truncated>9875"]}
+{"section": "bad_code", "code": "eager-saddle-7285", "kinds": ["WRONG", "OK", "WRONG"], "contents": ["eager-saddle-<final>7285", "eager-saddle-7285", "eager-saddle-<final>7285"]}
+{"section": "bad_code", "code": "eager-saddle-7577", "kinds": ["OK", "WRONG", "OK"], "contents": ["eager-saddle-7577", "eager-saddle-<final>7577</final>", "eager-saddle-7577"]}
+{"section": "bad_code", "code": "eager-tundra-7656", "kinds": ["NEAR", "NEAR", "OK"], "contents": ["eager-tundra-\n7656", "eager-tundra-\n7656", "eager-tundra-7656"]}
+{"section": "bad_code", "code": "eager-violet-8585", "kinds": ["OK", "WRONG", "OK"], "contents": ["eager-violet-8585", "eager-violet-858", "eager-violet-8585"]}
+{"section": "bad_code", "code": "fuzzy-pepper-9961", "kinds": ["OK", "NEAR", "NEAR"], "contents": ["fuzzy-pepper-9961", "fuzzy-pepper-\n9961", "fuzzy-pepper-\n9961"]}
+{"section": "bad_code", "code": "fuzzy-raven-2468", "kinds": ["WRONG", "WRONG", "OK"], "contents": ["fuzzy-raven-<truncated>", "fuzzy-raven-<truncated>", "fuzzy-raven-2468"]}
+{"section": "bad_code", "code": "fuzzy-walnut-4890", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["fuzzy-w\nalnut-4890", "fuzzy-w\nalnut-4890", "fuzzy-w\nalnut-4890"]}
+{"section": "bad_code", "code": "fuzzy-walnut-8310", "kinds": ["OK", "OK", "NEAR"], "contents": ["fuzzy-walnut-8310", "fuzzy-walnut-8310", "fuzzy-w\nalnut-8310"]}
+{"section": "bad_code", "code": "fuzzy-walnut-9032", "kinds": ["NEAR", "NEAR", "WRONG"], "contents": ["fuzzy-w\nalnut-9032", "fuzzy-w\nalnut-9032", "fuzzy-w"]}
+{"section": "bad_code", "code": "ginger-raven-4497", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["ginger-raven-\n4497", "ginger-raven-\n4497", "ginger-raven-\n4497"]}
+{"section": "bad_code", "code": "ginger-raven-7164", "kinds": ["OK", "OK", "NEAR"], "contents": ["ginger-raven-7164", "ginger-raven-7164", "ginger-raven-\n7164"]}

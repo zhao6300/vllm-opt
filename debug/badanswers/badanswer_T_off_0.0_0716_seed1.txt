@@ -1,0 +1,24 @@
+{"section": "progress", "round": 0, "counts": {"OK": 76, "WRONG": 10, "NEAR": 10}}
+{"section": "progress", "round": 1, "counts": {"OK": 152, "WRONG": 20, "NEAR": 20}}
+{"section": "progress", "round": 2, "counts": {"OK": 228, "WRONG": 30, "NEAR": 30}}
+{"section": "summary", "total": 288, "bad": 60, "rate": 0.2083, "kinds": {"OK": 228, "WRONG": 30, "NEAR": 30}, "bad_normalized": 30, "rate_normalized": 0.1042, "temperature": 0.0, "thinking": "off", "per_code_fail_counts": {"0": 76, "3": 20}, "codes_ever_bad": 20, "codes_bad_all_rounds": 20, "sticky_fraction": 1.0, "elapsed_s": 36.5, "cached_tokens_nonzero": 0, "prompt_tokens": [30, 31], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "brisk-otter-7043", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-otter-<final>7043</final>", "brisk-otter-<final>7043</final>", "brisk-otter-<final>7043</final>"]}
+{"section": "bad_code", "code": "brisk-quartz-2283", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-quartz-228<|endoftext|>", "brisk-quartz-228<|endoftext|>", "brisk-quartz-228<|endoftext|>"]}
+{"section": "bad_code", "code": "brisk-quartz-2482", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-quartz-248\n2", "brisk-quartz-248\n2", "brisk-quartz-248\n2"]}
+{"section": "bad_code", "code": "brisk-raven-5000", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-raven-\n5000", "brisk-raven-\n5000", "brisk-raven-\n5000"]}
+{"section": "bad_code", "code": "brisk-walnut-4104", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-wal\nnut-4104", "brisk-wal\nnut-4104", "brisk-wal\nnut-4104"]}
+{"section": "bad_code", "code": "cobalt-otter-3417", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["cobalt-\notter-3417", "cobalt-\notter-3417", "cobalt-\notter-3417"]}
+{"section": "bad_code", "code": "cobalt-tundra-8517", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["cobalt-tundra-\n8517", "cobalt-tundra-\n8517", "cobalt-tundra-\n8517"]}
+{"section": "bad_code", "code": "dusty-pepper-4549", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-pepper-<truncated>", "dusty-pepper-<truncated>", "dusty-pepper-<truncated>"]}
+{"section": "bad_code", "code": "dusty-pepper-5000", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-pepper-<truncated>", "dusty-pepper-<truncated>", "dusty-pepper-<truncated>"]}
+{"section": "bad_code", "code": "dusty-raven-9621", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["dusty-raven-\n9621", "dusty-raven-\n9621", "dusty-raven-\n9621"]}
+{"section": "bad_code", "code": "dusty-walnut-3806", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["dusty-w\nalnut-3806", "dusty-w\nalnut-3806", "dusty-w\nalnut-3806"]}
+{"section": "bad_code", "code": "eager-pepper-9254", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["eager-pepper-\n9254", "eager-pepper-\n9254", "eager-pepper-\n9254"]}
+{"section": "bad_code", "code": "eager-raven-9875", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-raven-<truncated>9875", "eager-raven-<truncated>9875", "eager-raven-<truncated>9875"]}
+{"section": "bad_code", "code": "eager-saddle-7577", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-saddle-<truncated>", "eager-saddle-<truncated>", "eager-saddle-<truncated>"]}
+{"section": "bad_code", "code": "fuzzy-raven-2468", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["fuzzy-raven-\n2468", "fuzzy-raven-\n2468", "fuzzy-raven-\n2468"]}
+{"section": "bad_code", "code": "fuzzy-walnut-4890", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["fuzzy-w", "fuzzy-w", "fuzzy-w"]}
+{"section": "bad_code", "code": "fuzzy-walnut-8310", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["fuzzy-w", "fuzzy-w", "fuzzy-w"]}
+{"section": "bad_code", "code": "fuzzy-walnut-9032", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["fuzzy-w", "fuzzy-w", "fuzzy-w"]}
+{"section": "bad_code", "code": "ginger-raven-4497", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["ginger-raven-\n4497", "ginger-raven-\n4497", "ginger-raven-\n4497"]}
+{"section": "bad_code", "code": "ginger-raven-7164", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["ginger-raven-<truncated>", "ginger-raven-<truncated>", "ginger-raven-<truncated>"]}

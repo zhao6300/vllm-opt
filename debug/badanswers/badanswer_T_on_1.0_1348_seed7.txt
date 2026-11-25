@@ -1,0 +1,6 @@
+{"section": "progress", "round": 0, "counts": {"OK": 95, "WRONG": 1}}
+{"section": "progress", "round": 1, "counts": {"OK": 190, "EMPTY": 1, "WRONG": 1}}
+{"section": "progress", "round": 2, "counts": {"OK": 286, "EMPTY": 1, "WRONG": 1}}
+{"section": "summary", "total": 288, "bad": 2, "rate": 0.0069, "kinds": {"OK": 286, "EMPTY": 1, "WRONG": 1}, "bad_normalized": 2, "rate_normalized": 0.0069, "temperature": 1.0, "thinking": "on", "per_code_fail_counts": {"0": 94, "1": 2}, "codes_ever_bad": 2, "codes_bad_all_rounds": 0, "sticky_fraction": 0.0, "elapsed_s": 140.8, "cached_tokens_nonzero": 0, "prompt_tokens": [55, 56], "finish_reasons": {"stop": 287, "length": 1}}
+{"section": "bad_code", "code": "eager-pepper-2524", "kinds": ["OK", "EMPTY", "OK"], "contents": ["eager-pepper-2524", "", "eager-pepper-2524"]}
+{"section": "bad_code", "code": "ginger-quartz-0579", "kinds": ["WRONG", "OK", "OK"], "contents": ["ginger-quSTART-0579END", "ginger-quartz-0579", "ginger-quartz-0579"]}

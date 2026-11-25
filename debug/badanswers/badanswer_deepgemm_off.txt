@@ -1,0 +1,18 @@
+{"section": "progress", "round": 0, "counts": {"OK": 82, "WRONG": 14}}
+{"section": "progress", "round": 1, "counts": {"OK": 164, "WRONG": 28}}
+{"section": "progress", "round": 2, "counts": {"OK": 246, "WRONG": 42}}
+{"section": "summary", "total": 288, "bad": 42, "rate": 0.1458, "kinds": {"OK": 246, "WRONG": 42}, "per_code_fail_counts": {"0": 82, "3": 14}, "codes_ever_bad": 14, "codes_bad_all_rounds": 14, "sticky_fraction": 1.0, "elapsed_s": 64.1, "cached_tokens_nonzero": 0, "prompt_tokens": [30, 31], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "amber-raven-4855", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["amber-ra<ref>4855</ref>", "amber-ra<ref>4855</ref>", "amber-ra<ref>4855</ref>"]}
+{"section": "bad_code", "code": "amber-saddle-7142", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["amber-s<refusal>7142</refusal>", "amber-s<refusal>7142</refusal>", "amber-s<refusal>7142</refusal>"]}
+{"section": "bad_code", "code": "brisk-otter-8731", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-otter-\n8731", "brisk-otter-\n8731", "brisk-otter-\n8731"]}
+{"section": "bad_code", "code": "brisk-walnut-9533", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-wal<|endoftext|>nut-9533", "brisk-wal<|endoftext|>nut-9533", "brisk-wal<|endoftext|>nut-9533"]}
+{"section": "bad_code", "code": "cobalt-otter-4075", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["cobalt-\notter-4075", "cobalt-\notter-4075", "cobalt-\notter-4075"]}
+{"section": "bad_code", "code": "cobalt-saddle-1730", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["cobalt-saddle-173\n0", "cobalt-saddle-173\n0", "cobalt-saddle-173\n0"]}
+{"section": "bad_code", "code": "cobalt-saddle-2194", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["cobalt-saddle-<ip>", "cobalt-saddle-<ip>", "cobalt-saddle-<ip>"]}
+{"section": "bad_code", "code": "cobalt-saddle-6610", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["cobalt-saddle-<truncated>", "cobalt-saddle-<truncated>", "cobalt-saddle-<truncated>"]}
+{"section": "bad_code", "code": "dusty-raven-9694", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-raven-<truncated>", "dusty-raven-<truncated>", "dusty-raven-<truncated>"]}
+{"section": "bad_code", "code": "dusty-walnut-5945", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-w\nalnut-5945", "dusty-w\nalnut-5945", "dusty-w\nalnut-5945"]}
+{"section": "bad_code", "code": "eager-pepper-2696", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-pepper-<truncated>", "eager-pepper-<truncated>", "eager-pepper-<truncated>"]}
+{"section": "bad_code", "code": "eager-pepper-3145", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-pepper-<truncated>", "eager-pepper-<truncated>", "eager-pepper-<truncated>"]}
+{"section": "bad_code", "code": "eager-pepper-8583", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-pepper-\n8583", "eager-pepper-\n8583", "eager-pepper-\n8583"]}
+{"section": "bad_code", "code": "ginger-raven-0024", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["ginger-raven-<ip>", "ginger-raven-<ip>", "ginger-raven-<ip>"]}

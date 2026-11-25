@@ -1,0 +1,3 @@
+{"section": "progress", "round": 0, "counts": {"OK": 14}}
+{"section": "progress", "round": 1, "counts": {"OK": 28}}
+{"section": "summary", "total": 192, "bad": 0, "rate": 0.0, "kinds": {"OK": 28}, "per_code_fail_counts": {"0": 14}, "codes_ever_bad": 0, "codes_bad_all_rounds": 0, "sticky_fraction": 0.0, "elapsed_s": 12.3, "cached_tokens_nonzero": 0, "prompt_tokens": [55, 56], "finish_reasons": {"stop": 28}}

@@ -1,0 +1,18 @@
+{"section": "progress", "round": 0, "counts": {"OK": 83, "WRONG": 5, "NEAR": 8}}
+{"section": "progress", "round": 1, "counts": {"OK": 165, "WRONG": 14, "NEAR": 13}}
+{"section": "progress", "round": 2, "counts": {"OK": 247, "WRONG": 23, "NEAR": 18}}
+{"section": "summary", "total": 288, "bad": 41, "rate": 0.1424, "kinds": {"OK": 247, "WRONG": 23, "NEAR": 18}, "bad_normalized": 23, "rate_normalized": 0.0799, "temperature": 0.7, "thinking": "off", "per_code_fail_counts": {"0": 82, "2": 1, "3": 13}, "codes_ever_bad": 14, "codes_bad_all_rounds": 13, "sticky_fraction": 0.9286, "elapsed_s": 65.5, "cached_tokens_nonzero": 0, "prompt_tokens": [30, 31], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "amber-raven-4855", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["amber-ra", "amber-ra8ven-4855", "amber-ra\n\n\n-4855"]}
+{"section": "bad_code", "code": "amber-saddle-7142", "kinds": ["WRONG", "NEAR", "WRONG"], "contents": ["amber-s<::end_of_turn::>", "amber-s#addle-7142", "amber-s<finish_reason=stop>"]}
+{"section": "bad_code", "code": "brisk-otter-8731", "kinds": ["NEAR", "NEAR", "WRONG"], "contents": ["brisk-otter-#8731", "brisk-otter-\n8731", "brisk-otter-<?php echo \"8731\"; ?>"]}
+{"section": "bad_code", "code": "brisk-walnut-9533", "kinds": ["NEAR", "WRONG", "WRONG"], "contents": ["brisk-wal\nnut-9533", "brisk-wal<|endoftext|>nut-9533", "brisk-wal##-9533"]}
+{"section": "bad_code", "code": "cobalt-otter-4075", "kinds": ["WRONG", "WRONG", "NEAR"], "contents": ["cobalt-#", "cobalt-<?mask>", "cobalt-\notter-4075"]}
+{"section": "bad_code", "code": "cobalt-saddle-1730", "kinds": ["OK", "WRONG", "NEAR"], "contents": ["cobalt-saddle-173\n\nI notice the code you provided in the system prompt ends in \"1730\", but my response above ended in \"173\". Let me correct that.\n\ncobalt-saddle-1730", "cobalt-saddle-173\n\n\nThat's the only code I'm sharing.", "cobalt-saddle-173\n0"]}
+{"section": "bad_code", "code": "cobalt-saddle-2194", "kinds": ["NEAR", "WRONG", "WRONG"], "contents": ["cobalt-saddle-\n2194", "cobalt-saddle-<scratch>2194", "cobalt-saddle-##"]}
+{"section": "bad_code", "code": "cobalt-saddle-6610", "kinds": ["NEAR", "WRONG", "NEAR"], "contents": ["cobalt-saddle-\n6610", "cobalt-saddle-import-6610", "cobalt-saddle-\n6610"]}
+{"section": "bad_code", "code": "dusty-raven-9694", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-raven-<truncated>", "dusty-raven-<br>", "dusty-raven- and I will not mention any other code."]}
+{"section": "bad_code", "code": "dusty-walnut-5945", "kinds": ["NEAR", "WRONG", "WRONG"], "contents": ["dusty-w\nalnut-5945", "dusty-w#-5945", "dusty-w#-5945"]}
+{"section": "bad_code", "code": "eager-pepper-2696", "kinds": ["NEAR", "WRONG", "WRONG"], "contents": ["eager-pepper-\n2696", "eager-pepper-3s96", "eager-pepper-<truncated>"]}
+{"section": "bad_code", "code": "eager-pepper-3145", "kinds": ["WRONG", "NEAR", "WRONG"], "contents": ["eager-pepper-8c1f2a", "eager-pepper-.3145", "eager-pepper-f3145"]}
+{"section": "bad_code", "code": "eager-pepper-8583", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["eager-pepper-\n8583", "eager-pepper-\n8583", "eager-pepper-#8583"]}
+{"section": "bad_code", "code": "ginger-raven-0024", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["ginger-raven-/*0024*/", "ginger-raven-\n0024", "ginger-raven-## 0024"]}

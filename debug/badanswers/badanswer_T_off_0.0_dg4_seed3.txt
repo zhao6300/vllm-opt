@@ -1,0 +1,24 @@
+{"section": "progress", "round": 0, "counts": {"OK": 76, "NEAR": 9, "WRONG": 11}}
+{"section": "progress", "round": 1, "counts": {"OK": 152, "NEAR": 18, "WRONG": 22}}
+{"section": "progress", "round": 2, "counts": {"OK": 228, "NEAR": 27, "WRONG": 33}}
+{"section": "summary", "total": 288, "bad": 60, "rate": 0.2083, "kinds": {"OK": 228, "NEAR": 27, "WRONG": 33}, "bad_normalized": 33, "rate_normalized": 0.1146, "temperature": 0.0, "thinking": "off", "per_code_fail_counts": {"0": 76, "3": 20}, "codes_ever_bad": 20, "codes_bad_all_rounds": 20, "sticky_fraction": 1.0, "elapsed_s": 37.8, "cached_tokens_nonzero": 0, "prompt_tokens": [30, 31], "finish_reasons": {"stop": 288}}
+{"section": "bad_code", "code": "brisk-otter-8359", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["brisk-otter-\n8359", "brisk-otter-\n8359", "brisk-otter-\n8359"]}
+{"section": "bad_code", "code": "brisk-pepper-9123", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-pepper-<ip>", "brisk-pepper-<ip>", "brisk-pepper-<ip>"]}
+{"section": "bad_code", "code": "brisk-quartz-3420", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-quartz-342<|im_end|>", "brisk-quartz-342<|im_end|>", "brisk-quartz-342<|im_end|>"]}
+{"section": "bad_code", "code": "brisk-raven-4334", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-raven-<ip>", "brisk-raven-<ip>", "brisk-raven-<ip>"]}
+{"section": "bad_code", "code": "brisk-violet-2046", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-violet-204", "brisk-violet-204", "brisk-violet-204"]}
+{"section": "bad_code", "code": "brisk-walnut-8504", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["brisk-wal<untrusted_content>nut-8504</untrusted_content>", "brisk-wal<untrusted_content>nut-8504</untrusted_content>", "brisk-wal<untrusted_content>nut-8504</untrusted_content>"]}
+{"section": "bad_code", "code": "cobalt-saddle-8343", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["cobalt-saddle-\n8343", "cobalt-saddle-\n8343", "cobalt-saddle-\n8343"]}
+{"section": "bad_code", "code": "dusty-pepper-8180", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["dusty-pepper-\n8180", "dusty-pepper-\n8180", "dusty-pepper-\n8180"]}
+{"section": "bad_code", "code": "dusty-raven-8491", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["dusty-raven-<truncated>8491</truncated>", "dusty-raven-<truncated>8491</truncated>", "dusty-raven-<truncated>8491</truncated>"]}
+{"section": "bad_code", "code": "eager-pepper-0988", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["eager-pepper-\n0988", "eager-pepper-\n0988", "eager-pepper-\n0988"]}
+{"section": "bad_code", "code": "eager-pepper-8557", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-pepper-<ip>", "eager-pepper-<ip>", "eager-pepper-<ip>"]}
+{"section": "bad_code", "code": "eager-raven-4047", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["eager-raven-\n4047", "eager-raven-\n4047", "eager-raven-\n4047"]}
+{"section": "bad_code", "code": "eager-saddle-8506", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["eager-saddle-<ip>", "eager-saddle-<ip>", "eager-saddle-<ip>"]}
+{"section": "bad_code", "code": "eager-tundra-4356", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["eager-tundra-\n4356", "eager-tundra-\n4356", "eager-tundra-\n4356"]}
+{"section": "bad_code", "code": "fuzzy-raven-9743", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["fuzzy-raven-\n9743", "fuzzy-raven-\n9743", "fuzzy-raven-\n9743"]}
+{"section": "bad_code", "code": "fuzzy-violet-1683", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["fuzzy-violet-168", "fuzzy-violet-168", "fuzzy-violet-168"]}
+{"section": "bad_code", "code": "fuzzy-walnut-2679", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["fuzzy-w", "fuzzy-w", "fuzzy-w"]}
+{"section": "bad_code", "code": "ginger-raven-0784", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["ginger-raven-\n0784", "ginger-raven-\n0784", "ginger-raven-\n0784"]}
+{"section": "bad_code", "code": "hollow-raven-4646", "kinds": ["NEAR", "NEAR", "NEAR"], "contents": ["hollow-raven-\n4646", "hollow-raven-\n4646", "hollow-raven-\n4646"]}
+{"section": "bad_code", "code": "hollow-tundra-0055", "kinds": ["WRONG", "WRONG", "WRONG"], "contents": ["hollow-tundra-005", "hollow-tundra-005", "hollow-tundra-005"]}

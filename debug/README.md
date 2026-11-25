@@ -109,10 +109,34 @@ mixed steps as well.
 
 ## Caveats
 
-- Based on `33452c74d5` (includes the committed short-context gate and the
-  step dump). The debug hook forces the full indexer path, which is the control
-  we want.
+- Based on the debug branch merged up to `44d33e2366` (the port branch plus
+  `ffdb285414` fixed-order combine, `c986fdb378` padded decode rows, and the
+  short-context gate). The debug hook forces the full indexer path, which is
+  the control we want.
+- This worktree has no compiled extensions; they are symlinked from
+  `/workspace/vllm-opt/vllm` (`*.so`, `_version.py`, `third_party/deep_gemm`,
+  `fmha_sm100`, `tml_fa4`, `triton_kernels`) and listed in
+  `.git/info/exclude`, so `git status` stays clean. Re-link them if the
+  production worktree is rebuilt or moved.
 - `FULL_DECODE_ONLY` still captures the pure-decode FULL graphs; their Python
   only runs at capture. The TF request's prefill/mixed steps are eager and are
   the ones dumped.
 - Dumps go to `/dev/shm`; remove the directory between runs.
+
+## Bad-answer archive
+
+`debug/badanswers/` holds the chat-path records copied from the session
+workspace `/workspace/debug-vllm` on 2026-11-25:
+
+- `badanswer_T_{off,on}_<temp>_<tag>_seed<N>.txt` — outputs of
+  `badanswer_matrix.py`: sequential T=0 (or T=0.7/1.0) requests, concurrency 1,
+  a fresh `cache_salt` per attempt. One JSONL record per line with
+  `section: progress | summary | bad_code`; `thinking` and temperature are in
+  the filename.
+- `badanswer_margin*.txt` — outputs of `badanswer_margin.py`: top-5 per-token
+  margins for the fixed bad-code list, `lone` vs a co-batched background
+  decoder.
+- The two scripts are archived with the records. They import helpers such as
+  `longctx_probe` from `/workspace/debug-vllm`, so treat this as the record of
+  the runs, not a standalone rerun package. The API key is read from
+  `/proc/<pid>/cmdline` at runtime and is not stored.
