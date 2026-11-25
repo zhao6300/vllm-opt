@@ -526,6 +526,42 @@ def _varlen_decode_rows(
     )
 
 
+class _PaddedDecodeRows:
+    """Map between the flat decode rows and their `[B, width]` padded layout.
+
+    Padded slot `b * width + j` holds flat row `starts[b] + j` when
+    `j < decode_lens[b]`. Built on the device, without host syncs.
+    """
+
+    def __init__(
+        self, decode_lens: torch.Tensor, num_decode_tokens: int, width: int
+    ) -> None:
+        lens = decode_lens.long()
+        self.starts = torch.cumsum(lens, 0) - lens
+        offsets = torch.arange(width, device=lens.device)
+        self.source = (self.starts[:, None] + offsets).view(-1)
+        self.valid = (offsets < lens[:, None]).view(-1)
+        self.lens = lens
+        self.width = width
+        self.num_decode_tokens = num_decode_tokens
+
+    def pack(self, rows: torch.Tensor, fill: int = -1) -> torch.Tensor:
+        """`rows[:num_decode_tokens]` in the padded layout, `fill` in padding."""
+        source = self.source.clamp(max=max(self.num_decode_tokens - 1, 0))
+        return torch.where(self.valid[:, None], rows[source], fill)
+
+    def unpack_into(self, padded: torch.Tensor, rows: torch.Tensor) -> None:
+        """Write the padded layout's live slots to `rows[:num_decode_tokens]`."""
+        n = self.num_decode_tokens
+        requests = torch.repeat_interleave(
+            torch.arange(self.lens.numel(), device=self.lens.device),
+            self.lens,
+            output_size=n,
+        )
+        offsets = torch.arange(n, device=self.lens.device) - self.starts[requests]
+        rows[:n] = padded[requests * self.width + offsets]
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -1310,6 +1346,14 @@ def sparse_attn_indexer(
             ).takes_bf16_logits(logits, topk_tokens, logits.shape[0]):
                 logits = as_fp32_logits(logits, seq_lens.view(-1))
         num_rows = logits.shape[0]
+        # A padded batch has more rows than decode tokens, and the shared
+        # buffers' rows past num_decode_tokens hold this step's prefills,
+        # which ran first: the padded rows live in scratch instead.
+        padded_rows = (
+            _PaddedDecodeRows(decode_lens, num_decode_tokens, next_n)
+            if needs_padded_path
+            else None
+        )
         if candidate_blocks is not None:
             # Two-level selection (v4.1) on the decode logits; columns are
             # request-local compressed positions. seq_lens is (B, next_n)
@@ -1319,6 +1363,14 @@ def sparse_attn_indexer(
             row_repeat = next_n if vis.numel() != num_rows else 1
             vis = vis[:num_rows]
             decode_candidates = candidate_blocks[:num_rows]
+            if padded_rows is not None:
+                # The buffer keeps flat rows, as the prefill and candidate
+                # indexer paths read them.
+                decode_candidates = (
+                    candidate_blocks.new_empty((num_rows, candidate_blocks.shape[1]))
+                    if candidate_write
+                    else padded_rows.pack(candidate_blocks)
+                )
             if candidate_write:
                 _select_candidate_blocks(
                     logits,
@@ -1343,7 +1395,15 @@ def sparse_attn_indexer(
                     candidate_block_size,
                     row_repeat,
                 )
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+            if padded_rows is not None and candidate_write:
+                padded_rows.unpack_into(decode_candidates, candidate_blocks)
+        if padded_rows is None:
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        else:
+            # Same row stride as the buffer: some top-k kernels require it.
+            topk_indices = topk_indices_buffer.new_empty(
+                (num_padded_tokens, topk_indices_buffer.shape[1])
+            )[:, :topk_tokens]
 
         # The backend comes from the layer (config is only readable at model
         # construction); dispatchers are cached per backend.
