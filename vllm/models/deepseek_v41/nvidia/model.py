@@ -377,12 +377,17 @@ def maybe_init_gemm_rs(vllm_config: VllmConfig, use_sequence_parallel: bool) -> 
 
 
 def _debug_phase(root: str) -> str:
-    """Phase name from `<root>/phase` (`alone` or `mixed`)."""
+    """Phase name from `<root>/phase` (`alone`, `mixed` or `decode`).
+
+    No phase file, or `off`, disables every dump: the hooks then cost one
+    `open` per call, with no device sync or file write, so a matrix can run
+    with the hooks loaded and only a targeted request writes the phase file.
+    """
     try:
         with open(os.path.join(root, "phase")) as f:
-            return f.read().strip() or "default"
+            return f.read().strip() or "off"
     except OSError:
-        return "default"
+        return "off"
 
 
 def _debug_phase_dir(root: str) -> str:
@@ -413,6 +418,14 @@ def _debug_dump_tf_rows(
     # is valid while CUDA is capturing a graph.
     if torch.cuda.is_current_stream_capturing():
         return
+    phase = _debug_phase(root)
+    if phase == "off":
+        return
+    layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
+    if layers:
+        wanted = [x.strip() for x in layers.split(",") if x.strip()]
+        if wanted and not any(x in attn.prefix for x in wanted):
+            return
     if not is_forward_context_available():
         return
     attn_metadata = get_forward_context().attn_metadata
@@ -423,7 +436,8 @@ def _debug_dump_tf_rows(
         return
     decode_rows = False
     if swa.num_prefill_tokens > 0:
-        phase = _debug_phase(root)
+        if phase == "decode":
+            return
         if phase == "mixed" and swa.num_decode_tokens == 0:
             return
         if phase == "alone" and swa.num_decode_tokens > 0:
@@ -435,13 +449,7 @@ def _debug_dump_tf_rows(
         start, stop = 0, int(swa.num_decode_tokens)
     else:
         return
-    layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
-    if layers:
-        wanted = [x.strip() for x in layers.split(",") if x.strip()]
-        if wanted and not any(x in attn.prefix for x in wanted):
-            return
     num_batch = positions.shape[0]
-    pos0 = int(positions[0])
     base = 0
     if tensor.shape[0] != num_batch:
         tp = get_tensor_model_parallel_world_size()
@@ -453,6 +461,7 @@ def _debug_dump_tf_rows(
             return
     rows = tensor[start - base : stop - base]
     if decode_rows:
+        pos0 = int(positions[0])
         name = (
             f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
             f"__dev{torch.cuda.current_device()}"
@@ -465,8 +474,10 @@ def _debug_dump_tf_rows(
             )
             if not os.path.exists(ids_path):
                 torch.save(
-                    {"input_ids": input_ids.detach().cpu(),
-                     "positions": positions.detach().cpu()},
+                    {
+                        "input_ids": input_ids.detach().cpu(),
+                        "positions": positions.detach().cpu(),
+                    },
                     ids_path,
                 )
     else:

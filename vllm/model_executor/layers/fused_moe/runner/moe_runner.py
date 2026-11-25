@@ -83,9 +83,16 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
         return
     try:
         with open(os.path.join(root, "phase")) as f:
-            phase = f.read().strip() or "default"
+            phase = f.read().strip() or "off"
     except OSError:
-        phase = "default"
+        phase = "off"
+    if phase == "off":
+        return
+    layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
+    if layers:
+        wanted = [x.strip() for x in layers.split(",") if x.strip()]
+        if wanted and not any(x in str(layer_name) for x in wanted):
+            return
     fc = get_forward_context()
     md = fc.attn_metadata
     if not isinstance(md, dict):
@@ -94,20 +101,20 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
         (
             v
             for v in md.values()
-            if hasattr(v, "num_decode_tokens")
-            and hasattr(v, "num_prefill_tokens")
+            if hasattr(v, "num_decode_tokens") and hasattr(v, "num_prefill_tokens")
         ),
         None,
     )
     if swa is None:
         return
     seq_lens = getattr(swa, "seq_lens", None)
-    if seq_lens is not None and seq_lens.numel():
-        if int(seq_lens.max()) <= 1:
-            return  # graph-capture / idle dummy step
+    if seq_lens is not None and seq_lens.numel() and int(seq_lens.max()) <= 1:
+        return  # graph-capture / idle dummy step
     nd, npf = int(swa.num_decode_tokens), int(swa.num_prefill_tokens)
     decode_rows = False
     if npf > 0:
+        if phase == "decode":
+            return
         if phase == "mixed" and nd == 0:
             return
         if phase == "alone" and nd > 0:
@@ -156,7 +163,6 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
             f"__start{start}__rows{stop - start}.pt",
         ),
     )
-
 
 
 def register_layer_for_moe_forward_op(
