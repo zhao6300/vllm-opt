@@ -2116,7 +2116,10 @@ PP relay/MoE·EP）。patch 在 `flashinfer_sparse.py:1317` 附近。
 或共享状态。
 
 **线 1 的调试分支（本地未推送）。** 分支 `debug/dsv41-tf-dump`，worktree
-`/workspace/vllm-opt-dbg`，commit `0fb41e7660`（hook）+ `1ec8a17b30`（sim）。
+`/workspace/vllm-opt-dbg`，已 rebase 到 `33452c74d5`（含 `33df21c7ff` 短上下文 gate
+和 `33452c74d5` step dump），commit `740522ca3c`（TF 行 hook）+ `eb6fbdb511`
+（metadata sim）+ `06ebe6cc55`（runner/PP 行 dump、层过滤、input sim）；主工作树的
+`debug/dsv41-mixed-step-dumps` 已 ff 到同一 commit。
 `VLLM_DEBUG_TF_DIR` 控制：每个 decoder layer 的 attention 后/FFN 后把 TF 行 dump 到
 `<root>/<phase>/`，phase 由 `<root>/phase` 文件切换（`alone`/`mixed`，hook 会跳过不属于
 该 phase 的步）；`_forward_sparse_impl` 比较 prefill 调用前后的
@@ -2125,6 +2128,94 @@ PP relay/MoE·EP）。patch 在 `flashinfer_sparse.py:1317` 附近。
 `_short_context_topk_is_uncaptured` 强制返回 False，保证 alone/mixed 走同一条 indexer
 路径。配合 `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `FULL_DECODE_ONLY`（混合步必须 eager）；
 runbook 和比较脚本在 `debug/README.md`、`debug/compare_tf_dumps.py`。
+
+**11-25 10:55 的 eager 判别（breakable=0 + FULL_DECODE_ONLY，DSpark on、CAKE=0）。**
+teacher-force 用 `--pad-k` 控制 prefill 长度，同时跑 bg decode（其微批里 6 行 decode，
+D=6）：
+
+- **decode 调用不改写 prefill 输出**：日志里 938 条
+  `[mixed] ... decode changed prefill output:` 全部是 **0.0**。SM120 wrapper /
+  caller scratch 不是这条翻转的机制。
+- **flip 是 batch 形状的函数，且逐码不同**。在 D=6 下扫 prefill 37..49
+  （batch 43..55）：
+  - `cobalt-raven-0225`：pref 41/42（batch 47/48）、45/46（51/52）、49（55）翻；
+    37–40、43/44、47/48 不翻；
+  - `hollow-raven-6153`：pref 37（batch 43）、41/42（47/48）翻；其余采样点不翻。
+  同一请求内容、同一条 decode 行，只有 batch 行数/偏移变了，说明是 shape 敏感的
+  kernel 效应（MoE/EP 的按 token 路由和 combine 归约顺序是首要嫌疑），不是 decode
+  路径特有的分支。
+- 生产 PIECEWISE 的 37+6 real → 48 padded 正好落在 D=6、batch=48 的 flip 形状上，
+  与最初的 13 nat 观测一致。
+- **内容对照被环境流量污染**：同一个 `pref=40` 在日志里出现了 D=6/12/18/24/30/36/42/
+  54/66 多种微批组成；4 条 bg decode 的 pad/decode token 内容 A/B 不能直接比，必须
+  用 `[mixed]` 的 `dec/pref/batch` 记录每次的 D 才能控制。
+- 层 dump 原来没有 device/DP rank 和请求 tag，另一个 DP rank 的环境流量会覆盖同名
+  文件（`attnprefbefore/after` 的非零差异就是这种覆盖造成的，per-call 日志是 0.0）。
+  调试分支 `6bf3fed69b` 已把 device 和 `dec<D>_pref<P>` 加进文件名，`e0fecc0409`
+  又加了 router logits/top-k/margin dump；主工作树已 ff 到该 commit。
+
+**同 B/N 的受控对子（11-25 12:xx，pid 2812988）。** 单独 P=48（B=N=48，全 prefill）
+vs 混合 D=6/P=42（B=N=48）；日志里恰好 80 行 `dec=6 pref=42 batch=48`，没有别的
+`pref=42` 组成。逐层比较（前 42 行输入完全相同，只有最后 6 行是 prefill pad vs
+decode）：
+
+- layer 0 `attn` 输出**逐位相同**（max_abs 0.0）；
+- layer 0 `ffn` 第一次出现差异：**0.0156**，从 row 18 开始；之后逐层放大，layer 19
+  `ffn` 到 20.28。
+- 所以第一处分岔在 **MoE/FFN 内部**，attention 侧到 layer 0 输出为止是干净的。
+- 随后加载 router/ffnin/combine dump 的实测见下。
+
+**SP 切分边界已对上（同一对子）。** layer 0 `ffn` 的差异**只在 row 18–23**
+（18/19/21/23 非零，20/22 恰好相同）；**row 0–17 和 24–41 逐位相同**。B=48、
+TP2、SP chunk=24 时，TF 的 18–23 正好是 6 条 decode 行把 prefill 顶到 global
+row 6 后、从 TP rank 0 换到 rank 1 的那 6 个 token。每行 max_abs 是 2 的幂
+（2⁻⁶/2⁻⁸/2⁻⁹），即 1 ulp 量级；layer 0 的相对范数 2.5e-3。之后相对范数逐层放大：
+L1 attn 3.7e-2、L10 ~0.5、L16–18 ~1、L19 ffn 4.8；从 L1 起最大行都是 row 34
+（答案 `-`，翻转位 35 的前一位）。所以最初的扰动是这 6 个换 rank token 上的
+rank-dependent collective，后面才是放大。`ffnin`（mHC merge 之后、MoE 之前）和
+router logits 的 dump 已在 `c88dfebee8`/`e0fecc0409` 就绪，用来区分是 mHC boundary
+的 TP collective 还是 MoE combine。
+
+**ffnin / router 结果（同一对子）。** `ffnin` layer 0 = 0.0：mHC 之后、MoE 之前逐位
+相同，mHC boundary 排除。layer 0 router logits 也逐位相同（top-6/top-1 差异 0），所以
+layer 0 的 1 ulp 发生在 **router 之后**：expert GEMM 或 EP combine。router top-6 的
+放大链：L1 无翻转；**L2 首次翻转在 row 21（system prompt 码 token，margin 0.003）和
+row 40（pad，0.012）**；L3 加入 row 35（答案数字位）并出现 2 个 top-1 翻转；L5 加入
+row 34。combine 前/后的 dump（`0026fcba20`，`moeprecombine`/`moepostcombine`）
+随后实测，见下。
+
+**combine pre/post 的实测（layer 0）。** pre 和 post **都已经不同**（rows
+18/19/21/23，max 0.0078），且 **post == pre**。这个 backend
+（`allgather_reducescatter` + internal MK，`supports_internal_mk=True`）下
+`do_naive_dispatch_combine=False`，`_maybe_combine` 是 no-op，EP combine 在
+`_apply_quant_method` 内部完成，`moeprecombine` 拿到的已经是 method 输出。所以这一枪
+只排除了 naive `_maybe_combine` 的 reduce_scatterv，没有分开 expert GEMM 和内部
+all2all combine。随后做了 backend A/B（见下）。
+
+**最终因果链（与 GPU 数据一致）。** 6 条 decode 行把 TF 的 18–23 从 TP rank 0 挤到
+rank 1；EP=4 的 combine 对这 6 个 token 的 4 路部分和换了结合顺序，产生 1 ulp。
+0–17 和 24–41 留在原 root，尽管每专家 M 变了仍逐位相同，所以 expert GEMM 对这些
+token 不依赖 M/位置，唯一和 root 有关的步骤就是 combine。TP=2 的 reduce-scatter 只有
+两个部分和相加（a+b = b+a），所以 attention 输出逐位相同；EP=4 的四路结合顺序才会
+差 1 ulp。之后 1 ulp 在 L2 先翻码 token 21 的 top-6，随后是答案位 35/34，L19 相对差
+到 4.8。生产 PIECEWISE 的 alone 那 6 行是真实 vLLM padding 行（被跳过）；eager 的
+B=N=48 对子用的是真实 pad token，M 变化是内容驱动，但行模式相同。**backend A/B
+已完成**：`--moe-backend flashinfer_cutlass`（同一对子、同一 all2all）下 layer 0 的
+模式与 deep_gemm 完全相同——attn/ffnin 0，ffn 0.015625（rows 18/19/21/23），
+`moeprecombine`/`moepostcombine` 都是 0.007812 且相等，router L0 逐位相同；答案仍翻
+（12.95）。所以 expert GEMM 排除，seed 在两种 backend 共用的 EP communication/combine
+路径。内部 all2all 的 per-rank partial 直接测量仍待补（`_maybe_combine` 对两者都是
+no-op，需要 hook `all2all.py` 的 reduce_scatterv 或换 all2all backend）。
+
+**结论与修复方向。** 这不是 attention/metadata/kernel 的功能 bug，而是 **MoE 输出依赖
+token 落在哪个 SP shard**：6 条 decode 行把 TF 的 18–23 挤到 TP rank 1，EP4 combine
+对它们的 4 路部分和换了结合顺序，产生 1 ulp，再经过 L2–L5 的低 margin top-6 路由决策
+逐层放大。已排除：attention（含 TP reduce，`a+b=b+a`）、mHC boundary（`ffnin` 逐位
+相同）、runner/metadata、expert GEMM backend（deep_gemm / flashinfer_cutlass 同一 1 ulp）、
+naive `_maybe_combine`、layer 0 router。修复方向：让 combine 的归约与 token 的 root
+无关（固定顺序/确定性归约），或 DP4/TP1 让一个请求的 token 永远落在同一个 root；
+TP2 的 reduce-scatter 不需要改。内部 all2all 的 per-rank partial 直接测量是可选的最后
+一块拼图，不影响上述结论。
 
 thinking=false、T=0 同一格：strict 59/288（20.5%，28 WRONG + 31 NEAR），去格式
 28/288（9.7%）；坏码 30 个，但只有 12 个与 DeepGEMM 那 16 个重合，18 个是新的、4 个
