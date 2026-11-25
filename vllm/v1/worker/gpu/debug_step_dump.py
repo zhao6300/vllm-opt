@@ -26,6 +26,7 @@ import json
 import os
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.logger import init_logger
@@ -52,23 +53,54 @@ def _only_mixed() -> bool:
     return os.getenv("VLLM_DEBUG_STEP_ONLY_MIXED", "1") == "1"
 
 
-def force_eager_early_decode(num_computed_tokens_np: Any, batch_req_state: Any) -> bool:
+_EAGER_MARKED: np.ndarray | None = None
+
+
+def note_debug_request(req_index: int, sampling_params: Any, max_num_reqs: int) -> None:
+    """Record whether a new request asked for eager steps.
+
+    A request marks itself with ``vllm_xargs: {"debug_eager": 1}`` in the
+    OpenAI request body (`SamplingParams.extra_args`). Every worker sees the
+    same scheduler output, so the mark is the same on every rank.
+    """
+    global _EAGER_MARKED
+    if _EAGER_MARKED is None:
+        _EAGER_MARKED = np.zeros(max_num_reqs, dtype=bool)
+    extra = getattr(sampling_params, "extra_args", None) or {}
+    _EAGER_MARKED[req_index] = bool(extra.get("debug_eager"))
+
+
+def force_eager_debug_step(num_computed_tokens_np: Any, batch_req_state: Any) -> bool:
     """Whether to run this step eagerly so the Python dump hooks see it.
 
-    With ``VLLM_DEBUG_EAGER_DECODE_TOKENS=N`` (> 0), a step runs eager when one
-    of its decoding requests has generated fewer than N tokens since its
-    prefill, e.g. N=1 makes only each request's first verify step after the
-    prefill eager. The decision reads only scheduler-synced request state, so
-    every TP rank and PP stage takes it alike, and the DP sync makes the other
-    DP ranks follow. Every other decode step keeps replaying its graph.
+    A step runs eager when any of these holds (each off by default):
+
+    - it holds a request marked with ``vllm_xargs: {"debug_eager": 1}``:
+      every step of that request, prefill and decode, under any
+      `cudagraph_mode`;
+    - ``VLLM_DEBUG_EAGER_PREFILL=1`` and it has prefill rows (prefill and
+      mixed steps eager under `FULL_AND_PIECEWISE` too);
+    - ``VLLM_DEBUG_EAGER_DECODE_TOKENS=N`` (> 0) and one of its decoding
+      requests has generated fewer than N tokens since its prefill, e.g.
+      N=1 makes each request's first verify step eager.
+
+    The decision reads only scheduler-synced request state, so every TP rank
+    and PP stage takes it alike, and the DP sync makes the other DP ranks
+    follow. All other steps keep replaying their graphs.
     """
+    if batch_req_state is None:
+        return False
+    idx_all = batch_req_state.idx_mapping_np
+    if _EAGER_MARKED is not None and _EAGER_MARKED[idx_all].any():
+        return True
+    prefilling = batch_req_state.is_prefilling_np
+    if os.getenv("VLLM_DEBUG_EAGER_PREFILL", "0") == "1" and prefilling.any():
+        return True
     limit = int(os.getenv("VLLM_DEBUG_EAGER_DECODE_TOKENS", "0"))
-    if limit <= 0 or batch_req_state is None:
+    decoding = ~prefilling
+    if limit <= 0 or not decoding.any():
         return False
-    decoding = ~batch_req_state.is_prefilling_np
-    if not decoding.any():
-        return False
-    idx = batch_req_state.idx_mapping_np[decoding]
+    idx = idx_all[decoding]
     since = num_computed_tokens_np[idx] - batch_req_state.prefill_len_np[decoding]
     return bool((since < limit).any())
 

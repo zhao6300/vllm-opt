@@ -130,7 +130,8 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.debug_step_dump import (
     dump_inputs,
     dump_outputs,
-    force_eager_early_decode,
+    force_eager_debug_step,
+    note_debug_request,
 )
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
@@ -1366,6 +1367,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
             )
             req_index = self.req_states.req_id_to_index[req_id]
+            note_debug_request(req_index, sampling_params, self.req_states.max_num_reqs)
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
             if self.speculator is not None:
@@ -1976,7 +1978,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_query_len=max_query_len,
             need_eager=is_profile
             or skip_compiled
-            or force_eager_early_decode(
+            or force_eager_debug_step(
                 self.req_states.num_computed_tokens_np, batch_req_state
             ),
             num_active_loras=num_active_loras,
