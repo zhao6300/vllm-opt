@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
@@ -13,6 +14,8 @@ from vllm.config.parallel import ExpertPlacementStrategy
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
@@ -67,6 +70,70 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _debug_router_dump(layer_name, router_logits):
+    """Dump the TF rows of a MoE layer's router logits (debug only)."""
+    root = os.environ.get("VLLM_DEBUG_TF_DIR")
+    if not root or not torch.is_tensor(router_logits) or router_logits.dim() != 2:
+        return
+    if not is_forward_context_available():
+        return
+    try:
+        with open(os.path.join(root, "phase")) as f:
+            phase = f.read().strip() or "default"
+    except OSError:
+        phase = "default"
+    fc = get_forward_context()
+    md = fc.attn_metadata
+    if not isinstance(md, dict):
+        return
+    swa = next(
+        (
+            v
+            for v in md.values()
+            if hasattr(v, "num_decode_tokens")
+            and hasattr(v, "num_prefill_tokens")
+        ),
+        None,
+    )
+    if swa is None:
+        return
+    nd, npf = int(swa.num_decode_tokens), int(swa.num_prefill_tokens)
+    if npf <= 0:
+        return
+    if phase == "mixed" and nd == 0:
+        return
+    if phase == "alone" and nd > 0:
+        return
+    bd = getattr(fc, "batch_descriptor", None)
+    num_batch = int(getattr(bd, "num_tokens", 0)) if bd is not None else 0
+    n_rows = router_logits.shape[0]
+    if num_batch and n_rows == num_batch:
+        base = 0
+    else:
+        tp = get_tensor_model_parallel_world_size()
+        if not num_batch or tp <= 1:
+            return
+        chunk = (num_batch + tp - 1) // tp
+        if n_rows != chunk:
+            return
+        base = get_tensor_model_parallel_rank() * chunk
+    start, stop = max(nd, base), min(nd + npf, base + n_rows)
+    if stop <= start:
+        return
+    path = os.path.join(root, phase)
+    os.makedirs(path, exist_ok=True)
+    tag = str(layer_name).replace("/", "_")
+    torch.save(
+        router_logits[start - base : stop - base].detach().cpu(),
+        os.path.join(
+            path,
+            f"router__{tag}__dev{torch.cuda.current_device()}"
+            f"__start{start}__rows{stop - start}.pt",
+        ),
+    )
+
 
 
 def register_layer_for_moe_forward_op(
@@ -1007,6 +1074,7 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
+        gate_ready = False
         if self.gate is not None:
             if self._fse_fuse_gate:
                 router_logits = dispatch_unquantized_gemm()(
@@ -1014,6 +1082,9 @@ class MoERunner(MoERunnerInterface):
                 )
             else:
                 router_logits, _ = self.gate(hidden_states)
+            gate_ready = True
+        if gate_ready:
+            _debug_router_dump(self.layer_name, router_logits)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
