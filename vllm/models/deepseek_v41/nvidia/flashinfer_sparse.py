@@ -387,6 +387,87 @@ def _sm120_caller_buffers_for_layer(
     return buffers
 
 
+# Layer-0 attention I/O for the precise CPU reference
+# (`VLLM_DEBUG_ATTN_DUMP=1`). Records are normalized to 512 value bytes plus
+# the 16 UE8M0 scale bytes, whatever the cache layout.
+_debug_attn_calls: dict[tuple[str, int], int] = {}
+
+
+def _debug_attn_dump(
+    tag: str,
+    layer_prefix: str,
+    q: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    lens: torch.Tensor,
+    sink: torch.Tensor | None,
+    scale: float,
+    output: torch.Tensor,
+    *,
+    footer: bool,
+    block: int,
+) -> None:
+    root = os.environ.get("VLLM_DEBUG_TF_DIR")
+    if not root or not os.environ.get("VLLM_DEBUG_ATTN_DUMP"):
+        return
+    if ".layers.0." not in layer_prefix:
+        return
+    try:
+        with open(os.path.join(root, "phase")) as f:
+            phase = f.read().strip() or "default"
+    except OSError:
+        phase = "default"
+    out_dir = os.path.join(root, phase)
+    os.makedirs(out_dir, exist_ok=True)
+    dev = torch.cuda.current_device()
+    call = _debug_attn_calls.get((tag, dev), 0)
+    _debug_attn_calls[(tag, dev)] = call + 1
+
+    flat = cache.view(torch.uint8).reshape(-1)
+    idx = indices.detach().reshape(-1)
+    uniq = torch.unique(idx[idx >= 0])
+    if uniq.numel():
+        if footer:
+            stride0 = cache.stride(0)
+            pages = uniq // block
+            rows = uniq % block
+            d512 = torch.arange(512, device=flat.device)
+            d16 = torch.arange(16, device=flat.device)
+            v = flat[(pages * stride0 + rows * 512)[:, None] + d512[None, :]]
+            s = flat[
+                (pages * stride0 + block * 512 + rows * 16)[:, None]
+                + d16[None, :]
+            ]
+            recs = torch.cat([v, s], dim=1)
+        else:
+            d528 = torch.arange(528, device=flat.device)
+            recs = flat[(uniq * 528)[:, None] + d528[None, :]]
+    else:
+        recs = torch.empty((0, 528), dtype=torch.uint8, device=flat.device)
+    torch.save(
+        {
+            "tag": tag,
+            "layer": layer_prefix,
+            "phase": phase,
+            "q": q.detach().cpu(),
+            "indices": indices.detach().cpu(),
+            "lens": lens.detach().cpu(),
+            "sink": None if sink is None else sink.detach().cpu(),
+            "scale": float(scale),
+            "output": output.detach().cpu(),
+            "recs": recs.cpu(),
+            "uniq": uniq.cpu(),
+            "footer": footer,
+            "block": int(block),
+            "cache_shape": tuple(cache.shape),
+            "cache_stride": cache.stride(0),
+        },
+        os.path.join(
+            out_dir, f"attn0__{tag}__dev{dev}__rows{q.shape[0]}__call{call}.pt"
+        ),
+    )
+
+
 def _sparse_mla_sm120_paged_attention(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -403,6 +484,8 @@ def _sparse_mla_sm120_paged_attention(
     prefill_impl: str | None,
     kv_scale_format: str,
     caller: _Sm120CallerBuffers | None = None,
+    layer_prefix: str = "",
+    phase_tag: str = "",
 ) -> None:
     """Run FlashInfer's SM120 sparse MLA wrapper in-place."""
     from flashinfer.mla._sparse_mla_sm120 import SparseMLASm120Wrapper
@@ -467,6 +550,22 @@ def _sparse_mla_sm120_paged_attention(
     finally:
         if caller is not None:
             caller.in_use = False
+    if phase_tag:
+        _debug_attn_dump(
+            phase_tag,
+            layer_prefix,
+            query,
+            swa_kv_cache,
+            sparse_indices,
+            topk_length,
+            attn_sink,
+            sm_scale,
+            output,
+            footer=kv_scale_format == "ue8m0_g32",
+            block=swa_kv_cache.shape[1]
+            if swa_kv_cache.dim() > 1
+            else 1,
+        )
 
 
 def _cake_dsv41_sm120_paged_attention(
@@ -482,6 +581,8 @@ def _cake_dsv41_sm120_paged_attention(
     extra_sparse_indices: torch.Tensor | None,
     extra_sparse_topk_lens: torch.Tensor | None,
     workspace: torch.Tensor,
+    layer_prefix: str = "",
+    phase_tag: str = "",
 ) -> None:
     """Run FlashInfer's SM120 DSv4.1 `cake` mixed-cache decode in-place.
 
@@ -503,6 +604,22 @@ def _cake_dsv41_sm120_paged_attention(
         extra_indices=extra_sparse_indices,
         extra_lengths=extra_sparse_topk_lens,
     )
+    if phase_tag:
+        _debug_attn_dump(
+            phase_tag,
+            layer_prefix,
+            query,
+            swa_kv_cache,
+            sparse_indices,
+            topk_length,
+            attn_sink,
+            sm_scale,
+            output,
+            footer=True,
+            block=swa_kv_cache.shape[1]
+            if swa_kv_cache.dim() > 1
+            else 1,
+        )
 
 
 # Flat-row (storage-offset) sparse indices of a padded inline-scale cache. One
@@ -1597,6 +1714,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                         else None
                     ),
                     workspace=self._cake_workspace(),
+                    layer_prefix=self.swa_cache_layer.prefix,
+                    phase_tag="dec",
                 )
             return
         _sparse_mla_sm120_paged_attention(
@@ -1614,6 +1733,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             prefill_impl=None,
             kv_scale_format=self.kv_scale_format,
             caller=self._sm120_caller_buffers,
+            layer_prefix=self.swa_cache_layer.prefix,
+            phase_tag="dec",
         )
 
     def _forward_prefill(
@@ -1749,4 +1870,6 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 prefill_impl=envs.VLLM_FLASHINFER_SM120_PREFILL_IMPL,
                 kv_scale_format=self.kv_scale_format,
                 caller=self._sm120_caller_buffers,
+                layer_prefix=self.swa_cache_layer.prefix,
+                phase_tag="pref",
             )

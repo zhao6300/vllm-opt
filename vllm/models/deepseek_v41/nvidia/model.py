@@ -470,7 +470,8 @@ def _debug_dump_tf_rows(
         if input_ids is not None and "layers.0." in attn.prefix:
             ids_path = os.path.join(
                 _debug_phase_dir(root),
-                f"dec_ids__pos{pos0}__rows{num_batch}.pt",
+                f"dec_ids__pos{pos0}"
+                f"__r{get_tensor_model_parallel_rank()}__rows{num_batch}.pt",
             )
             if not os.path.exists(ids_path):
                 torch.save(
