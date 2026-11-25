@@ -72,10 +72,10 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
-def _debug_router_dump(layer_name, router_logits):
-    """Dump the TF rows of a MoE layer's router logits (debug only)."""
+def _debug_router_dump(layer_name, tensor, tag="router"):
+    """Dump the TF rows of a MoE tensor (router logits or combine output)."""
     root = os.environ.get("VLLM_DEBUG_TF_DIR")
-    if not root or not torch.is_tensor(router_logits) or router_logits.dim() != 2:
+    if not root or not torch.is_tensor(tensor) or tensor.dim() != 2:
         return
     if not is_forward_context_available():
         return
@@ -108,7 +108,7 @@ def _debug_router_dump(layer_name, router_logits):
         return
     bd = getattr(fc, "batch_descriptor", None)
     num_batch = int(getattr(bd, "num_tokens", 0)) if bd is not None else 0
-    n_rows = router_logits.shape[0]
+    n_rows = tensor.shape[0]
     if num_batch and n_rows == num_batch:
         base = 0
     else:
@@ -124,12 +124,12 @@ def _debug_router_dump(layer_name, router_logits):
         return
     path = os.path.join(root, phase)
     os.makedirs(path, exist_ok=True)
-    tag = str(layer_name).replace("/", "_")
     torch.save(
-        router_logits[start - base : stop - base].detach().cpu(),
+        tensor[start - base : stop - base].detach().cpu(),
         os.path.join(
             path,
-            f"router__{tag}__dev{torch.cuda.current_device()}"
+            f"{tag}__{str(layer_name).replace('/', '_')}"
+            f"__dev{torch.cuda.current_device()}"
             f"__start{start}__rows{stop - start}.pt",
         ),
     )
@@ -1104,10 +1104,14 @@ class MoERunner(MoERunnerInterface):
                 hidden_states_scale=hidden_states_scale,
             )
 
-            return self._maybe_combine(
+            _debug_router_dump(self.layer_name, hidden_states, "moeprecombine")
+            result = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+            routed = result[1] if isinstance(result, tuple) else result
+            _debug_router_dump(self.layer_name, routed, "moepostcombine")
+            return result
 
     #########################################################
     #

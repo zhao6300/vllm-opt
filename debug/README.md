@@ -17,6 +17,9 @@ TF stream can be found.
     device (DP/PP rank), the global start row and the row count:
     `attn__<layer>__r<rank>__dev<N>__start<S>__rows<R>.pt`; the compare script
     concatenates the TP shards per device.
+- `vllm/model_executor/layers/fused_moe/runner/moe_runner.py` dumps the TF
+  rows of `router_logits`, the routed output before the EP combine
+  (`moeprecombine`), and the combined output (`moepostcombine`).
 - `vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py`
   - logs `[mixed] <layer> dec=... pref=... batch=... mode=...` per mixed
     attention call;
