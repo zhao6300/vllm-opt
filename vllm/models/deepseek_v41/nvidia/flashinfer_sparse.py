@@ -1352,7 +1352,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             self._forward_prefill(
                 q=q[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
-                swa_k_cache=swa_k_cache,
+                swa_k_cache=swa_kv_cache,
                 output=output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
