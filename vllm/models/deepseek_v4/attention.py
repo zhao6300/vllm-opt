@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepseekV4 MLA Attention Layer."""
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -1075,6 +1076,9 @@ class DeepseekV4Indexer(nn.Module):
         (a batch past the capture sizes, or any DP rank asking for eager) hits
         the same rows.
         """
+        if os.environ.get("VLLM_DEBUG_TF_DIR"):
+            # Keep the indexer path fixed for the mixed-batch bisect.
+            return False
         mode = self.vllm_config.compilation_config.cudagraph_mode
         if mode is None or mode == CUDAGraphMode.NONE:
             return True

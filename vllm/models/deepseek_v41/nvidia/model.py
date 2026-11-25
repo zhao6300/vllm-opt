@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from functools import partial
@@ -15,6 +16,7 @@ from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_pcp_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
@@ -372,6 +374,67 @@ def maybe_init_gemm_rs(vllm_config: VllmConfig, use_sequence_parallel: bool) -> 
         return False
     logger.info_once("To disable DeepSeek-V4.1 GEMM-RS, set VLLM_ENABLE_GEMM_RS=0.")
     return True
+
+
+def _debug_phase(root: str) -> str:
+    """Phase name from `<root>/phase` (`alone` or `mixed`)."""
+    try:
+        with open(os.path.join(root, "phase")) as f:
+            return f.read().strip() or "default"
+    except OSError:
+        return "default"
+
+
+def _debug_phase_dir(root: str) -> str:
+    path = os.path.join(root, _debug_phase(root))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _debug_dump_tf_rows(
+    attn: nn.Module, tensor: object, positions: torch.Tensor | None, tag: str
+) -> None:
+    """Dump the TF request's rows of a layer stream for the mixed-batch bisect.
+
+    Run with `VLLM_USE_BREAKABLE_CUDAGRAPH=0` and `FULL_DECODE_ONLY` so the
+    mixed prefill+decode step is eager and this Python runs on every step.
+    The TF request owns rows `[num_decode_tokens, +num_prefill_tokens)`.
+    """
+    root = os.environ.get("VLLM_DEBUG_TF_DIR")
+    if not root or not isinstance(tensor, torch.Tensor) or positions is None:
+        return
+    if not is_forward_context_available():
+        return
+    attn_metadata = get_forward_context().attn_metadata
+    if not isinstance(attn_metadata, dict):
+        return
+    swa = attn_metadata.get(attn.swa_cache_layer.prefix)
+    if swa is None or swa.num_prefill_tokens <= 0:
+        return
+    phase = _debug_phase(root)
+    if phase == "mixed" and swa.num_decode_tokens == 0:
+        return
+    if phase == "alone" and swa.num_decode_tokens > 0:
+        return
+    start = swa.num_decode_tokens
+    stop = start + swa.num_prefill_tokens
+    num_batch = positions.shape[0]
+    base = 0
+    if tensor.shape[0] != num_batch:
+        tp = get_tensor_model_parallel_world_size()
+        if tp <= 1 or num_batch % tp or tensor.shape[0] != num_batch // tp:
+            return
+        base = get_tensor_model_parallel_rank() * (num_batch // tp)
+        start, stop = max(start, base), min(stop, base + tensor.shape[0])
+        if stop <= start:
+            return
+    rows = tensor[start - base : stop - base]
+    path = os.path.join(
+        _debug_phase_dir(root),
+        f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
+        f"__start{start}__rows{stop - start}.pt",
+    )
+    torch.save(rows.detach().cpu(), path)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -751,6 +814,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
         if self.use_sequence_parallel and self.attn.gemm_rs is None:
             x = sp_reduce_scatter(x)
+        _debug_dump_tf_rows(self.attn, x, positions, "attn")
 
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
@@ -781,6 +845,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.ffn(x, input_ids, mega_gate_metadata)
         if mhc_stream is not None:
             torch.cuda.current_stream().wait_stream(mhc_stream)
+        _debug_dump_tf_rows(self.attn, x, positions, "ffn")
         return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
     def write_kv(

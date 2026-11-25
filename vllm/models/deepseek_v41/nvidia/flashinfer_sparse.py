@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, cast
 
@@ -58,6 +59,17 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+def _debug_phase_dir(root: str) -> str:
+    try:
+        with open(os.path.join(root, "phase")) as f:
+            phase = f.read().strip() or "default"
+    except OSError:
+        phase = "default"
+    path = os.path.join(root, phase)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 # FlashInfer resolves its decode plan -- the only plan that carves scratch out
 # of the caller-owned workspace -- for at most this many rows; wider batches
@@ -1315,15 +1327,36 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         swa_only: bool,
     ) -> None:
         num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        debug_mixed = (
+            os.environ.get("VLLM_DEBUG_MIXED_ATTN") == "1"
+            and num_decode_tokens > 0
+            and num_prefill_tokens > 0
+        )
+        if debug_mixed:
+            fc = get_forward_context()
+            bd = getattr(fc, "batch_descriptor", None)
+            print(
+                f"[mixed] {self.prefix} dec={num_decode_tokens} "
+                f"pref={num_prefill_tokens} "
+                f"batch={getattr(bd, 'num_tokens', None)} "
+                f"mode={getattr(fc, 'cudagraph_runtime_mode', None)}",
+                flush=True,
+            )
+        prefill_before = None
         if swa_metadata.num_prefills > 0:
             self._forward_prefill(
                 q=q[num_decode_tokens:],
                 compressed_k_cache=self_kv_cache,
-                swa_k_cache=swa_kv_cache,
+                swa_k_cache=swa_k_cache,
                 output=output[num_decode_tokens:],
                 attn_metadata=flashmla_metadata,
                 swa_metadata=swa_metadata,
             )
+            if debug_mixed:
+                prefill_before = output[
+                    num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                ].clone()
         if swa_metadata.num_decodes > 0:
             self._forward_decode(
                 q=q[:num_decode_tokens],
@@ -1333,6 +1366,31 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
             )
+            if debug_mixed:
+                prefill_after = output[
+                    num_decode_tokens : num_decode_tokens + num_prefill_tokens
+                ]
+                changed = (prefill_before - prefill_after).abs().max().item()
+                print(
+                    f"[mixed] {self.prefix} decode changed prefill output: "
+                    f"{changed}",
+                    flush=True,
+                )
+                root = os.environ.get("VLLM_DEBUG_TF_DIR")
+                if root:
+                    phase_dir = _debug_phase_dir(root)
+                    torch.save(
+                        prefill_before.detach().cpu(),
+                        os.path.join(
+                            phase_dir, f"attnprefbefore__{self.prefix}.pt"
+                        ),
+                    )
+                    torch.save(
+                        prefill_after.detach().cpu(),
+                        os.path.join(
+                            phase_dir, f"attnprefafter__{self.prefix}.pt"
+                        ),
+                    )
 
     def forward_mqa(
         self,
