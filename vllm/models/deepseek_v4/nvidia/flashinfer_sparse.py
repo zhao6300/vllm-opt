@@ -55,14 +55,35 @@ _FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64
 _FLASHINFER_DSV4_VALUE_DIM = 512
 _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH = 64
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+# Devices whose workspace has been used by a forward pass. Every layer's
+# ``__init__`` that can size it has run by then, so a later growth would move a
+# pointer a captured graph may have baked.
+_flashinfer_dsv4_workspace_frozen: set[torch.device] = set()
 
 
 def get_flashinfer_dsv4_workspace(
     device: torch.device, min_bytes: int = 0
 ) -> torch.Tensor:
+    # Forward paths request the buffer with ``min_bytes=0``; sizing callers
+    # (layer ``__init__``) pass a positive size before any forward runs.
+    if min_bytes == 0:
+        _flashinfer_dsv4_workspace_frozen.add(device)
     required = max(_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE, min_bytes)
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
     if workspace is None or workspace.numel() < required:
+        if workspace is not None and device in _flashinfer_dsv4_workspace_frozen:
+            raise RuntimeError(
+                "the shared FlashInfer DSv4 workspace cannot grow after a "
+                "forward has used it; size it from every layer's __init__"
+            )
+        if workspace is not None and device.type == "cuda":
+            with torch.cuda.device(device):
+                capturing = torch.cuda.is_current_stream_capturing()
+            if capturing:
+                raise RuntimeError(
+                    "the shared FlashInfer DSv4 workspace would grow during "
+                    "CUDA graph capture; every layer must size it in __init__"
+                )
         workspace = torch.zeros(required, dtype=torch.uint8, device=device)
         _flashinfer_dsv4_workspace_by_device[device] = workspace
     return workspace

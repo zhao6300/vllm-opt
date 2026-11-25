@@ -122,6 +122,17 @@ What runs on SM120 for this configuration, and the settings it requires:
 Not used on SM120: FlashMLA, FlashMLA mega attention, mega MoE and the mHC
 stream overlap. PCP would force FlashMLA, so do not enable it.
 
+**A/B or a second instance: give each its own calibration directory.** The
+SM120 wrapper now freezes the plan of every key captured into a CUDA graph, so
+a later calibration change cannot make eager calls and graph replays disagree.
+Shapes that are not captured still re-prepare when ``sparse_mla_sm120_cpb.json``
+changes, and two instances sharing ``FLASHINFER_WORKSPACE_BASE`` would rewrite
+that file for each other. For A/B runs set a per-instance
+``FLASHINFER_AUTOTUNE_DIR`` (e.g. ``/cache/jit/autotune-<port>``), or
+pre-calibrate once and make the file read-only. Calibration is only written
+during startup warmup; with a private directory the epoch is stable after
+capture.
+
 The SM120 FP4 KV fix on the base branch (`a0e2c96938`, "address FlashInfer
 sparse KV by cache row") was checked end to end with TP1 x DP4 + DSpark,
 block size 64 and `FULL_AND_PIECEWISE`. This deployment keeps the same

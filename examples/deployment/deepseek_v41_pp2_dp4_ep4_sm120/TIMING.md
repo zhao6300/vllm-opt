@@ -1713,6 +1713,17 @@ stream 改写时 attention 输出本身也会错。
 进程重试）。但**不能据此认为以后也不会写**：另一个实例、或按 FlashInfer 文档
 建议的「空闲进程预校准」，都会重新生成/改写这个文件。
 
+**发生时机：不只在启动。** 写入方可以来自本进程 warmup（rank 0，通常早于
+capture），也可以来自另一个实例或预校准进程（任意时刻）；创建、删除、改写
+都会改变 `(mtime_ns, size, inode)` 这个 token（内容不变也算）。`refresh_store`
+在每个 eager attention 调用上都会 stat 文件，所以“变化之后的下一个
+prefill/混合步”就会重新 `prepare`——替换动作本身只发生在**运行期**的 eager
+调用里。capture 调用不刷新（`_prepared.py:475-476`），因此不会在 capture 中
+替换。启动期唯一特殊的是本进程的校准写入一般早于自己的 capture；但 8 个
+worker 之间没有屏障，rank 0 的写入完全可能晚于另一个 rank 的 capture，效果
+仍是在那个进程运行期的第一次 eager 调用时出现。若文件从头到尾没人改，运行
+多久都不会触发；当前这次启动连文件都没有生成。
+
 **会重新变活的三种情况。** ① `CAKE=0`（decode 图开始烘 wrapper 的
 `lse/mid/mlse`）；② prefill 真的被捕捉进图（覆盖日志消失，例如模型有了
 compiled submodule，或换用别的 cudagraph 组合）；③ 服务运行期间有 writer 改写
@@ -1741,8 +1752,106 @@ prefill/混合步就会在运行时看到版本变化、重新 `prepare` 并释�
 或独立的预校准进程——它们可以在任意时刻写这个共享文件。
 
 **若要跑 CAKE=0。** 先在服务启动前把 CPB 校准跑完并退出写进程，再启动服务；
-或让 wrapper 使用调用方自己的 `out_lse`/`mid`/`mlse`；或按
+A/B 实例给独立的 `FLASHINFER_AUTOTUNE_DIR`（`_calibration.py:1139` 优先于
+workspace 路径），或预校准后把 cpb 文件设成只读（改权限不动 mtime，不会触发
+版本变化）；或让 wrapper 使用调用方自己的 `out_lse`/`mid`/`mlse`；或按
 `_constants_version` 变化触发 recapture。当前 CAKE=1 + FULL_DECODE_ONLY 不需要动。
+
+**归属：FlashInfer 侧是上游，vLLM 侧是我们。** `/workspace/flashinfer` 是干净树，
+HEAD 就是 `origin/main` = `42bbaf16`（正是 wheel 的 `__git_commit__`）；
+`prepare` 的替换语义和 “recapture affected graphs” 契约来自上游 PR #5197
+（2026-09-18，Gabriel Wu），不是本地 fork 补丁。而上游 vLLM
+（`upstream/main` 2f170a0f）**根本不用** `SparseMLASm120Wrapper`：DSv4.1 走
+`flashinfer_trtllm_batch_decode_sparse_mla_dsv4(..., workspace_buffer=
+get_flashinfer_dsv4_workspace(...))`，天然是 caller-owned workspace。本地提交
+2a1eb21aee（2026-09-16，“Route SM120 DSv4.1 through FP4 extra-cache wrapper”）
+把 SM120 换成了常驻 wrapper，8f0f2d07（2026-10-23）port 到 main——风险是这次换
+API 时引入的组合，不是上游 vLLM 的既有问题。
+
+**修复。** 先纠正一个细节：`workspace()` 的字节数只取决于
+`tokens × scratch_heads × chunk_capacity`（chunk 宽 64，
+`attention_resolve.cu:147-160`），**CPB 不参与**，`alignment` 固定为 16。所以
+单纯改 CPB 只会走 `replace`，不会释放。真正会换 `workspace` 的是 **variant
+切换**：带 scratch 的 decode 计划（variant 0 / split-K）↔ 无 scratch 的
+prefill/`Dsv4Fp8Decode` 计划；以及没有 profile 时走编译 resolver、有了校准
+profile 后改走 profile route（`_prepared.py:95-137`）。第一次写入某形状的
+profile、或 profile 的 variant 在两次测量间翻转，都可能改计划。
+
+**plan 对象本身不持有设备内存。** C++ 的 `ExecutionPlan` 是纯 POD
+（`attention_plan.h:156-174`），`AttentionPlanObj` 只包着它
+（`attention_descriptor.h:58-60`），没有 tensor 或设备侧描述符；kernel 启动时
+按值拿参数，capture 后不再解引用 Python 侧的 plan。所以对**这个 build**，
+“换 plan 对象”只丢主机端数据，B 是完整的。如果未来 plan 开始持有设备状态，
+就必须回到 FlashInfer 侧的退役/冻结。
+
+**已落地的 vLLM 侧修复（方案 B）。** `flashinfer_sparse.py` 现在给
+`wrapper.run` 传 `out_lse`/`mid_out`/`mid_lse`，三个都有时 `prepare` 不分配任何
+tensor（`_prepared.py:346-353`），计划替换不释放任何东西。实现要点：
+
+- buffer 按 `(device, padded_heads)` 常驻、跨层共享：`lse =
+  fp32[max_num_batched_tokens, padded_heads]`，`mid = bf16[slots*512]`，
+  `mlse = fp32[slots]`。decode 和非 decode 都传，连“小 prefill 被捕捉”也不会
+  让 wrapper 自己持有 buffer。
+- `slots` 取两种 decode 计划的上界：profile 的 variant 0（64 行、chunk 宽 64、
+  heads 按 `decode_scratch_heads` 的规则——8 保持 8，其余向上取整到 16 的
+  倍数）和编译 split-K（chunk 宽 32、最多 8 个 split；heads≤8 的 CTA 在任何
+  token 数都会选中，split 数受 wave 预算限制）。本机（heads=32、topk=128、
+  extra=512、SM=110）实际取到 20,480 slots，约
+  **20 MiB + 80 KiB + 1 MiB / GPU**。TP8（heads=8）约 64 MiB：这不是 heads
+  取整多算，而是编译 split-K 在 8-head CTA 上任何 token 数都可能被选中，
+  大 prefill 时按 `tokens × heads` 计。
+- **启动时校验覆盖全部 T 和两条路由**：`__init__` 里对 T=1..64 的每个 token
+  数，分别用「磁盘上的 profile」「无 profile」「强制 variant 0（split-K）」
+  三种选择各 resolve 一次，并用 `(extra_topk=512, extra_fp4)` 与
+  `(extra_topk=0, extra_fp4=False)` 两种布局各跑一遍，取最大的
+  `plan.workspace` 与已分配容量比较。scratch 的最大值不一定在 T=64：token
+  越少 split 可能越多，profile 也可能为不同桶选不同 variant。整套只在主机上
+  resolve、不跑 kernel，本机约 0.07 s/配置；不够就在模型初始化时抛错，而不是
+  等 `prefix_scratch` 在服务中途报 ValueError。
+- **stream/重入保护**：`in_use` 放进 try/finally，调用抛异常也会复位。stream
+  不能做“只允许第一次的非 capture stream”这种硬断言——vLLM 的 graph capture
+  会在 capture stream 上先跑一遍 eager warmup（`cudagraph_utils.py:477-505`），
+  硬断言会在第一次正常调用时误报。实现改成：检测到 stream 切换时先
+  `synchronize()` 旧 stream，再切换；这样共享 scratch 不会在两个 stream 上
+  并发使用，且 capture→serving 的切换只付一次同步。profile/dummy 在主
+  stream；capture 的 eager warmup 和 capture 都在 capture stream 上（同一次
+  切换，synchronize 覆盖）；图 replay 不跑 Python。
+**fork 补丁：captured key 不再重新 prepare。** 只在 vLLM 侧把 buffer 变成
+caller-owned 还不够：换 plan 对象本身、以及 graph/eager 用不同计划，仍然存在。
+FlashInfer fork 已补上：
+
+- `_SparseMLAPagedAttentionRunner` 增加 `_captured_keys`；`wrapper_run` 在
+  `capturing` 时记录 key。
+- 重新 prepare 的条件变成“`current is None`，或 **key 未被捕图** 且
+  epoch/tuning 变化”。捕过图的 key 永远保留 capture 时的 plan，eager 和 graph
+  replay 逐位一致；代价是这些形状不再吸收新的调优结果（这是选定的取舍）。
+- `_functional_plan`（cake 的 functional 路径）加了同样的
+  `_captured_functional_keys` 冻结。
+- 公共契约注释同步改写（`_api.py`）：“已捕图的 key 在进程生命周期内保留其
+  plan”。
+
+已验证：单元探针跑一次 2 行 decode 并模拟 capture，人为
+`_constants_version += 1` 后再次 eager 调用**没有**触发 `prepare`，输出逐位
+相同；同一进程里未捕图的 3 行形状则正常重新 prepare。回归测试
+`test_captured_decode_plan_stays_frozen` 用**真实 CUDA graph** 做同样的事：
+capture → replay → bump epoch → eager，断言 `_prepared_calls` 里的 plan 对象
+没变、`mid/mlse/lse` 全为 None（没有 wrapper-owned tensor）、输出与 replay
+逐位一致。`tests/v1/attention/test_flashinfer_sparse_mla_sm120_api.py` 全文件
+51 passed。2026-11-25 已用包含该补丁的工作树重建并安装
+`flashinfer 0.7.5.dev20261125`（构建 commit `f29e705e`；
+`flashinfer_python/jit_cache/cubin` 都是 20261125，wheel 哈希与
+`/workspace/artifacts/flashinfer-wheels-20261125.sha256` 一致）；安装副本与
+`/workspace/flashinfer` 源码逐字节一致。**补丁本身仍未提交**，构建记录的
+commit 不包含它——以后从干净树重建会丢，需要先 commit。当前线上进程启动早于
+这次安装，重启后才生效。
+
+**运维兜底（现在不是必需）。** 预校准后启动、独立
+`FLASHINFER_AUTOTUNE_DIR`、只读 cpb 文件。
+
+**不成立的修法**：靠 `impl="decode"/"decode-splitkv"` 把路由钉死。SM120 上
+压缩层 `extra_kv_fp4=True`，而编译版 decode resolver 明确要求 `!m.extra_fp4`
+（`decode_dispatch.cu:177-184`），所以 `impl != "auto"` 会直接 ValueError；计划
+仍然落在校准 profile / policy 上。
 
 #### B. `mm_mxfp8` 的多 stream workspace
 
@@ -1838,6 +1947,67 @@ for cell in off:0.0 off:0.7 off:1.0 on:0.0 on:0.7 on:1.0; do
     > "badanswer_T_${th}_${tv}.txt"
 done
 ```
+
+### 5.16 DSv4.1 共享 workspace 的审计（2026-11-25）
+
+把这条链路上所有“会增长、又可能被 captured graph 引用”的 workspace 过了一遍。
+上一版依赖“所有层先 `__init__`、再 forward”的约定；这一版把这个约定变成代码
+检查，不再靠假设。
+
+| workspace | 分配/增长点 | 捕获后是否会移动 |
+| --- | --- | --- |
+| `get_flashinfer_dsv4_workspace`（每 device 共享） | 各层 `__init__` 传正 `min_bytes`；首次 forward（`min_bytes=0`）后冻结 | 否：增长直接 RuntimeError |
+| `_storage_offset_index_scratch` | 首次按 `max_num_batched_tokens` 分配；之后不增长 | 否：更大请求直接 RuntimeError |
+| `_Sm120CallerBuffers`（本次新增） | 首次 `__init__` 一次分配 + 启动校验；命中时校验容量 | 否，不替换 |
+| FlashInfer `mm_mxfp8_workspace` | `_get_stream_cache_buf`，按 raw stream 分 | 否，所有调用点都是常量 `DEFAULT_WORKSPACE_SIZE` |
+| generic `flashinfer_mla_sparse.py` 的 `_fi_sparse_workspace` | 按 geometry 增长 | 不在 DSv4.1 路径（不选这个 backend） |
+| FlashMLA mega 的 workspace manager | 按 prefill shape 预留 | 不在 SM120 路径 |
+
+- **`get_flashinfer_dsv4_workspace`**：代码逻辑是“`min_bytes=0` 的调用视为
+  forward 路径，第一次出现就给该 device 打 frozen 标记”。所有带非零
+  `min_bytes` 的调用点只有各层 `__init__`；`_reserve_empty_forward_workspace`
+  和 specialized decode 都传 0。冻结后任何增长——不管在 eager 还是 capture
+  ——都直接 `RuntimeError`，不会再替换掉图里的指针。每层的 cake 快照
+  `_cake_workspace_tensor` 仍持有自己那份 tensor。
+- **`_storage_offset_index_scratch`**：第一次调用按 `capacity_rows`
+  （= `max_num_batched_tokens`）分配；之后 `capacity_rows` 更大就 `RuntimeError`。
+  不再有“只在 capture 中拒绝增长”的分支，也就不存在 eager 增长绕过 guard 的窗口。
+- **`_Sm120CallerBuffers`**：命中缓存时校验 `lse` 行数和 scratch slots 覆盖本次
+  请求，不够就报错；不会因为后一个调用者需要更大而替换旧 tensor。
+- **`mm_mxfp8_workspace`**：按 stream 隔离（`utils.py:320-366`），本仓库所有
+  DSv4.1 调用点（`mm_mxfp8`、specialized decode 的 mxfp8/publishing GEMM）都用
+  `DEFAULT_WORKSPACE_SIZE`，同一 stream 上不会二次增长。
+- **不在路径上的两个**：`vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py`
+  的全局 workspace 会按 geometry 增长，但 DSv4.1 用的是
+  `FLASHINFER_MLA_SPARSE_DSV41`，不会选到它；FlashMLA mega 的 workspace
+  manager 只在 FlashMLA 路径启用，SM120 不用。
+
+**并发覆盖。** 进程模型上，每个 DP/PP/TP worker 是独立进程，module 级 dict
+不跨进程。这个 deployment 在进程内只有一条 forward 在跑：
+
+- DBO/ubatching 默认关闭（`enable_dbo=False`、`ubatch_size=0`），
+  `maybe_build_ubatch_runner()` 返回 None；
+- PP microbatch（`pp_num_microbatches=pp_size=2`）只做跨 stage 流水，同一
+  stage 的 compute 仍按 step 在主 stream 上顺序执行；PP 的 send/recv 在旁路
+  stream，不调用 sparse wrapper；
+- attention 的 aux stream 只跑投影/写 cache，`maybe_execute_in_parallel` 和
+  specialized decode 都会在 attention 前 join，wrapper 只在主 stream 上调用。
+
+所以“高并发”在这里表现为更大的 batch：T 受 `max_num_batched_tokens=8192`、
+请求数受 `max_num_seqs=64` 约束；`lse` 行数按 8192 分配，decode scratch 按
+decode envelope 分配并在启动时校验，prefill 计划不占 scratch，索引 scratch
+按 8192 行分配。这些都在上面的上界内。
+
+**如果主动打开 DBO**（`--enable-dbo` / `ubatch_size>1`），两个 forward 会在
+不同 stream 上并发，当前这组跨层共享的 caller buffer 不在覆盖范围内：`in_use`
+会让第二个并发调用 fail closed，stream 切换会 `synchronize` 串行化（不会静默
+写坏，但会失去 overlap）。要跑 DBO 需要把 caller bundle 按 stream 拆开，这是
+另一项改动，当前 deployment 不需要。
+
+守卫/回归测试：`test_dsv4_workspace_freezes_after_first_forward`、
+`test_dsv4_workspace_refuses_to_grow_under_capture`、
+`test_storage_offset_scratch_refuses_to_grow`，加上更新后的两个
+workspace-growth 用例；完整 SM120 API 套件 **51 passed**。
 
 ## 6. 索引器微基准（不是瓶颈）
 

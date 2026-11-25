@@ -12,7 +12,6 @@ import vllm.envs as envs
 from vllm.config import set_current_vllm_config
 from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
-    get_flashinfer_dsv4_workspace,
     required_sm120_sparse_topk,
 )
 from vllm.models.deepseek_v41 import nvidia
@@ -21,6 +20,8 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLASparseBackend,
     DeepseekV4FlashInferSM120Attention,
     _flashinfer_dsv4_workspace_bytes,
+    _sm120_scratch_slots,
+    _Sm120CallerBuffers,
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
@@ -535,20 +536,27 @@ def test_sm120_dsv4_workspace_tracks_dspark_and_vision_widths() -> None:
     assert vision > causal
 
 
-def test_dsv4_workspace_grows_but_never_shrinks() -> None:
-    from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
-        _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
-        get_flashinfer_dsv4_workspace,
-    )
+def test_dsv4_workspace_grows_before_a_forward_and_freezes() -> None:
+    import vllm.models.deepseek_v4.nvidia.flashinfer_sparse as v4_fi
 
     device = torch.device("cpu")
-    floor = get_flashinfer_dsv4_workspace(device)
-    assert floor.numel() >= _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+    v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+    v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+    try:
+        floor = v4_fi.get_flashinfer_dsv4_workspace(
+            device, v4_fi._FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+        )
+        grown = v4_fi.get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
+        assert grown.numel() == floor.numel() * 2
 
-    grown = get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
-    assert grown.numel() == floor.numel() * 2
-
-    assert get_flashinfer_dsv4_workspace(device) is grown
+        # The first forward path (min_bytes=0) freezes the buffer; a later
+        # sizing call must not replace the tensor a graph may have baked.
+        assert v4_fi.get_flashinfer_dsv4_workspace(device) is grown
+        with pytest.raises(RuntimeError, match="cannot grow"):
+            v4_fi.get_flashinfer_dsv4_workspace(device, grown.numel() * 2)
+    finally:
+        v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+        v4_fi._flashinfer_dsv4_workspace_frozen.clear()
 
 
 def _dsv41_workspace_config(
@@ -608,15 +616,24 @@ def test_sm120_workspace_scales_with_dspark_and_index_topk() -> None:
     assert ratio1 == ratio2
 
 
-def test_dsv41_workspace_grows_but_never_shrinks() -> None:
+def test_dsv41_workspace_grows_before_a_forward_and_freezes() -> None:
+    import vllm.models.deepseek_v4.nvidia.flashinfer_sparse as v4_fi
+
     device = torch.device("cpu")
-    floor = get_flashinfer_dsv4_workspace(device)
-    assert floor.numel() >= _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
-
-    grown = get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
-    assert grown.numel() == floor.numel() * 2
-
-    assert get_flashinfer_dsv4_workspace(device) is grown
+    v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+    v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+    try:
+        floor = v4_fi.get_flashinfer_dsv4_workspace(
+            device, v4_fi._FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE
+        )
+        grown = v4_fi.get_flashinfer_dsv4_workspace(device, floor.numel() * 2)
+        assert grown.numel() == floor.numel() * 2
+        assert v4_fi.get_flashinfer_dsv4_workspace(device) is grown
+        with pytest.raises(RuntimeError, match="cannot grow"):
+            v4_fi.get_flashinfer_dsv4_workspace(device, grown.numel() * 2)
+    finally:
+        v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+        v4_fi._flashinfer_dsv4_workspace_frozen.clear()
 
 
 def _padded_swa_cache(
@@ -1247,3 +1264,260 @@ def test_cake_launch_splits_are_row_independent(rows, cuts) -> None:
     whole = run(0, rows)
     split = torch.cat([run(lo, hi) for lo, hi in zip(cuts, cuts[1:])])
     torch.testing.assert_close(whole, split, rtol=0, atol=8e-3)
+
+
+def _run_sm120_paged_attention(caller: _Sm120CallerBuffers | None) -> None:
+    query = torch.zeros((48, 64, 512), dtype=torch.bfloat16)
+    _paged_attention(
+        query=query,
+        swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8),
+        sparse_indices=torch.empty((48, 1152), dtype=torch.int32),
+        output=query.clone(),
+        sm_scale=1.0,
+        topk_length=torch.empty((48,), dtype=torch.int32),
+        attn_sink=None,
+        extra_kv_cache=torch.empty((8, 64, 1, 288), dtype=torch.uint8),
+        extra_sparse_indices=torch.empty((48, 1, 1152), dtype=torch.int32),
+        extra_sparse_topk_lens=torch.empty((48,), dtype=torch.int32),
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+        caller=caller,
+    )
+
+
+def _run_sm120_paged_attention_cuda(caller: _Sm120CallerBuffers) -> None:
+    query = torch.zeros((48, 64, 512), dtype=torch.bfloat16, device="cuda")
+    _paged_attention(
+        query=query,
+        swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8, device="cuda"),
+        sparse_indices=torch.empty((48, 1152), dtype=torch.int32, device="cuda"),
+        output=query.clone(),
+        sm_scale=1.0,
+        topk_length=torch.empty((48,), dtype=torch.int32, device="cuda"),
+        attn_sink=None,
+        extra_kv_cache=torch.empty((8, 64, 1, 288), dtype=torch.uint8, device="cuda"),
+        extra_sparse_indices=torch.empty(
+            (48, 1, 1152), dtype=torch.int32, device="cuda"
+        ),
+        extra_sparse_topk_lens=torch.empty((48,), dtype=torch.int32, device="cuda"),
+        extra_kv_fp4=True,
+        prefill_impl="auto",
+        caller=caller,
+    )
+
+
+def test_sm120_paged_attention_passes_caller_owned_scratch(monkeypatch) -> None:
+    """Captured graphs must point at caller buffers, not wrapper-owned ones."""
+    _install_sm120_wrapper(monkeypatch)
+    caller = _Sm120CallerBuffers(
+        lse=torch.empty((64, 64), dtype=torch.float32),
+        mid=torch.empty(1024, dtype=torch.bfloat16),
+        mlse=torch.empty(16, dtype=torch.float32),
+    )
+
+    _run_sm120_paged_attention(caller)
+
+    wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
+        torch.device("cpu"), True, _INLINE
+    ]
+    assert wrapper.run_kwargs["out_lse"] is caller.lse
+    assert wrapper.run_kwargs["mid_out"] is caller.mid
+    assert wrapper.run_kwargs["mid_lse"] is caller.mlse
+    assert not caller.in_use
+
+
+def test_sm120_paged_attention_rejects_reentrant_scratch(monkeypatch) -> None:
+    _install_sm120_wrapper(monkeypatch)
+    caller = _Sm120CallerBuffers(
+        lse=torch.empty(1, dtype=torch.float32),
+        mid=torch.empty(1, dtype=torch.bfloat16),
+        mlse=torch.empty(1, dtype=torch.float32),
+    )
+    caller.in_use = True
+
+    with pytest.raises(RuntimeError, match="re-entered"):
+        _run_sm120_paged_attention(caller)
+
+
+def test_sm120_paged_attention_resets_scratch_after_failure(monkeypatch) -> None:
+    """A failed call must clear the in-use marker for the next layer."""
+    _install_sm120_wrapper(monkeypatch)
+
+    def boom(self, **kwargs):
+        raise RuntimeError("kernel failed")
+
+    monkeypatch.setattr(_FakeSm120Wrapper, "run", boom)
+    caller = _Sm120CallerBuffers(
+        lse=torch.empty(1, dtype=torch.float32),
+        mid=torch.empty(1, dtype=torch.bfloat16),
+        mlse=torch.empty(1, dtype=torch.float32),
+    )
+
+    with pytest.raises(RuntimeError, match="kernel failed"):
+        _run_sm120_paged_attention(caller)
+    assert not caller.in_use
+
+
+@pytest.mark.parametrize(
+    ("heads", "topk", "extra_topk", "expect_heads", "expect_slots"),
+    [
+        (8, 128, 512, 8, 8 * max(8192, 2 * 188)),
+        (16, 128, 512, 16, 93 * 16 * 8),
+        (32, 128, 512, 32, 93 * 32 * 8),
+        (64, 128, 512, 64, 64 * 64 * 10),
+        (32, 64, 0, 32, 93 * 32 * 8),
+    ],
+)
+def test_sm120_scratch_slots_cover_rounded_heads_and_splitk(
+    heads, topk, extra_topk, expect_heads, expect_slots
+) -> None:
+    slots, scratch_heads = _sm120_scratch_slots(
+        padded_heads=heads,
+        max_tokens=8192,
+        topk=topk,
+        extra_topk=extra_topk,
+        sm_count=188,
+    )
+    assert scratch_heads == expect_heads
+    assert slots == expect_slots
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_sm120_caller_scratch_drains_on_stream_switch(monkeypatch) -> None:
+    _install_sm120_wrapper(monkeypatch)
+    caller = _Sm120CallerBuffers(
+        lse=torch.empty((8, 8), dtype=torch.float32, device="cuda"),
+        mid=torch.empty(64, dtype=torch.bfloat16, device="cuda"),
+        mlse=torch.empty(8, dtype=torch.float32, device="cuda"),
+    )
+    _run_sm120_paged_attention_cuda(caller)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        _run_sm120_paged_attention_cuda(caller)
+
+    assert caller.stream is not None
+    assert caller.stream.cuda_stream == side.cuda_stream
+    assert not caller.in_use
+
+
+@pytest.mark.skipif(not _requires_cake(), reason="needs SM120 and FlashInfer")
+def test_captured_decode_plan_stays_frozen() -> None:
+    """A graph-baked plan survives a calibration bump and owns no tensors."""
+    from flashinfer.mla._sparse_mla_sm120 import _calibration as calib
+
+    from vllm.models.deepseek_v41.common.ops import remap_flashinfer_sparse_indices
+
+    nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers.clear()
+    nvidia.flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+
+    cos_sin, kv, positions, slots = _v41_inputs()
+    main, extra = _write_v41_caches(cos_sin, kv, positions, slots, footer_scale=False)
+    torch.manual_seed(3)
+    query = torch.randn(2, 64, 512, dtype=torch.bfloat16, device="cuda")
+    keys, extra_keys, lens = _decode_selection()
+    indices = remap_flashinfer_sparse_indices(keys, _BLOCK, _BLOCK, _MAIN_SPAN)
+    extra_indices = remap_flashinfer_sparse_indices(
+        extra_keys, _BLOCK, _BLOCK, _EXTRA_SPAN
+    )
+    output = torch.zeros_like(query)
+    caller = _Sm120CallerBuffers(
+        lse=torch.empty((64, 64), dtype=torch.float32, device="cuda"),
+        mid=torch.empty(2 * 64 * 16 * 512, dtype=torch.bfloat16, device="cuda"),
+        mlse=torch.empty(2 * 64 * 16, dtype=torch.float32, device="cuda"),
+    )
+
+    def run() -> None:
+        _paged_attention(
+            query=query,
+            swa_kv_cache=main.unsqueeze(-2),
+            sparse_indices=indices[:, None, :],
+            output=output,
+            sm_scale=512**-0.5,
+            topk_length=lens,
+            attn_sink=None,
+            extra_kv_cache=extra.unsqueeze(-2),
+            extra_sparse_indices=extra_indices[:, None, :],
+            extra_sparse_topk_lens=lens,
+            extra_kv_fp4=True,
+            prefill_impl=None,
+            caller=caller,
+        )
+
+    run()  # eager warmup
+    wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
+        (query.device, True, _INLINE)
+    ]
+    captured = {key: plan.plan for key, plan in wrapper._prepared_calls.items()}
+    assert captured
+    for plan in wrapper._prepared_calls.values():
+        assert plan.mid is None and plan.mlse is None and plan.lse is None
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    assert wrapper._captured_keys
+    graph.replay()
+    reference = output.clone()
+
+    # A calibration refresh must not replace the plan a graph baked.
+    calib._constants_version += 1
+    try:
+        output.zero_()
+        run()
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        assert wrapper._prepared_calls.keys() == captured.keys()
+        for key, plan in captured.items():
+            assert wrapper._prepared_calls[key].plan is plan
+    finally:
+        calib._constants_version -= 1
+        nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers.clear()
+        nvidia.flashinfer_sparse._sparse_mla_sm120_caller_buffers.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dsv4_workspace_refuses_to_grow_under_capture(monkeypatch) -> None:
+    import vllm.models.deepseek_v4.nvidia.flashinfer_sparse as v4_fi
+
+    monkeypatch.setattr(v4_fi, "_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE", 64)
+    v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+    v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+    device = torch.device("cuda")
+    v4_fi.get_flashinfer_dsv4_workspace(device, 64)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    try:
+        with pytest.raises(RuntimeError, match="would grow"):
+            v4_fi.get_flashinfer_dsv4_workspace(device, 128)
+    finally:
+        v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+        v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_dsv4_workspace_freezes_after_first_forward(monkeypatch) -> None:
+    import vllm.models.deepseek_v4.nvidia.flashinfer_sparse as v4_fi
+
+    monkeypatch.setattr(v4_fi, "_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE", 64)
+    v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+    v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+    device = torch.device("cuda")
+    v4_fi.get_flashinfer_dsv4_workspace(device, 64)  # layer __init__
+    v4_fi.get_flashinfer_dsv4_workspace(device)  # first forward: freeze
+    try:
+        with pytest.raises(RuntimeError, match="cannot grow"):
+            v4_fi.get_flashinfer_dsv4_workspace(device, 128)
+    finally:
+        v4_fi._flashinfer_dsv4_workspace_by_device.clear()
+        v4_fi._flashinfer_dsv4_workspace_frozen.clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_storage_offset_scratch_refuses_to_grow() -> None:
+    mod = nvidia.flashinfer_sparse
+    mod._storage_offset_index_scratch.clear()
+    device = torch.device("cuda")
+    mod._get_storage_offset_index_scratch(device, "swa", 8, 4)
+    try:
+        with pytest.raises(RuntimeError, match="smaller capacity"):
+            mod._get_storage_offset_index_scratch(device, "swa", 16, 4)
+    finally:
+        mod._storage_offset_index_scratch.clear()

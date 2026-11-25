@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
@@ -67,7 +68,285 @@ _FLASHINFER_DSV4_DECODE_MAX_TOKENS = 64
 # fixed for the DeepSeek V4 family.
 _FLASHINFER_DSV4_VALUE_DIM = 512
 _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH = 64
+# The compiled split-K resolver tiles at 32 candidates; sizing the caller
+# scratch with this width bounds every plan the wrapper can resolve.
+_FLASHINFER_DSV4_SPLITK_TILE = 32
 _sparse_mla_sm120_wrappers: dict[tuple[torch.device, bool, str], object] = {}
+
+
+@dataclass
+class _Sm120CallerBuffers:
+    """Caller-owned scratch the wrapper must not free.
+
+    ``prepare`` drops the previous plan, and any tensors it owns, whenever a
+    calibration update changes the resolved plan. A captured graph keeps the
+    addresses it baked, so the caller has to hold the scratch for the life of
+    the process. All layers share one bundle and use it sequentially on one
+    stream. The plan object itself is a host-side descriptor (the C++
+    ``ExecutionPlan`` is plain data), so replacing it frees no device memory.
+    """
+
+    lse: torch.Tensor
+    mid: torch.Tensor | None
+    mlse: torch.Tensor | None
+    stream: torch.cuda.Stream | None = None
+    in_use: bool = False
+
+
+_sparse_mla_sm120_caller_buffers: dict[
+    tuple[torch.device, int, bool], _Sm120CallerBuffers
+] = {}
+
+
+def _sm120_scratch_slots(
+    *,
+    padded_heads: int,
+    max_tokens: int,
+    topk: int,
+    extra_topk: int,
+    sm_count: int,
+) -> tuple[int, int]:
+    """Upper bound on decode-plan scratch slots and its rounded head count.
+
+    Decode plans are the only ones that carve scratch. The FP8 split-K plan
+    sizes ``tokens * decode_scratch_heads(heads) * chunk_capacity`` with a
+    64-candidate chunk; the compiled resolver's split-K variant tiles at 32 and
+    is selected only while ``2 * tokens * ceil(heads / 32) < SMs``. Its 8-head
+    CTA is selected at every token count, with the split count capped by the
+    wave budget. Taking the maximum covers both.
+    """
+    # Match ``decode_scratch_heads``: 8 heads stay at 8, everything else
+    # rounds up to a multiple of 16 (attention_plan.h:99).
+    scratch_heads = 8 if padded_heads == 8 else cdiv(padded_heads, 16) * 16
+    profile_slots = (
+        _FLASHINFER_DSV4_DECODE_MAX_TOKENS
+        * scratch_heads
+        * (
+            cdiv(topk, _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH)
+            + cdiv(extra_topk, _FLASHINFER_DSV4_DECODE_CHUNK_WIDTH)
+        )
+    )
+    if padded_heads <= 8:
+        compiled_slots = padded_heads * max(max_tokens, 2 * sm_count)
+    else:
+        head_blocks = cdiv(padded_heads, _FLASHINFER_DSV4_SPLITK_TILE)
+        splitk_rows = max(1, (sm_count - 1) // (2 * head_blocks))
+        compiled_slots = splitk_rows * padded_heads * 8
+    return max(profile_slots, compiled_slots), scratch_heads
+
+
+def _validate_sm120_caller_buffers(
+    buffers: _Sm120CallerBuffers,
+    *,
+    device: torch.device,
+    padded_heads: int,
+    topk: int,
+    extra_topk: int,
+    kv_scale_format: str,
+    extra_fp4: bool,
+) -> None:
+    """Resolve every decode plan at startup and check the scratch fits.
+
+    Scratch is not largest at the widest batch: fewer tokens can buy more
+    split-K partitions, and a calibrated profile may select a different
+    variant per token bucket. Resolve every decode token count under the
+    stored profiles, the no-profile fallback, and a forced split-K route,
+    then compare the worst workspace with the caller buffers. This turns a
+    sizing mistake into a startup failure instead of a mid-serving
+    ``prefix_scratch`` error.
+    """
+    from flashinfer.mla._sparse_mla_sm120 import _execution as fi_exec
+    from flashinfer.mla._sparse_mla_sm120 import _policy as fi_policy
+    from flashinfer.mla._sparse_mla_sm120._prepared import prepare as prepare_plan
+
+    model = fi_exec.resolve_model_type(_FLASHINFER_DSV4_VALUE_DIM, kv_scale_format)
+    facts = fi_exec.query("format_info", model)
+    row_bytes = int(facts["bytes_per_token"])
+    fp4_row_bytes = int(facts["fp4_bytes_per_token"])
+    page_size = 64
+
+    def page_stride(rows: int, row: int) -> int:
+        return (rows * row + 15) // 16 * 16
+
+    def resolve(tokens: int, pass_extra_topk: int, pass_extra_fp4: bool):
+        pass_row = fp4_row_bytes if pass_extra_fp4 else row_bytes
+        metadata = fi_exec.AttentionMetadata(
+            model=model,
+            tokens=tokens,
+            heads=padded_heads,
+            topk=topk,
+            extra_topk=pass_extra_topk,
+            page_size=page_size,
+            extra_page_size=page_size if pass_extra_topk else 0,
+            page_stride_bytes=page_stride(page_size, row_bytes),
+            extra_page_stride_bytes=(
+                page_stride(page_size, pass_row) if pass_extra_topk else 0
+            ),
+            row_stride_bytes=row_bytes,
+            indices_stride=topk,
+            extra_indices_stride=pass_extra_topk,
+            lse_stride=padded_heads,
+            has_lengths=True,
+            has_extra_lengths=pass_extra_topk > 0,
+            has_sink=False,
+            extra_fp4=pass_extra_fp4,
+            variant=0,
+            extra_row_stride_bytes=pass_row if pass_extra_topk else 0,
+        )
+        return prepare_plan(
+            metadata,
+            device,
+            "fp8",
+            False,
+            0,
+            owned=False,
+            caller_mid=True,
+            caller_mlse=True,
+            caller_lse=True,
+        )
+
+    forced_splitk = fi_policy.PlannedCall(fi_policy.KernelVariant.DECODE_SPLITK, -1)
+
+    def no_profile(*_args, **_kwargs):
+        return None
+
+    def splitk_route(*_args, **_kwargs):
+        return forced_splitk
+
+    # The buffers are shared by compressed and SWA-only layers; check both the
+    # FP4-extra layout and the no-extra one (which can take the compiled split-K
+    # resolver).
+    passes = [(extra_topk, extra_fp4)]
+    if extra_topk:
+        passes.append((0, False))
+
+    stored_selection = fi_policy.profile_selection
+    routes = (stored_selection, no_profile, splitk_route)
+    worst = (0, 0, (0, 0), 0, 0)
+    try:
+        for pass_extra_topk, pass_extra_fp4 in passes:
+            for tokens in range(1, _FLASHINFER_DSV4_DECODE_MAX_TOKENS + 1):
+                for route in routes:
+                    fi_policy.profile_selection = route
+                    try:
+                        plan = resolve(tokens, pass_extra_topk, pass_extra_fp4)
+                    except ValueError:
+                        # This route cannot serve this token count.
+                        continue
+                    (
+                        (_, _, mid_bytes, _),
+                        (_, _, mlse_bytes, _),
+                        (
+                            lse_shape,
+                            _,
+                            _,
+                            _,
+                        ),
+                    ) = plan.workspace
+                    worst = (
+                        max(worst[0], mid_bytes),
+                        max(worst[1], mlse_bytes),
+                        (
+                            max(worst[2][0], lse_shape[0]),
+                            max(worst[2][1], lse_shape[1]),
+                        ),
+                        tokens,
+                        pass_extra_topk,
+                    )
+    finally:
+        fi_policy.profile_selection = stored_selection
+
+    mid_bytes, mlse_bytes, lse_shape, tokens, worst_extra_topk = worst
+    mid_fits = buffers.mid is not None and (
+        buffers.mid.numel() * buffers.mid.element_size() >= mid_bytes
+    )
+    mlse_fits = buffers.mlse is not None and (
+        buffers.mlse.numel() * buffers.mlse.element_size() >= mlse_bytes
+    )
+    if not (
+        buffers.lse.shape[0] >= lse_shape[0]
+        and buffers.lse.shape[1] >= lse_shape[1]
+        and mid_fits
+        and mlse_fits
+    ):
+        raise RuntimeError(
+            "SM120 sparse-MLA caller scratch is too small for the widest "
+            f"decode plan (tokens={tokens}, extra_topk={worst_extra_topk}, "
+            f"mid={mid_bytes} B, mlse={mlse_bytes} B, lse={lse_shape}); "
+            "allocated lse="
+            f"{tuple(buffers.lse.shape)}, mid="
+            f"{buffers.mid.numel() if buffers.mid is not None else 0}, mlse="
+            f"{buffers.mlse.numel() if buffers.mlse is not None else 0}"
+        )
+
+
+def _sm120_caller_buffers_for_layer(
+    *,
+    device: torch.device,
+    padded_heads: int,
+    max_tokens: int,
+    topk: int,
+    extra_topk: int,
+    kv_scale_format: str,
+    extra_fp4: bool,
+    scratch: bool,
+) -> _Sm120CallerBuffers:
+    key = (device, padded_heads, scratch)
+    cached = _sparse_mla_sm120_caller_buffers.get(key)
+    if cached is not None:
+        if cached.lse.shape[0] < max_tokens:
+            raise RuntimeError(
+                "the SM120 caller LSE buffer was allocated for fewer tokens; "
+                "every caller must size it with the same token bound"
+            )
+        if scratch:
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            slots, _ = _sm120_scratch_slots(
+                padded_heads=padded_heads,
+                max_tokens=max_tokens,
+                topk=topk,
+                extra_topk=extra_topk,
+                sm_count=sm_count,
+            )
+            if (
+                cached.mid is None
+                or cached.mid.numel() < slots * _FLASHINFER_DSV4_VALUE_DIM
+                or cached.mlse is None
+                or cached.mlse.numel() < slots
+            ):
+                raise RuntimeError(
+                    "the SM120 caller scratch was allocated for a smaller "
+                    "plan; every caller must size it with the same bounds"
+                )
+        return cached
+    lse = torch.empty((max_tokens, padded_heads), dtype=torch.float32, device=device)
+    buffers = _Sm120CallerBuffers(lse, None, None)
+    if scratch:
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        slots, _ = _sm120_scratch_slots(
+            padded_heads=padded_heads,
+            max_tokens=max_tokens,
+            topk=topk,
+            extra_topk=extra_topk,
+            sm_count=sm_count,
+        )
+        buffers.mid = torch.empty(
+            slots * _FLASHINFER_DSV4_VALUE_DIM,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        buffers.mlse = torch.empty(slots, dtype=torch.float32, device=device)
+        _validate_sm120_caller_buffers(
+            buffers,
+            device=device,
+            padded_heads=padded_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            kv_scale_format=kv_scale_format,
+            extra_fp4=extra_fp4,
+        )
+    _sparse_mla_sm120_caller_buffers[key] = buffers
+    return buffers
 
 
 def _sparse_mla_sm120_paged_attention(
@@ -85,6 +364,7 @@ def _sparse_mla_sm120_paged_attention(
     extra_kv_fp4: bool,
     prefill_impl: str | None,
     kv_scale_format: str,
+    caller: _Sm120CallerBuffers | None = None,
 ) -> None:
     """Run FlashInfer's SM120 sparse MLA wrapper in-place."""
     from flashinfer.mla._sparse_mla_sm120 import SparseMLASm120Wrapper
@@ -103,19 +383,49 @@ def _sparse_mla_sm120_paged_attention(
             device=query.device,
         )
         _sparse_mla_sm120_wrappers[device_key] = wrapper
-    wrapper.run(
-        q=query,
-        kv_cache=swa_kv_cache,
-        indices=sparse_indices,
-        output=output,
-        sm_scale=sm_scale,
-        topk_length=topk_length,
-        attn_sink=attn_sink,
-        extra_kv_cache=extra_kv_cache,
-        extra_indices=extra_sparse_indices,
-        extra_topk_length=extra_sparse_topk_lens,
-        prefill_impl=prefill_impl,
-    )
+    if caller is not None:
+        if caller.in_use:
+            raise RuntimeError(
+                "SM120 sparse-MLA caller scratch is re-entered; every layer must "
+                "call it sequentially."
+            )
+        caller.in_use = True
+    try:
+        if (
+            caller is not None
+            and caller.mid is not None
+            and query.is_cuda
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            stream = torch.cuda.current_stream(query.device)
+            if caller.stream is None:
+                caller.stream = stream
+            elif caller.stream.cuda_stream != stream.cuda_stream:
+                # A strict single-stream assertion is wrong: vLLM's graph
+                # capture runs the eager warmup pass on the capture stream
+                # (cudagraph_utils.py:477-505). Drain the old stream before the
+                # shared scratch is touched from the new one.
+                caller.stream.synchronize()
+                caller.stream = stream
+        wrapper.run(
+            q=query,
+            kv_cache=swa_kv_cache,
+            indices=sparse_indices,
+            output=output,
+            sm_scale=sm_scale,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            extra_kv_cache=extra_kv_cache,
+            extra_indices=extra_sparse_indices,
+            extra_topk_length=extra_sparse_topk_lens,
+            prefill_impl=prefill_impl,
+            out_lse=None if caller is None else caller.lse,
+            mid_out=None if caller is None else caller.mid,
+            mid_lse=None if caller is None else caller.mlse,
+        )
+    finally:
+        if caller is not None:
+            caller.in_use = False
 
 
 def _cake_dsv41_sm120_paged_attention(
@@ -168,10 +478,14 @@ def _get_storage_offset_index_scratch(
     """Reusable index scratch, sized so captured graphs never see it move."""
     key = (device, role, width)
     scratch = _storage_offset_index_scratch.get(key)
-    rows = max(capacity_rows, scratch.shape[0] if scratch is not None else 0)
-    if scratch is None or scratch.shape[0] < rows:
-        scratch = torch.empty((rows, width), dtype=torch.int32, device=device)
+    if scratch is None:
+        scratch = torch.empty((capacity_rows, width), dtype=torch.int32, device=device)
         _storage_offset_index_scratch[key] = scratch
+    elif scratch.shape[0] < capacity_rows:
+        raise RuntimeError(
+            "the storage-offset index scratch was allocated with a smaller "
+            "capacity; every caller must size it with the same row bound"
+        )
     return scratch
 
 
@@ -782,6 +1096,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     use_fp4_extra_kv: bool = current_platform.is_device_capability_family(
         120
     ) or current_platform.is_device_capability_family(121)
+    # Built in ``__init__``; None when a test constructs a bare instance.
+    _sm120_caller_buffers: _Sm120CallerBuffers | None = None
 
     @classmethod
     def packed_kv_cache_dtype(cls) -> CacheDType:
@@ -906,6 +1222,20 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         self.use_fp4_extra_kv = self.kv_cache_dtype == "nvfp4_ds_mla" and (
             current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability_family(121)
+        )
+        # The wrapper drops a replaced plan's owned tensors. Anything a captured
+        # graph baked must outlive the plan, so the caller owns the scratch.
+        self._sm120_caller_buffers = _sm120_caller_buffers_for_layer(
+            device=torch.device("cuda", torch.accelerator.current_device_index()),
+            padded_heads=self.padded_heads,
+            max_tokens=self.max_num_batched_tokens,
+            topk=required_sm120_sparse_topk(vllm_config, self.window_size),
+            extra_topk=int(
+                getattr(vllm_config.model_config.hf_config, "index_topk", 0)
+            ),
+            kv_scale_format=self.kv_scale_format,
+            extra_fp4=self.use_fp4_extra_kv,
+            scratch=True,
         )
 
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
@@ -1192,6 +1522,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             extra_kv_fp4=self.use_fp4_extra_kv,
             prefill_impl=None,
             kv_scale_format=self.kv_scale_format,
+            caller=self._sm120_caller_buffers,
         )
 
     def _forward_prefill(
@@ -1322,4 +1653,5 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_kv_fp4=self.use_fp4_extra_kv,
                 prefill_impl=envs.VLLM_FLASHINFER_SM120_PREFILL_IMPL,
                 kv_scale_format=self.kv_scale_format,
+                caller=self._sm120_caller_buffers,
             )
