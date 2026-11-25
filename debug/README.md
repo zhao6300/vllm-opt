@@ -11,14 +11,17 @@ TF stream can be found.
   - after attention (after the SP reduce-scatter) dumps `x` as `attn__<layer>`;
   - after the FFN/MoE dumps `x` (tensor only) as `ffn__<layer>`.
   - Rows dumped: `[num_decode_tokens, num_decode_tokens + num_prefill_tokens)`
-    (the TF request's rows). With sequence parallel the file records the
-    global start row and the rank; the compare script concatenates shards.
+    (the TF request's rows). The file name carries the TP rank, the CUDA
+    device (DP/PP rank), the global start row and the row count:
+    `attn__<layer>__r<rank>__dev<N>__start<S>__rows<R>.pt`; the compare script
+    concatenates the TP shards per device.
 - `vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py`
   - logs `[mixed] <layer> dec=... pref=... batch=... mode=...` per mixed
     attention call;
   - clones `output[num_decode_tokens:num_decode_tokens+num_prefill_tokens]`
     after `_forward_prefill` and after `_forward_decode`, prints the max change,
-    and (with `VLLM_DEBUG_TF_DIR`) saves `attnprefbefore/after__<layer>.pt`.
+    and (with `VLLM_DEBUG_TF_DIR`) saves
+    `attnprefbefore/after__<layer>__dev<N>__dec<D>_pref<P>.pt`.
 - `attention.py` (v4 + v41): when `VLLM_DEBUG_TF_DIR` is set,
   `_short_context_topk_is_uncaptured` returns False, so the indexer runs the
   full scoring path in both the alone and mixed runs.

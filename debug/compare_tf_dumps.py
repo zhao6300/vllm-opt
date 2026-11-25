@@ -17,7 +17,7 @@ import torch
 
 DUMP = re.compile(
     r"^(?P<tag>attn|ffn)__(?P<layer>.+?)__r(?P<rank>\d+)"
-    r"__start(?P<start>\d+)__rows(?P<rows>\d+)\.pt$"
+    r"__dev(?P<dev>\d+)__start(?P<start>\d+)__rows(?P<rows>\d+)\.pt$"
 )
 
 
@@ -27,7 +27,7 @@ def collect(root, phase):
         m = DUMP.match(os.path.basename(path))
         if not m:
             continue
-        key = (m["tag"], m["layer"])
+        key = (m["tag"], m["layer"], int(m["dev"]))
         groups.setdefault(key, []).append((int(m["start"]), path))
     out = {}
     for key, items in groups.items():
@@ -57,10 +57,11 @@ def main():
     alone = collect(args.root, "alone")
     mixed = collect(args.root, "mixed")
     keys = sorted(
-        set(alone) & set(mixed), key=lambda k: (layer_index(k[1]), k[0])
+        set(alone) & set(mixed),
+        key=lambda k: (layer_index(k[1]), k[2], k[0]),
     )
     print(
-        f"{'layer':44s} {'phase':4s} {'rows':>4s} {'max_abs':>10s} "
+        f"{'layer':44s} {'dev':>3s} {'phase':4s} {'rows':>4s} {'max_abs':>10s} "
         f"{'mean_abs':>10s} {'rel_max':>8s}"
     )
     first = None
@@ -77,7 +78,7 @@ def main():
         if over and first is None:
             first = (key, mx)
         print(
-            f"{key[1]:44s} {key[0]:4s} {b.shape[0]:4d} {mx:10.4f} "
+            f"{key[1]:44s} {key[2]:3d} {key[0]:4s} {b.shape[0]:4d} {mx:10.4f} "
             f"{mean:10.5f} {rel:8.3f}{'  <-- first' if over and first and first[0] == key else ''}"
         )
 

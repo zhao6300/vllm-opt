@@ -437,6 +437,7 @@ def _debug_dump_tf_rows(
     path = os.path.join(
         _debug_phase_dir(root),
         f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
+        f"__dev{torch.cuda.current_device()}"
         f"__start{start}__rows{stop - start}.pt",
     )
     torch.save(rows.detach().cpu(), path)

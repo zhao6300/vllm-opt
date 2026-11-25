@@ -1383,17 +1383,17 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 root = os.environ.get("VLLM_DEBUG_TF_DIR")
                 if root:
                     phase_dir = _debug_phase_dir(root)
+                    stem = (
+                        f"{self.prefix}__dev{torch.cuda.current_device()}"
+                        f"__dec{num_decode_tokens}_pref{num_prefill_tokens}"
+                    )
                     torch.save(
                         prefill_before.detach().cpu(),
-                        os.path.join(
-                            phase_dir, f"attnprefbefore__{self.prefix}.pt"
-                        ),
+                        os.path.join(phase_dir, f"attnprefbefore__{stem}.pt"),
                     )
                     torch.save(
                         prefill_after.detach().cpu(),
-                        os.path.join(
-                            phase_dir, f"attnprefafter__{self.prefix}.pt"
-                        ),
+                        os.path.join(phase_dir, f"attnprefafter__{stem}.pt"),
                     )
 
     def forward_mqa(
