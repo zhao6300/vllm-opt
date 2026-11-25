@@ -1715,22 +1715,28 @@ def test_sparse_mqa_logits_accuracy_vs_torch(kv_dtype: str):
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected"),
+    ("mode", "num_decode_tokens", "expected"),
     [
-        (None, True),
-        (CUDAGraphMode.NONE, True),
-        (CUDAGraphMode.FULL, False),
-        (CUDAGraphMode.FULL_DECODE_ONLY, True),
-        (CUDAGraphMode.PIECEWISE, False),
-        (CUDAGraphMode.FULL_AND_PIECEWISE, False),
+        (None, 0, True),
+        (None, 3, True),
+        (CUDAGraphMode.NONE, 3, True),
+        (CUDAGraphMode.FULL_DECODE_ONLY, 0, True),
+        (CUDAGraphMode.FULL_DECODE_ONLY, 3, False),
+        (CUDAGraphMode.FULL, 0, False),
+        (CUDAGraphMode.FULL, 3, False),
+        (CUDAGraphMode.PIECEWISE, 0, False),
+        (CUDAGraphMode.PIECEWISE, 3, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, 0, False),
+        (CUDAGraphMode.FULL_AND_PIECEWISE, 3, False),
     ],
 )
-def test_short_context_topk_fast_path_only_without_captured_prefill(
-    mode: CUDAGraphMode | None, expected: bool
+def test_short_context_topk_fast_path_only_without_captured_rows(
+    mode: CUDAGraphMode | None, num_decode_tokens: int, expected: bool
 ) -> None:
-    """The eager short-context path lists candidates ascending while the
-    captured full path leaves the kernel's unordered slots, so a config whose
-    prefills can be captured must not take the fast path in eager steps."""
+    """The eager fast path lists candidates ascending while a captured step
+    leaves the kernel's unordered slots. Prefill rows are captured whenever the
+    mixed mode is not NONE; decode rows are also captured under
+    FULL_DECODE_ONLY, whose eager fallback reuses them."""
     from vllm.models.deepseek_v4.attention import DeepseekV4Indexer as V4Indexer
     from vllm.models.deepseek_v41.attention import (
         DeepseekV4Indexer as V41Indexer,
@@ -1741,4 +1747,4 @@ def test_short_context_topk_fast_path_only_without_captured_prefill(
         indexer.vllm_config = SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_mode=mode)
         )
-        assert indexer._short_context_topk_is_uncaptured() is expected
+        assert indexer._short_context_topk_is_uncaptured(num_decode_tokens) is expected

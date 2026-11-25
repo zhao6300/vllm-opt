@@ -1956,9 +1956,12 @@ padding 并非数值无关。所以 breakable 路径下真实长度在同一 cap
 `fill_short_context_topk_indices`（写升序 0..n-1），被 capture 时走完整打分
 （`top_k_per_row_prefill`，unordered）；sparse MLA 对候选顺序敏感，所以同一请求的
 候选顺序取决于它的步是否被 capture。11-24 全 eager → 升序，11-25 之后 prefill 全部
-capture → unordered，这直接解释了 sticky 从 3/3 松到 12/30。修复：当 resolved
-cudagraph mode 的 mixed 分量不是 NONE（即 prefill 可能被 capture）时禁用快路径，
-eager 与 captured 都走完整路径；FULL_DECODE_ONLY（mixed = NONE）保留原快路径。
+capture → unordered，这直接解释了 sticky 从 3/3 松到 12/30。修复按行判断：
+`_short_context_topk_is_uncaptured(num_decode_tokens)` 只在 resolved mode 为 NONE、或
+FULL_DECODE_ONLY 且本步没有 decode 行时允许快路径，其余一律走完整路径。这样
+FULL_DECODE_ONLY 下 decode 的 eager 回退（批次超出 capture 尺寸，或任一 DP rank 要求
+eager 导致全部 eager）也不会和同一行在 captured 步里的顺序不同。当前部署是 PIECEWISE，
+本来就全部走完整路径，行为不变。
 
 **Engram 预取不需要改代码。** `_engram_lookup_thresholds` 在非 family 100 返回
 (None, None)，`cpu_offload=True` 时固定走 `_prefetch_stream`；两个 prefetch op 都是
@@ -1966,6 +1969,162 @@ eager break。`tests/distributed/test_engram_dp_shard.py::_check_prefetch_replay
 覆盖 breakable（断言 2 个 eager break）和 FULL 两种 capture，每轮换 ids 后逐位一致，
 所以"逻辑自洽但没实测"这条可以关闭；服务器层面如需再确认，下次重启做一次 inline A/B
 即可。
+
+**07:16 重启（含短上下文 indexer 对齐修复）后的复测。** thinking off、T=0：seed 0 是
+strict 30/288（9 WRONG + 21 NEAR，去格式 3.1%），10 个坏码 3/3；seed 1 是 strict
+60/288（30 WRONG + 30 NEAR，去格式 10.4%），20 个坏码 3/3。两个种子的坏码集合零重叠，
+且 seed 1 的集合与 03:57 那台几乎相同——坏答率由 prompt 集和服务器状态主导，indexer
+对齐修复消除的是 eager/captured 的路径依赖，不改变低 margin tie 本身。thinking on、
+T=1.0（seed 7）是 3/288（1.0%），都是单字符/换行滑落；累计 10/2304 ≈ 0.43%。
+对同批 10 个坏码测 top-5 margin：最小 top1-top2 差 **0.062–0.625 nat**；10 个好码是
+**9.9–14.0 nat**，零重叠。注意这是**服务栈自身**的 margin，不是参考值：一个小的确定性
+偏差也能把本来 3 nat 的参考 margin 压到 0.5 nat，所以它只说明"出错那次前向里这个位置
+很接近"，不能证明提示词本身在模型分布上就是近平局；sticky 3/3 排除的是竞态，不是
+确定性 bug。（好码 10–14 nat 给出一个约束：能翻好码的系统性偏差必须 ~5 nat 以上。）
+要判定是"模型近平局"还是"栈引入了偏差/精度丢失"，需要把同一序列 teacher-force 过
+参考栈（fp8_ds_mla KV、fp8 indexer、关 DSpark、eager）再比较逐位 logprob 与参考 margin。
+
+**teacher-forcing 的半测（不重启，2026-11-25）。** 方法：用 `/tokenize` 把同一 chat
+prompt 按模板渲染成 token（`add_generation_prompt=true`、`thinking=false`），接上**正确
+密码**的 token，向 `/completions` 请求 `prompt_logprobs=5`，请求带
+`X-data-parallel-rank: 0` 固定 DP rank；先单独跑，再在后台起一条 64-token、
+`max_tokens=1000` 的 decode 混入同一步重跑，每条码 3 次。脚本：
+`/workspace/debug-vllm/teacher_force.py <serve-pid>`。
+
+| 组 | 10 个坏码 | 10 个好码 |
+| --- | --- | --- |
+| prefill 路径最小 top1–top2 gap | 6 个 0.06–0.25 nat；4 个 7.0–11.0 nat | 4.9–13.5 nat |
+| 混入 1 条 decode 后正确 token 的最大位移 | 3 个 11.5–13.4 nat；其余 0.001–0.24 nat | 0.0–0.047 nat |
+
+- 6 个坏码在 prefill 里本来就是近平局；
+- 另 4 个（`cobalt-pepper-9729`、`cobalt-raven-0225`、`ginger-raven-0024`、
+  `hollow-raven-6153`）单独跑很自信，其中 3 个在混入 1 条 decode 后正确 token 位移
+  11.5–13.4 nat（三次重测同值；decode 没赶上同一步时为 0），margin 从 10 nat 掉到
+  0.2–1.3 nat——它们的失败来自 batch 组成 / prefill-decode 路径，而不是隔离时的近平局；
+- 好码对同样的混批几乎不变（0–0.047 nat）。
+- 不固定 rank 时同一码的 margin 会变（例如 `ginger-raven-0024` 在另一个 DP rank 上是
+  0.31 nat），所以 rank 必须钉住。
+
+这仍然只是服务栈内部：它量化了"失败 = 对 batch 组成敏感"，不证明隔离时的稳定值正确。
+
+**混合 batch 的进一步排查（2026-11-25，不重启）。** 用整段 `prompt_logprobs` 逐位比较
+（不只是答案位置）：
+
+- 同一请求连续三次、无背景，逐位相同（0.0），服务器状态在窗口内稳定；
+- 同 rank 混入 1 条 decode 时，差异从 prompt 中段（绝对位置约 19）开始，prompt 区最大
+  1–3 nat；答案区多数位置因概率饱和仍是 0.0，但**密码的第一个数字 token**
+  （`022`/`615`/`002`，绝对位置 35）会翻，正确 token 的 logprob 位移 11.5–13.4 nat；
+  该位置与 32/64 的 KV/页边界不对齐，`cached_tokens` 全为 0（排除前缀缓存/LMCache）；
+- 对照：同 rank 混入 **prefill**、或在**另一个 DP rank** 上混入 decode，都是 0.0；
+  把背景 decode 从 8 token 换到 2000 token 结果不变；但改成 **8 条并发 decode** 后
+  又变回 0.0——说明 API 层面的背景流量**不能保证和探测请求落在同一步**，"没混进去"和
+  "不变"在这里分不开。
+
+所以 13 nat 的翻转只出现在"确实混进去了"的那些运行里，且集中在密码第一个数字 token；
+但要判定它是 bug 还是离散放大，必须先确认每一步的 batch 组成。下一步需要在服务里加一行
+每步日志（num_prefill_tokens / num_decode_tokens）或用进程内引擎手动构造混合 batch，
+再复现后按 KV dtype → eager → 关 DSpark 的顺序做二分。
+缺失的一半是参考栈（`--kv-cache-dtype fp8_ds_mla`、indexer fp8、关 DSpark、eager）的
+逐位对比；这些是启动参数，需要重启窗口，且专家权重仍是 FP4，参考栈只能排除
+KV/indexer/EP/cudagraph/调度路径。
+
+**08:11 重启（只把 indexer_kv_dtype 从 mxfp4 改成 fp8）：零结果。** 其余不变
+（kv-cache-dtype 仍是 nvfp4_ds_mla、DSpark 在、CAKE=0、breakable 在、fill target=0）。
+96 码 × 3 轮、thinking off、T=0：seed 0 仍是 30/288（9 WRONG + 21 NEAR），seed 1 仍是
+60/288（30 + 30），**坏码集合与每个码的 kinds 逐条相同**；teacher forcing 的
+min gap 与混批位移也逐位相同。原因是这些 prompt 只有 30–31 个 token（≤ topk/ratio），
+短上下文里所有候选都被选中，索引器分数根本不进入选择。所以索引器 dtype 不是这条链上的
+变量；参考对比必须动 KV dtype（fp8_ds_mla）和/或 eager/no-DSpark。
+
+**混合 batch 的判别实验（2026-11-25 下午，不重启）。** 统一用 `prompt_logprobs` 的
+绝对位置 35（`cobalt-raven-0225` 答案首数字 token `022`）作判据；脚本
+`/workspace/debug-vllm/tf_bucket_sweep.py`、`teacher_force.py`（现输出逐位置
+`part/ans_i/delta`）、`tf_shape_matrix.py`。
+
+1. **桶/TP 切分（假设 A）：排除。** 单独发送，在 answer 后追加 k 个 token，position 35
+   的因果上下文不变。`cobalt-raven` k=0..43、`hollow-raven` k=0..27，覆盖桶
+   40/48/56/64/80，另补 L=237/1037/4037/8156（桶 256/1280/4096/8192）。所有 k 下
+   pos35 都是 0.0/−1.2e-7、top1 21183/27042，而 prompt 区 18–29 随桶漂 1.0–2.8 nat。
+   48 桶（和混合 case 同桶）也一样。**桶、padding、SP 边界单独不足以翻位置 35。**
+2. **同一步 prefill+prefill：不触发。** 同时发两条 4000-token prefill（总 8000 ≤ 8192），
+   用完成时间判同步：`bg_first` 下 bg 1.18–1.22 s、tf 1.34–1.37 s，都等于 8000-token
+   合并步；`tf_first` 下 tf 0.76 s、bg 1.17 s（顺序）。两种顺序 pos35 都稳定。再用
+   37-token teacher + 4000-token prefill 跑 10 次，其中 4 次 tf 0.63 s = bg（同一步），
+   pos35 仍稳定。
+3. **跨微批常驻 prefill：不触发。** 30k-token、`max_tokens=1`（4 段，2.88–2.91 s），
+   期间每 250 ms 发 teacher-force。第 1 个 tf 等 2.6 s（排在 bg 后面）；后 5 个只用
+   0.051–0.053 s 就完成，此时 bg 还差 1.3–2.4 s——它们在另一个 PP 微批里并发执行。
+   **所有 tf 的 pos35 都稳定。** 同脚本的 decode bg 阳性对照 3/3 翻转（lp −13.431、
+   top1 30、tf 75 ms）。
+
+所以 PP relay、stage 1 持久 `intermediate_tensors`、`VLLM_PP_SEND_BUFFERS=2` 发送环
+作为"充分条件"被排除。触发条件是**同一前向里有 decode 行**，以及它带来的 DSpark
+verify（6 行）和 draft，不是任意 co-batch、也不是跨微批常驻请求。
+
+**代码版本与行号审计。** 现役 08:11 进程加载的是 `0c5f36a49e` + 工作树里未提交的
+`_short_context_topk_is_uncaptured(num_decode_tokens)`：`flashinfer_sparse.py` mtime
+06:45、`attention.py` 07:40，都早于进程启动；stale `.pyc` 的源 mtime/size 不匹配会
+触发重编译，版本串 `f55a5e71e9` 只是安装时写死的。`FULL_AND_PIECEWISE` 下
+`mixed_mode()==PIECEWISE != NONE`，helper 恒 False，短上下文路径不是自变量。
+CPU 走查：indexer prefill chunk 的 `token_start` 是 decode-first 的绝对行号
+（`indexer.py:2144`），decode 写 `[:num_decode_tokens]`（`sparse_attn_indexer.py:1346`），
+消费端按 `[num_decode_tokens:...]` 读（`flashinfer_sparse.py:1596-1601`）；SWA prefill
+索引 0-based + `token_offset`，消费端用 `prefill_token_base` 重锚
+（`sparse_swa.py:718-739`、`flashinfer_sparse.py:1573-1575,1633-1638`），flat remap 已是
+`num_decode_tokens + query_start`（`:1655`）——这些都不解释翻转。
+`needs_padded_path` 的覆盖点也不适用：SM12x `_supports_native_decode(6)` 为 False
+（`indexer.py:1008-1019`），decode 展平成逐 token 行，`decode_lens` 全 1，
+`num_padded_tokens == num_decode_tokens`；它是 SM100 native + adaptive verification
+的单独风险。
+
+**下一步 A/B（需要重启，按顺序）。**
+
+1. **关 DSpark**：去掉 `--speculative-config`，其余不动。bg decode 变 1 行、draft 不跑。
+   mixed pos35 仍翻 → 只要 decode 分支存在就够；回到 0.0 → DSpark 的 6 行 verify 或
+   draft（与 target 共享 SM120 wrapper/caller bundle）是变量。
+2. **CAKE=1**：`VLLM_FLASHINFER_DSV41_SM120_CAKE=1`，decode 改走 cake、独立 workspace；
+   KV 布局换成 footer-scale，只作方向参考。
+3. **`VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `FULL_DECODE_ONLY`**：mixed 步全 eager。
+   注意要拿 mixed pos35 和现在的 mixed 值比，不要和新 alone 基线比——新 helper 在
+   FULL_DECODE_ONLY 下 prefill-only eager 步（`num_decode_tokens=0`）会走快路径，
+   alone 基线本身变了。
+4. **PP A/B（后置）**：`VLLM_PP_SEND_BUFFERS=0`、`VLLM_PP_MICROBATCH_BALANCE=0`；
+   第 3 组已排除跨微批常驻 prefill，除非 decode A/B 无法定位。
+
+**插桩（重启生效）。** 在 `_forward_sparse_impl` 的 prefill 调用后 clone
+`output[num_decode_tokens : num_decode_tokens + num_prefill_tokens]`，decode 调用后再取
+同一块比较；只对 ratio=1 混合步、`VLLM_DEBUG_MIXED_ATTN=1` 打印
+`self.prefix dec/pref/batch/mode` 和最大变化。**不要 dump `caller.lse`**——它只是
+kernel 输出，后续没人读。`changed != 0` → decode 改写了 prefill 结果（SM120 wrapper /
+caller scratch 共享）；`changed == 0` → 在 attention 之外（compressor/indexer/Engram/
+PP relay/MoE·EP）。patch 在 `flashinfer_sparse.py:1317` 附近。
+
+**线 2：host 侧差分模拟（CPU，2026-11-25）。** 用真实 builder/Triton kernel
+（`TRITON_INTERPRET=1`）构造 A=[TF prefill 37]、B=[bg decode 6 + TF prefill 37]，
+逐位比较 TF 行（脚本 `/workspace/debug-vllm/sim_mixed_metadata2.py`）：
+
+- SWA `prefill_swa_indices`/`lens`、`is_valid_token`/`token_to_req_indices` 的 TF 行：
+  一致；
+- indexer ratio=1/2 的 `block_table`/`cu_seqlen_ks`/`ke`/`cu_seq_lens`/`token_to_seq`/
+  `local_cu_seq_lens`：一致；chunk `token_start/token_end` 0/37→6/43，正好
+  +`num_decode_tokens`；
+- compressor ring slot mapping 的 TF 行：一致；
+- flat remap 在 row_offset 0/6 下 prefill 值一致，decode/prefill 行不相交；
+- Engram `_hash_ids_kernel`（含 lookback）的 TF 行：一致。
+
+所以"只有 decode 行才走的 metadata 分支"在 host 侧全部一致，剩下的只能是 GPU kernel
+或共享状态。
+
+**线 1 的调试分支（本地未推送）。** 分支 `debug/dsv41-tf-dump`，worktree
+`/workspace/vllm-opt-dbg`，commit `0fb41e7660`（hook）+ `1ec8a17b30`（sim）。
+`VLLM_DEBUG_TF_DIR` 控制：每个 decoder layer 的 attention 后/FFN 后把 TF 行 dump 到
+`<root>/<phase>/`，phase 由 `<root>/phase` 文件切换（`alone`/`mixed`，hook 会跳过不属于
+该 phase 的步）；`_forward_sparse_impl` 比较 prefill 调用前后的
+`output[num_decode_tokens:num_decode_tokens+num_prefill_tokens]` 并打印 `[mixed]` 行，
+同时在 `<root>/<phase>/` 保存 `attnprefbefore/after__<layer>.pt`。设置该 env 时
+`_short_context_topk_is_uncaptured` 强制返回 False，保证 alone/mixed 走同一条 indexer
+路径。配合 `VLLM_USE_BREAKABLE_CUDAGRAPH=0` + `FULL_DECODE_ONLY`（混合步必须 eager）；
+runbook 和比较脚本在 `debug/README.md`、`debug/compare_tf_dumps.py`。
 
 thinking=false、T=0 同一格：strict 59/288（20.5%，28 WRONG + 31 NEAR），去格式
 28/288（9.7%）；坏码 30 个，但只有 12 个与 DeepGEMM 那 16 个重合，18 个是新的、4 个

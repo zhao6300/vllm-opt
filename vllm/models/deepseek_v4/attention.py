@@ -1063,17 +1063,24 @@ class DeepseekV4Indexer(nn.Module):
             use_fp4=self.use_fp4_kv,
         )
 
-    def _short_context_topk_is_uncaptured(self) -> bool:
-        """Whether no prefill step of this model is replayed from a graph.
+    def _short_context_topk_is_uncaptured(self, num_decode_tokens: int) -> bool:
+        """Whether this step's rows can never be replayed from a graph.
 
-        A prefill graph has no Python at replay, so it always runs the full
-        scoring path. Taking the eager short-context fast path in a config
-        whose prefills are captured would give one request two different
-        candidate orders (ascending vs the kernel's unordered slots) depending
-        on whether its step happened to be captured.
+        A captured step has no Python at replay, so it always runs the full
+        scoring path. Taking the eager short-context fast path instead would
+        give one request two different candidate orders (ascending vs the
+        kernel's unordered slots) depending on whether its step was captured.
+        Prefill rows are captured whenever the mixed mode is not NONE; decode
+        rows are also captured under FULL_DECODE_ONLY, whose eager fallback
+        (a batch past the capture sizes, or any DP rank asking for eager) hits
+        the same rows.
         """
         mode = self.vllm_config.compilation_config.cudagraph_mode
-        return mode is None or mode.mixed_mode() == CUDAGraphMode.NONE
+        if mode is None or mode == CUDAGraphMode.NONE:
+            return True
+        if mode.mixed_mode() != CUDAGraphMode.NONE:
+            return False
+        return num_decode_tokens == 0
 
     def forward(
         self,
@@ -1094,7 +1101,9 @@ class DeepseekV4Indexer(nn.Module):
             if (
                 indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens
                 and not torch.cuda.is_current_stream_capturing()
-                and self._short_context_topk_is_uncaptured()
+                and self._short_context_topk_is_uncaptured(
+                    indexer_metadata.num_decode_tokens
+                )
             ):
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
