@@ -379,6 +379,14 @@ class GateLinear(ReplicatedLinear):
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             if self.cdna_version >= 4:
                 output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight, False)
+            elif envs.VLLM_GATE_LINEAR_BATCH_INVARIANT:
+                from vllm.model_executor.determinism.batch_invariant import (
+                    matmul_persistent,
+                )
+
+                output = matmul_persistent(
+                    x, self.weight.T, out_dtype=torch.float32
+                )
             else:
                 output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)

@@ -862,6 +862,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        _debug_dump_tf_rows(self.attn, x, positions, "attnin", input_ids)
         x = self.attn(positions, x, None)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
