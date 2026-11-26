@@ -60,6 +60,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# SM120 sparse-MLA compute precision. A FP8 plan's output depends on the token
+# count (split-K/CPB and FP8 quantization points), so a decode verify step and
+# a prefill of the same rows disagree; bf16 compute is token-count invariant.
+_SM120_MLA_PRECISION = os.environ.get(
+    "VLLM_FLASHINFER_DSV41_SM120_MLA_PRECISION", "fp8"
+)
+
 
 def _debug_phase_dir(root: str) -> str:
     try:
@@ -169,6 +176,7 @@ def _validate_sm120_caller_buffers(
     extra_topk: int,
     kv_scale_format: str,
     extra_fp4: bool,
+    precision: str = _SM120_MLA_PRECISION,
 ) -> None:
     """Resolve every decode plan at startup and check the scratch fits.
 
@@ -221,7 +229,7 @@ def _validate_sm120_caller_buffers(
         return prepare_plan(
             metadata,
             device,
-            "fp8",
+            precision,
             False,
             0,
             owned=False,
@@ -294,15 +302,41 @@ def _validate_sm120_caller_buffers(
         and mid_fits
         and mlse_fits
     ):
-        raise RuntimeError(
-            "SM120 sparse-MLA caller scratch is too small for the widest "
-            f"decode plan (tokens={tokens}, extra_topk={worst_extra_topk}, "
-            f"mid={mid_bytes} B, mlse={mlse_bytes} B, lse={lse_shape}); "
-            "allocated lse="
-            f"{tuple(buffers.lse.shape)}, mid="
-            f"{buffers.mid.numel() if buffers.mid is not None else 0}, mlse="
-            f"{buffers.mlse.numel() if buffers.mlse is not None else 0}"
+        if buffers.used or (
+            device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "SM120 sparse-MLA caller scratch must grow after it was used "
+                f"(precision={precision}, tokens={tokens}, "
+                f"extra_topk={worst_extra_topk}, mid={mid_bytes} B, "
+                f"mlse={mlse_bytes} B, lse={lse_shape}); allocated lse="
+                f"{tuple(buffers.lse.shape)}, mid="
+                f"{buffers.mid.numel() if buffers.mid is not None else 0}, "
+                f"mlse={buffers.mlse.numel() if buffers.mlse is not None else 0}"
+            )
+        rows = max(buffers.lse.shape[0], lse_shape[0])
+        cols = max(buffers.lse.shape[1], lse_shape[1])
+        if (rows, cols) != tuple(buffers.lse.shape):
+            buffers.lse = torch.empty(
+                (rows, cols), dtype=torch.float32, device=device
+            )
+        need_slots = max(
+            cdiv(mid_bytes, _FLASHINFER_DSV4_VALUE_DIM * 2),
+            cdiv(mlse_bytes, 4),
         )
+        if buffers.mid is None or buffers.mid.numel() < (
+            need_slots * _FLASHINFER_DSV4_VALUE_DIM
+        ):
+            buffers.mid = torch.empty(
+                need_slots * _FLASHINFER_DSV4_VALUE_DIM,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if buffers.mlse is None or buffers.mlse.numel() < need_slots:
+            buffers.mlse = torch.empty(
+                need_slots, dtype=torch.float32, device=device
+            )
 
 
 def _sm120_caller_buffers_for_layer(
@@ -384,6 +418,7 @@ def _sm120_caller_buffers_for_layer(
                 extra_topk=b_extra_topk,
                 kv_scale_format=b_format,
                 extra_fp4=b_extra_fp4,
+                precision=_SM120_MLA_PRECISION,
             )
     return buffers
 
@@ -559,7 +594,10 @@ def _sparse_mla_sm120_paged_attention(
     extra_kv_flag = extra_kv_fp4 and has_extra_kv_cache
     # `d_v` is baked into the wrapper at construction, so layers with different
     # value widths need their own; the per-call plans carry heads/topk.
-    device_key = (query.device, query.shape[-1], extra_kv_flag, kv_scale_format)
+    precision = _SM120_MLA_PRECISION
+    device_key = (
+        query.device, query.shape[-1], extra_kv_flag, kv_scale_format, precision
+    )
     wrapper = _sparse_mla_sm120_wrappers.get(device_key)
     if wrapper is None:
         wrapper = SparseMLASm120Wrapper(
@@ -567,10 +605,19 @@ def _sparse_mla_sm120_paged_attention(
             kv_scale_format=kv_scale_format,
             kv_cache_format="fp8",
             extra_kv_fp4=extra_kv_flag,
-            compute_precision="fp8",
+            compute_precision=precision,
             device=query.device,
         )
         _sparse_mla_sm120_wrappers[device_key] = wrapper
+        logger.info_once(
+            "SM120 sparse MLA wrapper: precision=%s d_v=%s heads=%s "
+            "kv_scale_format=%s extra_fp4=%s",
+            precision,
+            query.shape[-1],
+            query.shape[1],
+            kv_scale_format,
+            extra_kv_flag,
+        )
     num_tokens = query.shape[0]
     min_tokens = envs.VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS
     padded_output = None
