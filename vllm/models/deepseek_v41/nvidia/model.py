@@ -1572,6 +1572,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 aux_hidden_by_layer,
                 full_num_tokens,
+                positions=positions,
             )
 
         aux_hidden_states = [
@@ -1622,8 +1623,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
+        self._debug_dump_last(pre_mix, positions, "lastpre")
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        self._debug_dump_last(hidden_states, positions, "lastcollapse")
         hidden_states = self.norm(hidden_states)
+        self._debug_dump_last(hidden_states, positions, "lastnorm")
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1693,6 +1697,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
 
+    def _debug_dump_last(
+        self, tensor: torch.Tensor, positions: torch.Tensor | None, tag: str
+    ) -> None:
+        """TF rows of a tensor at the end of this stage's last layer."""
+        if positions is None or not os.environ.get("VLLM_DEBUG_TF_DIR"):
+            return
+        last_attn = self.layers[self.end_layer - 1].attn
+        _debug_dump_tf_rows(last_attn, tensor, positions, tag)
+
     def _collapse(
         self,
         hidden_states: torch.Tensor | MoEOutput,
@@ -1701,13 +1714,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         res_mix: torch.Tensor,
         aux_hidden_by_layer: dict[int, torch.Tensor],
         full_num_tokens: int,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Without a successor boundary, the last layer finalized its own MoE.
         assert isinstance(hidden_states, torch.Tensor)
         # The last layer has no successor to fold its post into.
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
+        # Lens anchor: the last layer's FFN output and mHC state.
+        self._debug_dump_last(hidden_states, positions, "lastffn")
+        self._debug_dump_last(residual, positions, "lastres")
+        self._debug_dump_last(post_mix, positions, "lastpost")
+        self._debug_dump_last(res_mix, positions, "lastresmix")
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        self._debug_dump_last(hidden_states, positions, "laststream")
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = hidden_states.mean(dim=1)
             if self.use_sequence_parallel:
@@ -1754,6 +1774,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             res_mix,
             aux_hidden_by_layer,
             positions.shape[0],
+            positions=positions,
         )
         return (
             hidden_states,
