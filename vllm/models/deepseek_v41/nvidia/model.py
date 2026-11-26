@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import os
 import typing
 from collections.abc import Callable, Iterable
@@ -396,6 +397,9 @@ def _debug_phase_dir(root: str) -> str:
     return path
 
 
+_debug_save_failed = False
+
+
 def _debug_dump_tf_rows(
     attn: nn.Module,
     tensor: object,
@@ -442,8 +446,13 @@ def _debug_dump_tf_rows(
             return
         if phase == "alone" and swa.num_decode_tokens > 0:
             return
-        start = swa.num_decode_tokens
-        stop = start + swa.num_prefill_tokens
+        stop = swa.num_decode_tokens + swa.num_prefill_tokens
+        # Skip prefill rows before this local index (e.g. pos0) to cut size.
+        start = swa.num_decode_tokens + int(
+            os.environ.get("VLLM_DEBUG_TF_MIN_ROW", "0")
+        )
+        if start >= stop:
+            return
     elif os.environ.get("VLLM_DEBUG_DECODE_DUMP") and swa.num_decode_tokens > 0:
         decode_rows = True
         start, stop = 0, int(swa.num_decode_tokens)
@@ -469,25 +478,40 @@ def _debug_dump_tf_rows(
         )
         if input_ids is not None and "layers.0." in attn.prefix:
             ids_path = os.path.join(
-                _debug_phase_dir(root),
+                root,
+                phase,
                 f"dec_ids__pos{pos0}"
                 f"__r{get_tensor_model_parallel_rank()}__rows{num_batch}.pt",
             )
-            if not os.path.exists(ids_path):
-                torch.save(
-                    {
-                        "input_ids": input_ids.detach().cpu(),
-                        "positions": positions.detach().cpu(),
-                    },
-                    ids_path,
-                )
+            ids = {
+                "input_ids": input_ids.detach().cpu(),
+                "positions": positions.detach().cpu(),
+            }
+            with contextlib.suppress(OSError, RuntimeError):
+                _debug_phase_dir(root)
+                if not os.path.exists(ids_path):
+                    torch.save(ids, ids_path)
     else:
         name = (
             f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
             f"__dev{torch.cuda.current_device()}"
             f"__start{start}__rows{stop - start}.pt"
         )
-    torch.save(rows.detach().cpu(), os.path.join(_debug_phase_dir(root), name))
+    global _debug_save_failed
+    if _debug_save_failed:
+        return
+    out = os.path.join(root, phase, name)
+    tmp = f"{out}.tmp{os.getpid()}"
+    try:
+        _debug_phase_dir(root)
+        torch.save(rows.detach().cpu(), tmp)
+        os.replace(tmp, out)
+    except Exception as e:
+        # Log once and stop dumping rather than kill the worker (e.g. full disk).
+        _debug_save_failed = True
+        logger.warning("TF dump of %s failed (%s); layer dumps disabled", out, e)
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -862,6 +886,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        # attn_norm(hc_collapse(previous layer's streams, its ffn pre-mix)).
+        _debug_dump_tf_rows(self.attn, x, positions, "attnin", input_ids)
         x = self.attn(positions, x, None)
         # With GEMM-RS bound, the attention output is already this rank's
         # sequence-parallel shard (see DeepseekV4Attention._wo_b_proj).
