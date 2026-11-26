@@ -1617,7 +1617,8 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
             extra_kv_fp4=self.use_fp4_extra_kv,
-            prefill_impl=None,
+            # Same preference as prefill: a padded call takes a prefill kernel.
+            prefill_impl=envs.VLLM_FLASHINFER_SM120_PREFILL_IMPL,
             kv_scale_format=self.kv_scale_format,
             caller=self._sm120_caller_buffers,
         )
