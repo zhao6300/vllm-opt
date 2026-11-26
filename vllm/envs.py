@@ -712,6 +712,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Route the gate's bf16->fp32 router GEMM through the batch-invariant
     # Triton persistent kernel instead of cuBLAS, whose algorithm depends on
     # M. Unlike VLLM_BATCH_INVARIANT this leaves the rest of the stack alone.
+    # Only the cuBLAS tier is rerouted (bf16 weight, fp32 logits, no bias), so
+    # it applies where no specialized router GEMM is used, e.g. SM120; on SM90
+    # and SM100 the specialized tiers still run and this has no effect.
     "VLLM_GATE_LINEAR_BATCH_INVARIANT": lambda: bool(
         int(os.getenv("VLLM_GATE_LINEAR_BATCH_INVARIANT", "0"))
     ),

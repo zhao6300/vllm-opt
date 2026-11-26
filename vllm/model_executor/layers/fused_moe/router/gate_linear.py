@@ -380,13 +380,7 @@ class GateLinear(ReplicatedLinear):
             if self.cdna_version >= 4:
                 output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight, False)
             elif envs.VLLM_GATE_LINEAR_BATCH_INVARIANT:
-                from vllm.model_executor.determinism.batch_invariant import (
-                    matmul_persistent,
-                )
-
-                output = matmul_persistent(
-                    x, self.weight.T, out_dtype=torch.float32
-                )
+                output = torch.ops.vllm.batch_invariant_router_gemm(x, self.weight)
             else:
                 output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return self._return(output)
@@ -612,4 +606,36 @@ direct_register_custom_op(
     op_name="fp32_router_gemm_dispatch",
     op_func=fp32_router_gemm_dispatch_impl,
     fake_impl=fp32_router_gemm_dispatch_fake,
+)
+
+
+def batch_invariant_router_gemm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """bf16 x bf16 -> fp32 router logits from the Triton persistent matmul.
+
+    Its K blocking is fixed per (N, K), so a row's logits are bit-identical for
+    every token count, unlike cuBLAS whose algorithm changes with M. A custom
+    op so that compiled callers do not trace the launch or its M-bucketed
+    config selection.
+    """
+    from vllm.model_executor.determinism.batch_invariant import matmul_persistent
+
+    if x.shape[0] == 0:
+        return x.new_empty((0, weight.shape[0]), dtype=torch.float32)
+    return matmul_persistent(x, weight.t(), out_dtype=torch.float32)
+
+
+def batch_invariant_router_gemm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="batch_invariant_router_gemm",
+    op_func=batch_invariant_router_gemm_impl,
+    fake_impl=batch_invariant_router_gemm_fake,
 )
