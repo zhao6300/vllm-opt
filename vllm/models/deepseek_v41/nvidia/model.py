@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import os
 import typing
 from collections.abc import Callable, Iterable
@@ -396,6 +397,9 @@ def _debug_phase_dir(root: str) -> str:
     return path
 
 
+_debug_save_failed = False
+
+
 def _debug_dump_tf_rows(
     attn: nn.Module,
     tensor: object,
@@ -442,8 +446,13 @@ def _debug_dump_tf_rows(
             return
         if phase == "alone" and swa.num_decode_tokens > 0:
             return
-        start = swa.num_decode_tokens
-        stop = start + swa.num_prefill_tokens
+        stop = swa.num_decode_tokens + swa.num_prefill_tokens
+        # Skip prefill rows before this local index (e.g. pos0) to cut size.
+        start = swa.num_decode_tokens + int(
+            os.environ.get("VLLM_DEBUG_TF_MIN_ROW", "0")
+        )
+        if start >= stop:
+            return
     elif os.environ.get("VLLM_DEBUG_DECODE_DUMP") and swa.num_decode_tokens > 0:
         decode_rows = True
         start, stop = 0, int(swa.num_decode_tokens)
@@ -469,25 +478,40 @@ def _debug_dump_tf_rows(
         )
         if input_ids is not None and "layers.0." in attn.prefix:
             ids_path = os.path.join(
-                _debug_phase_dir(root),
+                root,
+                phase,
                 f"dec_ids__pos{pos0}"
                 f"__r{get_tensor_model_parallel_rank()}__rows{num_batch}.pt",
             )
-            if not os.path.exists(ids_path):
-                torch.save(
-                    {
-                        "input_ids": input_ids.detach().cpu(),
-                        "positions": positions.detach().cpu(),
-                    },
-                    ids_path,
-                )
+            ids = {
+                "input_ids": input_ids.detach().cpu(),
+                "positions": positions.detach().cpu(),
+            }
+            with contextlib.suppress(OSError, RuntimeError):
+                _debug_phase_dir(root)
+                if not os.path.exists(ids_path):
+                    torch.save(ids, ids_path)
     else:
         name = (
             f"{tag}__{attn.prefix}__r{get_tensor_model_parallel_rank()}"
             f"__dev{torch.cuda.current_device()}"
             f"__start{start}__rows{stop - start}.pt"
         )
-    torch.save(rows.detach().cpu(), os.path.join(_debug_phase_dir(root), name))
+    global _debug_save_failed
+    if _debug_save_failed:
+        return
+    out = os.path.join(root, phase, name)
+    tmp = f"{out}.tmp{os.getpid()}"
+    try:
+        _debug_phase_dir(root)
+        torch.save(rows.detach().cpu(), tmp)
+        os.replace(tmp, out)
+    except Exception as e:
+        # Log once and stop dumping rather than kill the worker (e.g. full disk).
+        _debug_save_failed = True
+        logger.warning("TF dump of %s failed (%s); layer dumps disabled", out, e)
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -862,6 +886,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
+        # attn_norm(hc_collapse(previous layer's streams, its ffn pre-mix)).
         _debug_dump_tf_rows(self.attn, x, positions, "attnin", input_ids)
         x = self.attn(positions, x, None)
         # With GEMM-RS bound, the attention output is already this rank's
@@ -1547,6 +1572,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 aux_hidden_by_layer,
                 full_num_tokens,
+                positions=positions,
             )
 
         aux_hidden_states = [
@@ -1597,8 +1623,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # mixes — the mix the reference applies via
         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
         assert pre_mix is not None
+        self._debug_dump_last(pre_mix, positions, "lastpre")
         hidden_states = hc_collapse_triton(hidden_states, pre_mix)
+        self._debug_dump_last(hidden_states, positions, "lastcollapse")
         hidden_states = self.norm(hidden_states)
+        self._debug_dump_last(hidden_states, positions, "lastnorm")
         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
             # Without MTP, gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1668,6 +1697,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         assert res_mix is not None and pre_mix is not None
         return hidden_states, residual, post_mix, res_mix, pre_mix
 
+    def _debug_dump_last(
+        self, tensor: torch.Tensor, positions: torch.Tensor | None, tag: str
+    ) -> None:
+        """TF rows of a tensor at the end of this stage's last layer."""
+        if positions is None or not os.environ.get("VLLM_DEBUG_TF_DIR"):
+            return
+        last_attn = self.layers[self.end_layer - 1].attn
+        _debug_dump_tf_rows(last_attn, tensor, positions, tag)
+
     def _collapse(
         self,
         hidden_states: torch.Tensor | MoEOutput,
@@ -1676,13 +1714,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         res_mix: torch.Tensor,
         aux_hidden_by_layer: dict[int, torch.Tensor],
         full_num_tokens: int,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Without a successor boundary, the last layer finalized its own MoE.
         assert isinstance(hidden_states, torch.Tensor)
         # The last layer has no successor to fold its post into.
         if self.fuse_mhc_all_reduce:
             hidden_states = boundary_all_reduce(hidden_states)
+        # Lens anchor: the last layer's FFN output and mHC state.
+        self._debug_dump_last(hidden_states, positions, "lastffn")
+        self._debug_dump_last(residual, positions, "lastres")
+        self._debug_dump_last(post_mix, positions, "lastpost")
+        self._debug_dump_last(res_mix, positions, "lastresmix")
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
+        self._debug_dump_last(hidden_states, positions, "laststream")
         if self.end_layer in self.aux_hidden_state_layers:
             final_aux = hidden_states.mean(dim=1)
             if self.use_sequence_parallel:
@@ -1729,6 +1774,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             res_mix,
             aux_hidden_by_layer,
             positions.shape[0],
+            positions=positions,
         )
         return (
             hidden_states,
