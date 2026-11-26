@@ -32,6 +32,8 @@ from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 _INLINE = "ue8m0_g32_inline"
+# Wrapper-cache keys end with the configured compute precision.
+_PRECISION = nvidia.flashinfer_sparse._SM120_MLA_PRECISION
 
 
 def _paged_attention(**kwargs) -> None:
@@ -278,7 +280,7 @@ def test_sm120_dsv4_1_uses_explicit_fp8_precision_wrapper(monkeypatch) -> None:
         prefill_impl="auto",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, query.shape[-1], True, _INLINE
+        query.device, query.shape[-1], True, _INLINE, _PRECISION
     ]
 
     assert isinstance(cached, FakeWrapper)
@@ -320,7 +322,7 @@ def test_sm120_dsv4_1_isolate_flag_when_extra_cache_is_absent(
         prefill_impl="auto",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, query.shape[-1], False, _INLINE
+        query.device, query.shape[-1], False, _INLINE, _PRECISION
     ]
 
     assert isinstance(cached, _FakeSm120Wrapper)
@@ -350,7 +352,7 @@ def test_sm120_dsv4_1_requires_extra_cache_for_fp4_extra_wrapper(
         prefill_impl="auto",
     )
     assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
-        (query.device, query.shape[-1], False, _INLINE)
+        (query.device, query.shape[-1], False, _INLINE, _PRECISION)
     }
 
     _paged_attention(
@@ -368,12 +370,12 @@ def test_sm120_dsv4_1_requires_extra_cache_for_fp4_extra_wrapper(
         prefill_impl="auto",
     )
     assert set(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers) == {
-        (query.device, query.shape[-1], False, _INLINE),
-        (query.device, query.shape[-1], True, _INLINE),
+        (query.device, query.shape[-1], False, _INLINE, _PRECISION),
+        (query.device, query.shape[-1], True, _INLINE, _PRECISION),
     }
     assert (
         nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-            query.device, query.shape[-1], True, _INLINE
+            query.device, query.shape[-1], True, _INLINE, _PRECISION
         ].kwargs["extra_kv_fp4"]
         is True
     )
@@ -401,7 +403,7 @@ def test_sm120_dsv4_1_reuses_wrapper_for_same_extra_cache_mode(
     )
     _paged_attention(**args)
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, query.shape[-1], True, _INLINE
+        query.device, query.shape[-1], True, _INLINE, _PRECISION
     ]
     first = len(cached.run_kwargs)
 
@@ -431,7 +433,7 @@ def test_sm120_dsv4_1_forwards_prefill_impl_and_sink(monkeypatch) -> None:
         prefill_impl="swapab",
     )
     cached = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        query.device, query.shape[-1], True, _INLINE
+        query.device, query.shape[-1], True, _INLINE, _PRECISION
     ]
 
     assert cached.run_kwargs["sm_scale"] == 0.25
@@ -1403,7 +1405,7 @@ def test_sm120_paged_attention_passes_caller_owned_scratch(monkeypatch) -> None:
     _run_sm120_paged_attention(caller)
 
     wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        torch.device("cpu"), 512, True, _INLINE
+        torch.device("cpu"), 512, True, _INLINE, _PRECISION
     ]
     assert wrapper.run_kwargs["out_lse"] is caller.lse
     assert wrapper.run_kwargs["mid_out"] is caller.mid
@@ -1602,7 +1604,7 @@ def test_captured_decode_plan_stays_frozen() -> None:
 
     run()  # eager warmup
     wrapper = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers[
-        (query.device, query.shape[-1], True, _INLINE)
+        (query.device, query.shape[-1], True, _INLINE, _PRECISION)
     ]
     captured = {key: plan.plan for key, plan in wrapper._prepared_calls.items()}
     assert captured

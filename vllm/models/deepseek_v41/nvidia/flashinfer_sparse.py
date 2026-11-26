@@ -303,8 +303,7 @@ def _validate_sm120_caller_buffers(
         and mlse_fits
     ):
         if buffers.used or (
-            device.type == "cuda"
-            and torch.cuda.is_current_stream_capturing()
+            device.type == "cuda" and torch.cuda.is_current_stream_capturing()
         ):
             raise RuntimeError(
                 "SM120 sparse-MLA caller scratch must grow after it was used "
@@ -318,9 +317,7 @@ def _validate_sm120_caller_buffers(
         rows = max(buffers.lse.shape[0], lse_shape[0])
         cols = max(buffers.lse.shape[1], lse_shape[1])
         if (rows, cols) != tuple(buffers.lse.shape):
-            buffers.lse = torch.empty(
-                (rows, cols), dtype=torch.float32, device=device
-            )
+            buffers.lse = torch.empty((rows, cols), dtype=torch.float32, device=device)
         need_slots = max(
             cdiv(mid_bytes, _FLASHINFER_DSV4_VALUE_DIM * 2),
             cdiv(mlse_bytes, 4),
@@ -334,9 +331,7 @@ def _validate_sm120_caller_buffers(
                 device=device,
             )
         if buffers.mlse is None or buffers.mlse.numel() < need_slots:
-            buffers.mlse = torch.empty(
-                need_slots, dtype=torch.float32, device=device
-            )
+            buffers.mlse = torch.empty(need_slots, dtype=torch.float32, device=device)
 
 
 def _sm120_caller_buffers_for_layer(
@@ -596,7 +591,11 @@ def _sparse_mla_sm120_paged_attention(
     # value widths need their own; the per-call plans carry heads/topk.
     precision = _SM120_MLA_PRECISION
     device_key = (
-        query.device, query.shape[-1], extra_kv_flag, kv_scale_format, precision
+        query.device,
+        query.shape[-1],
+        extra_kv_flag,
+        kv_scale_format,
+        precision,
     )
     wrapper = _sparse_mla_sm120_wrappers.get(device_key)
     if wrapper is None:
