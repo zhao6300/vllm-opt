@@ -420,13 +420,28 @@ class Scheduler(SchedulerInterface):
         # prefill batch fully drained the waiting queue. Prefill throttling
         # is disabled in this case.
         self.prefill_capacity_bound = False
+        # Optional decode latency target (VLLM_PREFILL_FILL_TARGET with
+        # VLLM_PREFILL_TPOT_TARGET_MS): while requests decode, a step's prefill
+        # chunk keeps their step-to-step interval within it; otherwise a step
+        # takes the full token budget. Its step budget is set per decode
+        # microbatch count by `_set_tpot_step_budget`.
+        self.prefill_tpot_target_ms = (
+            envs.VLLM_PREFILL_TPOT_TARGET_MS if envs.VLLM_PREFILL_FILL_TARGET else 0.0
+        )
+        if self.prefill_tpot_target_ms < 0:
+            raise ValueError(
+                "VLLM_PREFILL_TPOT_TARGET_MS must be >= 0: "
+                f"{self.prefill_tpot_target_ms}"
+            )
         # Optional time budget per step (VLLM_PREFILL_STEP_BUDGET_MS): caps the
         # prefill tokens a step carries by a cost model instead of by tokens.
-        self.prefill_cost_model = PrefillCostModel.from_env()
+        self.prefill_cost_model = PrefillCostModel.from_env(
+            self.prefill_tpot_target_ms or None
+        )
         # Set by the DP engine core to the group's MIN cap, so every rank's
         # step carries the same prefill work.
         self.prefill_cap_override: int | None = None
-        if self.prefill_cost_model is not None:
+        if self.prefill_cost_model is not None and not self.prefill_tpot_target_ms:
             logger.info(
                 "Prefill chunks are sized by a step time budget: %s",
                 self.prefill_cost_model,
@@ -435,7 +450,9 @@ class Scheduler(SchedulerInterface):
         # chunk fills the step to it, and a background thread adapts it to the
         # measured step period.
         self.prefill_target: PrefillTarget | None = None
-        if envs.VLLM_PREFILL_FILL_TARGET:
+        if self.prefill_tpot_target_ms:
+            self._set_tpot_step_budget(1)
+        elif envs.VLLM_PREFILL_FILL_TARGET:
             if self.prefill_cost_model is None:
                 raise ValueError(
                     "VLLM_PREFILL_FILL_TARGET needs VLLM_PREFILL_STEP_BUDGET_MS "
@@ -474,9 +491,18 @@ class Scheduler(SchedulerInterface):
         self._logged_fit = None
         model = self.prefill_cost_model
         if envs.VLLM_PREFILL_COST_FIT and model is not None:
+            period_ms = model.budget_ms
+            if self.prefill_tpot_target_ms:
+                # Steps with no decodes take a full token budget, well past the
+                # decode-step budget; the fit must keep them, not drop them as
+                # idle gaps.
+                full = self.scheduler_config.max_num_batched_tokens
+                period_ms = max(
+                    self.prefill_tpot_target_ms, model.step_ms(0, full, full)
+                )
             self.cost_fit = StepCostFitter.from_env(
                 (model.fixed_ms, model.ms_per_token, model.ms_per_token_context),
-                model.budget_ms,
+                period_ms,
                 self._on_cost_fit,
             )
         self.scheduler_reserve_full_isl = (
@@ -795,8 +821,9 @@ class Scheduler(SchedulerInterface):
         model = self.prefill_cost_model
         if model is None:
             return None
-        if self.prefill_cap_override is not None and not local_only:
-            return self.prefill_cap_override
+        override = None if local_only else self.prefill_cap_override
+        if override is not None and not self.prefill_tpot_target_ms:
+            return override
         decode_tokens = 0
         context = 0
         for request in self.running:
@@ -806,13 +833,50 @@ class Scheduler(SchedulerInterface):
                 context = max(context, request.num_computed_tokens)
             elif request.next_decode_eligible_step <= self.current_step:
                 decode_tokens += 1 + self.num_spec_tokens
-        return self._prefill_chunk(model, decode_tokens, context)
+        chunk = self._prefill_chunk(model, decode_tokens, context)
+        # With a TPOT target the group's cap lags by up to a DP sync interval;
+        # a rank whose own decodes started since then keeps to its local cap.
+        return chunk if override is None else min(chunk, override)
+
+    def _set_tpot_step_budget(self, decode_microbatches: int) -> None:
+        """Budget each step a share of the TPOT target: a decoding request
+        waits for one step per decode microbatch between its own steps."""
+        model = self.prefill_cost_model
+        assert model is not None and self.prefill_tpot_target_ms > 0
+        steps = max(decode_microbatches, 1)
+        self.prefill_cost_model = replace(
+            model, budget_ms=self.prefill_tpot_target_ms / steps
+        )
+        logger.info(
+            "Prefill chunks keep decode steps within a %g ms TPOT target "
+            "(%.1f ms per step over %d decode microbatches); without decodes a "
+            "step takes up to %d tokens. Cost model: %s",
+            self.prefill_tpot_target_ms,
+            self.prefill_cost_model.budget_ms,
+            steps,
+            self.scheduler_config.max_num_batched_tokens,
+            self.prefill_cost_model,
+        )
+
+    def _has_decoding_requests(self) -> bool:
+        """Whether a running request decodes, whether or not it is eligible in
+        this step: under PP it still waits on this step to reach its next."""
+        return any(
+            not request.is_finished() and not request.is_prefill_chunk
+            for request in self.running
+        )
 
     def _prefill_chunk(
         self, model: PrefillCostModel, decode_tokens: int, context: int
     ) -> int:
         """The prefill chunk a step with `decode_tokens` of decodes takes when it
         attends over `context`; the rule that sizes chunks and prices backlogs."""
+        if self.prefill_tpot_target_ms:
+            if not self._has_decoding_requests():
+                return self.scheduler_config.max_num_batched_tokens
+            return model.max_prefill_tokens(
+                decode_tokens, context, align=self.block_size
+            )
         if self.prefill_target is None:
             return model.max_prefill_tokens(
                 decode_tokens, context, align=self.block_size

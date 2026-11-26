@@ -1842,7 +1842,11 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         )
         # The engine prices its backlog in ms when a prefill step time budget
         # is configured; the budget turns that into a number of steps.
-        self.lb_step_budget_ms = max(envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
+        # A TPOT target takes the budget's place in the engines' chunk sizing.
+        tpot_ms = (
+            envs.VLLM_PREFILL_TPOT_TARGET_MS if envs.VLLM_PREFILL_FILL_TARGET else 0.0
+        )
+        self.lb_step_budget_ms = max(tpot_ms or envs.VLLM_PREFILL_STEP_BUDGET_MS, 0.0)
         # This client's own dispatches whose prefill has not finished, by engine.
         # It floors the engine-reported backlog for the ~100 ms before a snapshot
         # that has seen them lands, which is exactly when a burst of mixed-size

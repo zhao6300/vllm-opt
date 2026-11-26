@@ -9785,6 +9785,109 @@ def test_fill_target_grows_from_the_outputs_it_sees(monkeypatch):
         scheduler.shutdown()
 
 
+def _set_tpot_target(monkeypatch, tpot_ms: float, ms_per_token: float) -> None:
+    monkeypatch.delenv("VLLM_PREFILL_STEP_BUDGET_MS", raising=False)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_TARGET", "1")
+    monkeypatch.setenv("VLLM_PREFILL_TPOT_TARGET_MS", str(tpot_ms))
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN", str(ms_per_token))
+    monkeypatch.setenv("VLLM_PREFILL_MIN_CHUNK_TOKENS", "16")
+
+
+def test_tpot_target_needs_no_step_budget_and_runs_no_token_target(monkeypatch):
+    _set_tpot_target(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+
+    assert scheduler.prefill_target is None
+    assert scheduler.prefill_cost_model is not None
+    assert scheduler.prefill_cost_model.budget_ms == 1120
+
+
+def test_tpot_target_gives_a_step_without_decodes_the_full_token_budget(
+    monkeypatch,
+):
+    """Nobody waits on a step without decodes, so a prompt takes the whole
+    --max-num-batched-tokens, not what the decode-step budget would allow
+    (112 tokens at 10 ms per token)."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens["p0"] == 3000
+
+
+def test_tpot_target_bounds_a_step_with_decodes(monkeypatch):
+    """With four requests decoding, the chunk fits what the target leaves after
+    their tokens: 1120 ms less 40 ms at 10 ms per token, 108 tokens, 96 aligned."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    decoding = create_requests(
+        num_requests=4,
+        num_tokens=8,
+        max_tokens=100,
+        req_ids=[f"d{i}" for i in range(4)],
+    )
+    for request in decoding:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _decode_one(scheduler, output, [f"d{i}" for i in range(4)])
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens["p0"] == 96
+    assert all(output.num_scheduled_tokens[f"d{i}"] == 1 for i in range(4))
+
+
+def test_tpot_target_is_shared_by_the_pp_decode_microbatches(monkeypatch):
+    """A decoding request waits for one step per microbatch between its own
+    steps, so with two each step gets half the target."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        block_size=16,
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+    )
+    stagger = scheduler.decode_stagger
+    assert stagger > 1
+    assert scheduler.prefill_cost_model is not None
+    assert scheduler.prefill_cost_model.budget_ms == pytest.approx(1120 / stagger)
+
+
+def test_tpot_target_keeps_to_the_tighter_of_the_group_and_local_caps(
+    monkeypatch,
+):
+    """The DP group's MIN holds a rank without decodes to another rank's
+    decode-step chunk, and a rank whose own decodes started since the last
+    agreement is not held to the older, larger cap."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    assert scheduler.time_budget_prefill_cap() == 8192
+    scheduler.set_prefill_cap_override(96)
+    assert scheduler._prefill_token_cap() == 96
+
+    decoding = create_requests(
+        num_requests=4,
+        num_tokens=8,
+        max_tokens=100,
+        req_ids=[f"d{i}" for i in range(4)],
+    )
+    for other in decoding:
+        other.num_computed_tokens = other.num_prompt_tokens
+        other.status = RequestStatus.RUNNING
+        scheduler.requests[other.request_id] = other
+        scheduler.running.append(other)
+    scheduler.set_prefill_cap_override(8192)
+    local = scheduler.time_budget_prefill_cap()
+    assert local < 8192
+    assert scheduler._prefill_token_cap() == local
+
+
 def test_prefill_cap_override_is_the_dp_group_minimum(monkeypatch):
     """The DP engine core hands the scheduler the group's MIN prefill chunk, so
     every rank's step carries the same prefill work; the local computation is

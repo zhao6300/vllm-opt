@@ -58,12 +58,21 @@ class PrefillCostModel:
             raise ValueError(f"The attention share must be in [0, 1): {self}")
 
     @classmethod
-    def from_env(cls) -> "PrefillCostModel | None":
-        """The model the environment configures, or None without a budget."""
-        if envs.VLLM_PREFILL_STEP_BUDGET_MS <= 0:
+    def from_env(cls, budget_ms: float | None = None) -> "PrefillCostModel | None":
+        """The model the environment configures, or None without a budget.
+
+        Args:
+            budget_ms: Step time budget to use instead of
+                `VLLM_PREFILL_STEP_BUDGET_MS`, e.g. one derived from the TPOT
+                target.
+
+        """
+        if budget_ms is None:
+            budget_ms = envs.VLLM_PREFILL_STEP_BUDGET_MS
+        if budget_ms <= 0:
             return None
         return cls(
-            budget_ms=envs.VLLM_PREFILL_STEP_BUDGET_MS,
+            budget_ms=budget_ms,
             fixed_ms=envs.VLLM_PREFILL_COST_FIXED_MS,
             ms_per_token=envs.VLLM_PREFILL_COST_MS_PER_TOKEN,
             ms_per_token_context=envs.VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT,

@@ -90,6 +90,7 @@ if TYPE_CHECKING:
     VLLM_PREFILL_COST_FIT_INTERVAL: int = 64
     VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_PREFILL_TARGET_DECODE_MS: float = 0.0
+    VLLM_PREFILL_TPOT_TARGET_MS: float = 0.0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1420,6 +1421,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is still capped by what its attention over the context costs in the
     # budget left after the target's token cost, so a rank with a long context
     # does not hold the others to its chunk, and they do not hold it to theirs.
+    # With VLLM_PREFILL_TPOT_TARGET_MS set, chunks are sized by that decode
+    # latency target instead, and no step budget or token target is used.
     "VLLM_PREFILL_FILL_TARGET": lambda: bool(
         int(os.getenv("VLLM_PREFILL_FILL_TARGET", "0"))
     ),
@@ -1442,6 +1445,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the budget in both cases.
     "VLLM_PREFILL_TARGET_DECODE_MS": lambda: float(
         os.getenv("VLLM_PREFILL_TARGET_DECODE_MS", "0")
+    ),
+    # With VLLM_PREFILL_FILL_TARGET: size prefill chunks by one decode latency
+    # target instead of the token target. While any request on the rank is
+    # decoding, a step's chunk is the largest whose modelled step time (the
+    # VLLM_PREFILL_COST_* model, kept current by VLLM_PREFILL_COST_FIT) keeps a
+    # decoding request's step-to-step interval within this many milliseconds;
+    # under PP that interval spans one step per decode microbatch, so a step
+    # gets this target over their count. With no request decoding, a step takes
+    # up to --max-num-batched-tokens, since nobody waits on it. The DP group
+    # agrees on its smallest cap, so a rank without decodes does not hold
+    # another rank's decodes. Replaces VLLM_PREFILL_STEP_BUDGET_MS and
+    # VLLM_PREFILL_TARGET_DECODE_MS for chunk sizing. With speculative decoding
+    # the per-token TPOT is this interval over the tokens a step accepts.
+    # 0 (default) keeps the token target.
+    "VLLM_PREFILL_TPOT_TARGET_MS": lambda: float(
+        os.getenv("VLLM_PREFILL_TPOT_TARGET_MS", "0")
     ),
     # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
     # (the VLLM_PREFILL_COST_* values are then the starting point, and the fit

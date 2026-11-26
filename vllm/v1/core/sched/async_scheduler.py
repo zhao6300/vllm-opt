@@ -19,6 +19,8 @@ class AsyncScheduler(Scheduler):
         self.decode_stagger = self.vllm_config.pp_num_microbatches
         if current_platform.is_xpu() and not envs.VLLM_XPU_PP_MICROBATCH:
             self.decode_stagger = 1
+        if self.prefill_tpot_target_ms and self.decode_stagger > 1:
+            self._set_tpot_step_budget(self.decode_stagger)
         if self.decode_stagger > self.pp_size:
             logger.info_once(
                 "PP decode microbatches: %d (pipeline_parallel_size=%d); each "
