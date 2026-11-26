@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS: bool = False
     VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER: bool = False
     VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS: int = 0
+    VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE: bool = True
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1297,6 +1298,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-row result does not depend on the row count. Padded rows read no KV.
     "VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", "0")
+    ),
+    # DeepSeek-V4/V4.1 indexer: under FULL_DECODE_ONLY, also take the
+    # short-context top-k fast path in steps that carry decode rows (default
+    # 1). The default top-k kernels (prefill and persistent top-k, candidate
+    # selection) list a short row ascending, the same as the fast path, so this
+    # only skips work. Set 0 with the `flashinfer` indexer decode backend,
+    # whose CUB top-k is unordered: those steps then run the full scoring path
+    # so a decode row's candidate order matches its captured step.
+    "VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE": lambda: bool(
+        int(os.getenv("VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE", "1"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.

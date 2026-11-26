@@ -1851,7 +1851,9 @@ class DeepseekV4Indexer(nn.Module):
             return True
         if mode.mixed_mode() != CUDAGraphMode.NONE:
             return False
-        return num_decode_tokens == 0
+        # The default top-k kernels also list a short row ascending, so the
+        # decode-row restriction can be lifted when they are in use.
+        return num_decode_tokens == 0 or envs.VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE
 
     def forward(
         self,

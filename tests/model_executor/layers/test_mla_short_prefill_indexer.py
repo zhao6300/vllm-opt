@@ -1730,24 +1730,53 @@ def test_sparse_mqa_logits_accuracy_vs_torch(kv_dtype: str):
         (CUDAGraphMode.FULL_AND_PIECEWISE, 3, False),
     ],
 )
+@pytest.mark.parametrize("with_decode", [False, True])
 def test_short_context_topk_fast_path_only_without_captured_rows(
-    mode: CUDAGraphMode | None, num_decode_tokens: int, expected: bool
+    monkeypatch: pytest.MonkeyPatch,
+    mode: CUDAGraphMode | None,
+    num_decode_tokens: int,
+    expected: bool,
+    with_decode: bool,
 ) -> None:
     """The eager fast path lists candidates ascending while a captured step
     leaves the kernel's unordered slots. Prefill rows are captured whenever the
     mixed mode is not NONE; decode rows are also captured under
-    FULL_DECODE_ONLY, whose eager fallback reuses them."""
+    FULL_DECODE_ONLY, whose eager fallback reuses them.
+    VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE lifts only that decode-row case."""
     from vllm.models.deepseek_v4.attention import DeepseekV4Indexer as V4Indexer
     from vllm.models.deepseek_v41.attention import (
         DeepseekV4Indexer as V41Indexer,
     )
 
+    monkeypatch.setenv(
+        "VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE", "1" if with_decode else "0"
+    )
+    if with_decode and mode == CUDAGraphMode.FULL_DECODE_ONLY:
+        expected = True
     for cls in (V41Indexer, V4Indexer):
         indexer = cls.__new__(cls)
         indexer.vllm_config = SimpleNamespace(
             compilation_config=SimpleNamespace(cudagraph_mode=mode)
         )
         assert indexer._short_context_topk_is_uncaptured(num_decode_tokens) is expected
+
+
+def test_short_context_topk_fast_path_with_decode_rows_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset, VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE keeps the fast path for
+    FULL_DECODE_ONLY steps with decode rows, since the default top-k kernels
+    order a short row the same way."""
+    from vllm.models.deepseek_v41.attention import DeepseekV4Indexer
+
+    monkeypatch.delenv("VLLM_DSV4_INDEXER_FAST_PATH_WITH_DECODE", raising=False)
+    indexer = DeepseekV4Indexer.__new__(DeepseekV4Indexer)
+    indexer.vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
+        )
+    )
+    assert indexer._short_context_topk_is_uncaptured(3) is True
 
 
 def test_padded_decode_rows_leave_the_prefill_rows_alone() -> None:
