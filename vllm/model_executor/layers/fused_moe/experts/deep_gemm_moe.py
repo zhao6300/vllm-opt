@@ -50,6 +50,33 @@ from vllm.utils.import_utils import has_deep_gemm
 logger = init_logger(__name__)
 
 
+def _debug_dump_expertraw(
+    mm2_out: torch.Tensor,
+    inv_perm: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor | None,
+) -> None:
+    """Dump the unweighted FC2 output per (token, slot) as `expertraw`
+    `[M, topk * K]` and the local-expert mask as `ekmask` (debug branch).
+
+    Mirrors `ep_gather`: slots whose expert is not on this rank are skipped
+    there, so they are zeroed here and flagged 0 in `ekmask`.
+    """
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    layer = moe_runner._debug_current_moe_layer
+    if layer is None or moe_runner._debug_tf_rows(layer) is None:
+        return
+    ids = topk_ids.long()
+    if expert_map is not None:
+        ids = torch.where(ids >= 0, expert_map[ids.clamp(min=0)].long(), ids)
+    local = ids >= 0
+    idx = torch.where(local, inv_perm.long(), torch.zeros_like(ids))
+    raw = torch.where(local.unsqueeze(-1), mm2_out[idx], 0)
+    moe_runner._debug_ep_rows_dump(layer, raw.view(ids.size(0), -1), "expertraw")
+    moe_runner._debug_ep_rows_dump(layer, local.to(torch.uint8), "ekmask")
+
+
 def _fp8_workspace_shape(
     num_rows: int, num_columns: int, workspace_dtype: torch.dtype
 ) -> tuple[int, int]:
@@ -430,6 +457,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
+        _debug_dump_expertraw(mm2_out, inv_perm, topk_ids, expert_map)
         deepgemm_unpermute_and_reduce(
             a=mm2_out,
             topk_ids=topk_ids,
@@ -694,6 +722,7 @@ class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
+        _debug_dump_expertraw(mm2_out, inv_perm, topk_ids, expert_map)
         deepgemm_unpermute_and_reduce(
             a=mm2_out,
             topk_ids=topk_ids,
