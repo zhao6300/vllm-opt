@@ -72,31 +72,29 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
-def _debug_router_dump(layer_name, tensor, tag="router"):
-    """Dump the TF rows of a MoE tensor (router logits or combine output)."""
+def _debug_tf_rows(layer_name):
+    """`(phase_dir, start, stop, decode_rows, nd)` of the TF request's rows in
+    this step's local batch, or None when nothing is to be dumped."""
     root = os.environ.get("VLLM_DEBUG_TF_DIR")
-    if not root or not torch.is_tensor(tensor) or tensor.dim() != 2:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
+    if not root or torch.cuda.is_current_stream_capturing():
+        return None
     if not is_forward_context_available():
-        return
+        return None
     try:
         with open(os.path.join(root, "phase")) as f:
             phase = f.read().strip() or "off"
     except OSError:
         phase = "off"
     if phase == "off":
-        return
+        return None
     layers = os.environ.get("VLLM_DEBUG_TF_LAYERS")
     if layers:
         wanted = [x.strip() for x in layers.split(",") if x.strip()]
         if wanted and not any(x in str(layer_name) for x in wanted):
-            return
-    fc = get_forward_context()
-    md = fc.attn_metadata
+            return None
+    md = get_forward_context().attn_metadata
     if not isinstance(md, dict):
-        return
+        return None
     swa = next(
         (
             v
@@ -106,24 +104,55 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
         None,
     )
     if swa is None:
-        return
+        return None
     seq_lens = getattr(swa, "seq_lens", None)
     if seq_lens is not None and seq_lens.numel() and int(seq_lens.max()) <= 1:
-        return  # graph-capture / idle dummy step
+        return None  # graph-capture / idle dummy step
     nd, npf = int(swa.num_decode_tokens), int(swa.num_prefill_tokens)
-    decode_rows = False
     if npf > 0:
         if phase == "decode":
-            return
+            return None
         if phase == "mixed" and nd == 0:
-            return
+            return None
         if phase == "alone" and nd > 0:
-            return
-    elif os.environ.get("VLLM_DEBUG_DECODE_DUMP") and nd > 0:
-        decode_rows = True
-    else:
+            return None
+        return os.path.join(root, phase), nd, nd + npf, False, nd
+    if os.environ.get("VLLM_DEBUG_DECODE_DUMP") and nd > 0:
+        return os.path.join(root, phase), 0, nd, True, nd
+    return None
+
+
+# The MoE layer whose modular kernel is running, for the prepare/finalize dumps.
+_debug_current_moe_layer: str | None = None
+
+
+def _debug_save_rows(path, tag, layer_name, rows, start, decode_rows, nd):
+    os.makedirs(path, exist_ok=True)
+    stem = (
+        f"{tag}__{str(layer_name).replace('/', '_')}__dev{torch.cuda.current_device()}"
+    )
+    if decode_rows:
+        # The first decode step after the phase dir is cleared wins.
+        out = os.path.join(path, f"{stem}__dec{nd}.pt")
+        if not os.path.exists(out):
+            torch.save(rows.detach().cpu(), out)
         return
-    bd = getattr(fc, "batch_descriptor", None)
+    torch.save(
+        rows.detach().cpu(),
+        os.path.join(path, f"{stem}__start{start}__rows{rows.shape[0]}.pt"),
+    )
+
+
+def _debug_router_dump(layer_name, tensor, tag="router"):
+    """Dump the TF rows of a MoE tensor that holds this rank's local batch rows
+    (or its sequence-parallel shard of them)."""
+    if not torch.is_tensor(tensor) or tensor.dim() not in (1, 2):
+        return
+    ctx = _debug_tf_rows(layer_name)
+    if ctx is None:
+        return
+    path, start, stop, decode_rows, nd = ctx
+    bd = getattr(get_forward_context(), "batch_descriptor", None)
     num_batch = int(getattr(bd, "num_tokens", 0)) if bd is not None else 0
     n_rows = tensor.shape[0]
     if num_batch and n_rows == num_batch:
@@ -136,33 +165,48 @@ def _debug_router_dump(layer_name, tensor, tag="router"):
         if n_rows != chunk:
             return
         base = get_tensor_model_parallel_rank() * chunk
-    if decode_rows:
-        start, stop = max(0, base), min(nd, base + n_rows)
-    else:
-        start, stop = max(nd, base), min(nd + npf, base + n_rows)
+    start, stop = max(start, base), min(stop, base + n_rows)
     if stop <= start:
         return
-    path = os.path.join(root, phase)
-    os.makedirs(path, exist_ok=True)
-    if decode_rows:
-        # The first decode step after the phase dir is cleared wins.
-        out = os.path.join(
-            path,
-            f"{tag}__{str(layer_name).replace('/', '_')}"
-            f"__dev{torch.cuda.current_device()}__dec{nd}.pt",
-        )
-        if not os.path.exists(out):
-            torch.save(tensor[start - base : stop - base].detach().cpu(), out)
+    rows = tensor[start - base : stop - base]
+    _debug_save_rows(path, tag, layer_name, rows, start, decode_rows, nd)
+
+
+def _debug_ep_rows_dump(layer_name, tensor, tag):
+    """Dump the TF rows of a tensor gathered over the EP group (the rows every
+    rank dispatched, rank-major), e.g. the experts' input, top-k, or partials.
+
+    Each rank holds every gathered row; this rank's slice of the TF request's
+    rows is found from the dispatch sizes, and all TF rows are saved (both
+    sequence-parallel shards), so one device's file covers the request.
+    """
+    if not torch.is_tensor(tensor) or tensor.dim() not in (1, 2):
         return
-    torch.save(
-        tensor[start - base : stop - base].detach().cpu(),
-        os.path.join(
-            path,
-            f"{tag}__{str(layer_name).replace('/', '_')}"
-            f"__dev{torch.cuda.current_device()}"
-            f"__start{start}__rows{stop - start}.pt",
-        ),
-    )
+    ctx = _debug_tf_rows(layer_name)
+    if ctx is None:
+        return
+    path, start, stop, decode_rows, nd = ctx
+    dp_metadata = get_forward_context().dp_metadata
+    sizes = getattr(dp_metadata, "local_sizes", None)
+    if not sizes or tensor.shape[0] != sum(sizes):
+        # Not gathered (the modular kernel dispatches internally): local rows.
+        _debug_router_dump(layer_name, tensor, tag)
+        return
+    from vllm.distributed import get_dp_group
+
+    dp = get_dp_group()
+    # sizes is dp-major with one entry per sequence-parallel shard (1 if no SP).
+    sp = len(sizes) // dp.world_size
+    first = dp.rank_in_group * sp
+    if sp <= 0 or len(sizes) < first + sp:
+        return
+    chunk = sizes[first]
+    if chunk <= 0 or stop <= start or (stop - 1) // chunk >= sp:
+        return
+    offsets = [sum(sizes[: first + t]) for t in range(sp)]
+    index = [offsets[j // chunk] + j % chunk for j in range(start, stop)]
+    rows = tensor[torch.tensor(index, device=tensor.device)]
+    _debug_save_rows(path, tag, layer_name, rows, start, decode_rows, nd)
 
 
 def register_layer_for_moe_forward_op(
@@ -778,6 +822,9 @@ class MoERunner(MoERunnerInterface):
             )
             if not self.router.masks_padding:
                 topk_ids = topk_ids.masked_fill(is_padding.unsqueeze(1), -1)
+            _debug_ep_rows_dump(self.layer_name, hidden_states, "expertin")
+            _debug_ep_rows_dump(self.layer_name, topk_weights, "topkweights")
+            _debug_ep_rows_dump(self.layer_name, topk_ids, "topkids")
             fused_out = self.routed_experts.forward_monolithic_routed(
                 hidden_states, topk_weights, topk_ids
             )
@@ -799,6 +846,11 @@ class MoERunner(MoERunnerInterface):
                 topk_indices_dtype=self._quant_method.topk_indices_dtype,
                 input_ids=input_ids,
             )
+            _debug_ep_rows_dump(self.layer_name, hidden_states, "expertin")
+            _debug_ep_rows_dump(self.layer_name, topk_weights, "topkweights")
+            _debug_ep_rows_dump(self.layer_name, topk_ids, "topkids")
+            global _debug_current_moe_layer
+            _debug_current_moe_layer = self.layer_name
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -807,6 +859,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+            _debug_current_moe_layer = None
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
@@ -1133,7 +1186,8 @@ class MoERunner(MoERunnerInterface):
                 hidden_states_scale=hidden_states_scale,
             )
 
-            _debug_router_dump(self.layer_name, hidden_states, "moeprecombine")
+            _debug_ep_rows_dump(self.layer_name, hidden_states, "moeprecombine")
+            _debug_router_dump(self.layer_name, shared_output, "shared")
             result = self._maybe_combine(
                 shared_output,
                 hidden_states,

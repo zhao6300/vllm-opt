@@ -88,6 +88,15 @@ def _unwrap_scale_and_prepare_for_moe(
     return a1q_scale
 
 
+def _debug_dump(tensor: torch.Tensor, tag: str) -> None:
+    """TF rows of an EP-gathered tensor (debug/dsv41-mixed-step-dumps)."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    layer = moe_runner._debug_current_moe_layer
+    if layer is not None:
+        moe_runner._debug_ep_rows_dump(layer, tensor, tag)
+
+
 class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
     """Naive Prepare/Finalize for Dp/Ep case for Modular Kernels.
 
@@ -253,6 +262,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             else:
                 a1q_scale = a1q_scale_orig
 
+        _debug_dump(a1q, "expertinq")
+        _debug_dump(topk_weights, "ekweights")
+        _debug_dump(topk_ids, "ekids")
         return a1q, a1q_scale, None, topk_ids, topk_weights
 
     def finalize(
@@ -286,6 +298,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
+        _debug_dump(out, "expertout")
         with self._comm_region():
             get_ep_group().combine_into_output(
                 out,
