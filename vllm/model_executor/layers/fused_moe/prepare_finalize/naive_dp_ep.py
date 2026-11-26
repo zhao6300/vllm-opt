@@ -279,6 +279,15 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
+        m, num_topk = topk_ids.shape
+        hidden = fused_expert_output.size(-1)
+        if (
+            fused_expert_output.is_contiguous()
+            and fused_expert_output.numel() == m * num_topk * hidden
+        ):
+            # Unweighted per-(token, k) expert outputs; apply() scales in place.
+            _debug_dump(fused_expert_output.view(m, -1), "expertraw")
+
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP):
             # allocate_fused_expert_output already selected the combine input.
             # Reuse it directly; the symmetric allocator may return a new view
