@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Callable, Iterable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -116,7 +116,11 @@ def _debug_tf_rows(layer_name):
             return None
         if phase == "alone" and nd > 0:
             return None
-        return os.path.join(root, phase), nd, nd + npf, False, nd
+        # Skip prefill rows before this local index (e.g. pos0) to cut size.
+        first = nd + int(os.environ.get("VLLM_DEBUG_TF_MIN_ROW", "0"))
+        if first >= nd + npf:
+            return None
+        return os.path.join(root, phase), first, nd + npf, False, nd
     if os.environ.get("VLLM_DEBUG_DECODE_DUMP") and nd > 0:
         return os.path.join(root, phase), 0, nd, True, nd
     return None
@@ -126,21 +130,47 @@ def _debug_tf_rows(layer_name):
 _debug_current_moe_layer: str | None = None
 
 
+_debug_save_failed = False
+
+
 def _debug_save_rows(path, tag, layer_name, rows, start, decode_rows, nd):
-    os.makedirs(path, exist_ok=True)
+    """Save atomically (tmp + rename); on any error log once and stop dumping
+    instead of killing the worker."""
+    global _debug_save_failed
+    if _debug_save_failed:
+        return
     stem = (
         f"{tag}__{str(layer_name).replace('/', '_')}__dev{torch.cuda.current_device()}"
     )
     if decode_rows:
         # The first decode step after the phase dir is cleared wins.
         out = os.path.join(path, f"{stem}__dec{nd}.pt")
-        if not os.path.exists(out):
-            torch.save(rows.detach().cpu(), out)
-        return
-    torch.save(
-        rows.detach().cpu(),
-        os.path.join(path, f"{stem}__start{start}__rows{rows.shape[0]}.pt"),
-    )
+        if os.path.exists(out):
+            return
+    else:
+        out = os.path.join(path, f"{stem}__start{start}__rows{rows.shape[0]}.pt")
+    tmp = f"{out}.tmp{os.getpid()}"
+    try:
+        os.makedirs(path, exist_ok=True)
+        torch.save(rows.detach().cpu(), tmp)
+        os.replace(tmp, out)
+    except Exception as e:
+        _debug_save_failed = True
+        try:
+            st = os.statvfs(path)
+            free = f"{st.f_bavail * st.f_frsize / 2**20:.0f} MiB free"
+        except OSError:
+            free = "free space unknown"
+        logger.warning(
+            "TF dump of %s failed (%s; %s at %s); MoE dumps disabled in pid %d",
+            out,
+            e,
+            free,
+            path,
+            os.getpid(),
+        )
+        with suppress(OSError):
+            os.remove(tmp)
 
 
 def _debug_router_dump(layer_name, tensor, tag="router"):
