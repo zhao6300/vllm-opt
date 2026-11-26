@@ -1678,3 +1678,114 @@ def test_storage_offset_scratch_refuses_to_grow() -> None:
             mod._get_storage_offset_index_scratch(device, "swa", 16, 4)
     finally:
         mod._storage_offset_index_scratch.clear()
+
+
+class _RowWiseSm120Wrapper:
+    """Per-row stand-in: row r's output is q[r] + topk_length[r]."""
+
+    def __init__(self, **kwargs):
+        self.calls: list[dict] = []
+
+    def run(self, **kwargs):
+        self.calls.append(
+            {k: v.clone() if torch.is_tensor(v) else v for k, v in kwargs.items()}
+            | {
+                "ptrs": {
+                    k: v.data_ptr() for k, v in kwargs.items() if torch.is_tensor(v)
+                }
+            }
+        )
+        lens = kwargs["topk_length"].to(kwargs["q"].dtype)
+        kwargs["output"].copy_(kwargs["q"] + lens[:, None, None])
+
+
+def _min_tokens_call(monkeypatch, num_tokens: int, *, extra: bool = True):
+    import flashinfer.mla._sparse_mla_sm120 as flashinfer_sm120
+
+    monkeypatch.setattr(flashinfer_sm120, "SparseMLASm120Wrapper", _RowWiseSm120Wrapper)
+    query = torch.randn((num_tokens, 8, 512)).to(torch.bfloat16)
+    indices = torch.arange(num_tokens * 5, dtype=torch.int32).view(num_tokens, 5)
+    lens = torch.arange(1, num_tokens + 1, dtype=torch.int32)
+    output = torch.full((num_tokens, 8, 512), 7.0, dtype=torch.bfloat16)
+    args = dict(
+        query=query,
+        swa_kv_cache=torch.empty((8, 64, 528), dtype=torch.uint8),
+        sparse_indices=indices,
+        output=output,
+        sm_scale=1.0,
+        topk_length=lens,
+        attn_sink=None,
+        extra_kv_cache=torch.empty((8, 64, 1, 288), dtype=torch.uint8)
+        if extra
+        else None,
+        extra_sparse_indices=indices.clone().view(num_tokens, 1, 5) if extra else None,
+        extra_sparse_topk_lens=lens.clone() if extra else None,
+        extra_kv_fp4=extra,
+        prefill_impl="auto",
+    )
+    inputs = {k: v.clone() for k, v in args.items() if torch.is_tensor(v)}
+    _paged_attention(**args)
+    wrapper = next(iter(nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers.values()))
+    return args, inputs, wrapper
+
+
+@pytest.fixture
+def _fresh_min_tokens_state(monkeypatch):
+    monkeypatch.setattr(nvidia.flashinfer_sparse, "_sparse_mla_sm120_wrappers", {})
+    monkeypatch.setattr(nvidia.flashinfer_sparse, "_sm120_min_tokens_scratch", {})
+
+
+@pytest.mark.usefixtures("_fresh_min_tokens_state")
+def test_sm120_min_tokens_pads_short_calls_with_empty_windows(monkeypatch) -> None:
+    """A short call reaches FlashInfer with `MIN_TOKENS` rows whose padding has
+    zero-length windows, and only the real rows come back."""
+    monkeypatch.setenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", "65")
+    args, inputs, wrapper = _min_tokens_call(monkeypatch, 6)
+
+    (call,) = wrapper.calls
+    for key in ("q", "indices", "topk_length", "output", "extra_indices"):
+        assert call[key].shape[0] == 65
+    assert torch.equal(call["q"][:6], inputs["query"])
+    assert torch.equal(call["indices"][:6], inputs["sparse_indices"])
+    assert torch.equal(call["topk_length"][:6], inputs["topk_length"])
+    assert torch.all(call["topk_length"][6:] == 0)
+    assert torch.all(call["indices"][6:] == -1)
+    assert torch.all(call["extra_topk_length"][6:] == 0)
+    assert torch.all(call["extra_indices"][6:] == -1)
+    expected = inputs["query"] + inputs["topk_length"].to(torch.bfloat16)[:, None, None]
+    assert torch.equal(args["output"], expected)
+    for key in ("query", "sparse_indices", "topk_length", "extra_sparse_indices"):
+        assert torch.equal(args[key], inputs[key]), key
+
+
+@pytest.mark.usefixtures("_fresh_min_tokens_state")
+def test_sm120_min_tokens_reuses_buffers_and_clears_stale_rows(monkeypatch) -> None:
+    """The padded operands keep their addresses across calls (graphs bake
+    them), and rows a wider earlier call filled are reset to empty windows."""
+    monkeypatch.setenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", "65")
+    _min_tokens_call(monkeypatch, 12)
+    first = nvidia.flashinfer_sparse._sparse_mla_sm120_wrappers.copy()
+    monkeypatch.setattr(nvidia.flashinfer_sparse, "_sparse_mla_sm120_wrappers", first)
+    _, _, wrapper = _min_tokens_call(monkeypatch, 6)
+
+    wide, short = wrapper.calls
+    padded = ("q", "indices", "topk_length", "output", "extra_indices")
+    padded += ("extra_topk_length",)
+    assert all(wide["ptrs"][k] == short["ptrs"][k] for k in padded)
+    assert torch.all(short["topk_length"][6:] == 0)
+    assert torch.all(short["indices"][6:] == -1)
+
+
+@pytest.mark.usefixtures("_fresh_min_tokens_state")
+@pytest.mark.parametrize(("min_tokens", "num_tokens"), [("0", 6), ("65", 65)])
+def test_sm120_min_tokens_leaves_other_calls_alone(
+    monkeypatch, min_tokens: str, num_tokens: int
+) -> None:
+    """Off, or a call already that wide, passes the caller's tensors through."""
+    monkeypatch.setenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", min_tokens)
+    args, _, wrapper = _min_tokens_call(monkeypatch, num_tokens, extra=False)
+
+    (call,) = wrapper.calls
+    assert call["ptrs"]["q"] == args["query"].data_ptr()
+    assert call["ptrs"]["output"] == args["output"].data_ptr()
+    assert call["topk_length"].shape[0] == num_tokens

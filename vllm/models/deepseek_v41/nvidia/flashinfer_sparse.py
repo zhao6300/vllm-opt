@@ -375,6 +375,48 @@ def _sm120_caller_buffers_for_layer(
     return buffers
 
 
+# Row-padded copies of a short wrapper call's operands
+# (`VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS`), one per device, role, row tail
+# and dtype. Layers share them: the copy-in, the kernel and the copy-out run in
+# order on one stream. Kept for the process so captured graphs keep addresses.
+_sm120_min_tokens_scratch: dict[tuple, torch.Tensor] = {}
+
+
+def _sm120_min_tokens_buffer(
+    role: str, like: torch.Tensor, rows: int, fill: int | float | None
+) -> torch.Tensor:
+    """A persistent contiguous `[rows, *like.shape[1:]]` buffer for `role`."""
+    key = (like.device, role, tuple(like.shape[1:]), like.dtype, rows)
+    buf = _sm120_min_tokens_scratch.get(key)
+    if buf is None:
+        if like.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                f"the SM120 row-padding buffer for {role} {tuple(like.shape)} "
+                "must be created by the eager warmup before graph capture"
+            )
+        buf = torch.empty((rows, *like.shape[1:]), dtype=like.dtype, device=like.device)
+        if fill is not None:
+            buf.fill_(fill)
+        _sm120_min_tokens_scratch[key] = buf
+    return buf
+
+
+def _pad_sm120_rows(
+    role: str,
+    tensor: torch.Tensor,
+    rows: int,
+    pad: int | float | None,
+) -> torch.Tensor:
+    """`tensor`'s rows first, then `rows - len(tensor)` rows set to `pad`
+    (left as they are when `pad` is None)."""
+    buf = _sm120_min_tokens_buffer(role, tensor, rows, 0 if pad is None else pad)
+    n = tensor.shape[0]
+    buf[:n].copy_(tensor)
+    if pad is not None:
+        buf[n:].fill_(pad)
+    return buf
+
+
 def _sparse_mla_sm120_paged_attention(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -411,6 +453,30 @@ def _sparse_mla_sm120_paged_attention(
             device=query.device,
         )
         _sparse_mla_sm120_wrappers[device_key] = wrapper
+    num_tokens = query.shape[0]
+    min_tokens = envs.VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS
+    padded_output = None
+    if 0 < num_tokens < min_tokens:
+        # Padded rows have zero-length windows, so the kernel reads no KV for
+        # them; only the first `num_tokens` output rows are copied back.
+        query = _pad_sm120_rows("q", query, min_tokens, None)
+        sparse_indices = _pad_sm120_rows("indices", sparse_indices, min_tokens, -1)
+        topk_length = _pad_sm120_rows("lens", topk_length, min_tokens, 0)
+        if extra_sparse_indices is not None:
+            extra_sparse_indices = _pad_sm120_rows(
+                "extra_indices", extra_sparse_indices, min_tokens, -1
+            )
+        if extra_sparse_topk_lens is not None:
+            extra_sparse_topk_lens = _pad_sm120_rows(
+                "extra_lens", extra_sparse_topk_lens, min_tokens, 0
+            )
+        padded_output = output
+        output = _sm120_min_tokens_buffer("output", output, min_tokens, 0)
+        if caller is not None and caller.lse.shape[0] < min_tokens:
+            raise RuntimeError(
+                f"VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS={min_tokens} exceeds the "
+                f"{caller.lse.shape[0]} LSE rows of the SM120 caller scratch"
+            )
     if caller is not None:
         if caller.in_use:
             raise RuntimeError(
@@ -455,6 +521,8 @@ def _sparse_mla_sm120_paged_attention(
     finally:
         if caller is not None:
             caller.in_use = False
+    if padded_output is not None:
+        padded_output.copy_(output[:num_tokens])
 
 
 def _cake_dsv41_sm120_paged_attention(

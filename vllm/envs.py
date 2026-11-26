@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_DSV41_SM120_MEGA_GATE: bool = False
     VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS: bool = False
     VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER: bool = False
+    VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS: int = 0
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1277,6 +1278,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # RoPE + MXFP8 insert. Off keeps the Triton writer.
     "VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER", "0"))
+    ),
+    # Pad every SM120 sparse-MLA wrapper call to at least this many query rows
+    # (0 = off). FlashInfer runs at most 64 rows on its split-K decode kernel
+    # and more on its prefill kernel; the two, and the decode kernel across row
+    # counts, round differently, so a verify step and the prefill of the same
+    # context disagree. With 65 every call takes the prefill kernel, whose
+    # per-row result does not depend on the row count. Padded rows read no KV.
+    "VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", "0")
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
