@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_DSV41_SM120_INDEXER_LOGITS: bool = False
     VLLM_FLASHINFER_DSV41_SM120_FP8_CACHE_WRITER: bool = False
     VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS: int = 0
+    VLLM_GATE_LINEAR_BATCH_INVARIANT: bool = False
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_INTERVAL: int = 0
     VLLM_ADAPTIVE_VERIFICATION_ONLINE_WINDOW: int = 256
@@ -1287,6 +1288,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per-row result does not depend on the row count. Padded rows read no KV.
     "VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_FLASHINFER_DSV41_SM120_MIN_TOKENS", "0")
+    ),
+    # Run unquantized, bias-free GateLinear router GEMMs on the Triton
+    # batch-invariant matmul (fp32 accumulate, fp32 logits) instead of the
+    # cuBLAS/specialized tiers, whose algorithm and accumulation order change
+    # with the token count. A token's router logits then no longer depend on
+    # how many tokens share its batch (e.g. a speculative verify step vs the
+    # prefill of the same context). Unlike VLLM_BATCH_INVARIANT this touches
+    # only the router GEMM.
+    "VLLM_GATE_LINEAR_BATCH_INVARIANT": lambda: bool(
+        int(os.getenv("VLLM_GATE_LINEAR_BATCH_INVARIANT", "0"))
     ),
     # KV context length each adaptive-verification profiling request pretends to
     # carry, so the profiled step reads a realistic amount of cache.
