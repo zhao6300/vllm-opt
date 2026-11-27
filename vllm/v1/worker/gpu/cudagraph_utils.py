@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import bisect
 import gc
 import itertools
 from collections import defaultdict
@@ -223,6 +224,8 @@ class CudaGraphManager:
             tuple[int, int, int], list[BatchExecutionDescriptor]
         ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
+        # Token counts of the PIECEWISE graphs, ascending; the same on every rank.
+        self._piecewise_token_sizes: list[int] = []
 
         # Breakable CUDA graph (PW CUDA graph without torch.compile)
         self.use_breakable_cg = (
@@ -393,6 +396,13 @@ class CudaGraphManager:
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
+        self._piecewise_token_sizes = sorted(
+            {
+                d.num_tokens
+                for d in token_keyed_descs
+                if d.cg_mode == CUDAGraphMode.PIECEWISE and d.num_ubatches == 1
+            }
+        )
 
         # A uniform decode batch looks up its request count among the graphs of
         # its own query length, so one query length never shadows another.
@@ -603,6 +613,16 @@ class CudaGraphManager:
             num_active_loras=effective_loras,
             num_ubatches=num_ubatches,
         )
+
+    def piecewise_token_bucket(self, num_tokens: int) -> int | None:
+        """Smallest captured PIECEWISE graph size that holds `num_tokens`, or
+        None when no graph does (or none is captured). The sizes do not
+        depend on LoRA or request counts, so every rank gets the same answer."""
+        if not self._graphs_captured or num_tokens <= 0:
+            return None
+        sizes = self._piecewise_token_sizes
+        i = bisect.bisect_left(sizes, num_tokens)
+        return sizes[i] if i < len(sizes) else None
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""

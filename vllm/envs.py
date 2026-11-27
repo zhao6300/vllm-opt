@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_PREFILL_TARGET_DECODE_MS: float = 0.0
     VLLM_PREFILL_TPOT_TARGET_MS: float = 0.0
+    VLLM_DP_EAGER_PAD_TOKENS: int = 0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
     VLLM_PP_MICROBATCH_BALANCE: Literal["off", "balance", "pack"] = "off"
@@ -1449,6 +1450,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PREFILL_TPOT_TARGET_MS": lambda: float(
         os.getenv("VLLM_PREFILL_TPOT_TARGET_MS", "0")
     ),
+    # Data parallel, V2 model runner: run a step eager instead of on a
+    # PIECEWISE CUDA graph when the graph would pad at least this many rows
+    # over the whole DP group. A graph pads every rank to the largest rank's
+    # graph size G, and every padded row is carried by each MoE all-gather and
+    # combine; eager runs each rank at its own graph-grid size instead, for a
+    # roughly fixed launch cost. The group's padding is
+    # `dp_size * G - sum(grid size of each rank's tokens)`, computed from the
+    # DP all-reduce so every rank decides alike. FULL decode graphs are never
+    # skipped. Set it to the launch cost over the per-row transfer cost of a
+    # step (about 4096 on PCIe SM120 with DP4); 0 (default) disables it.
+    "VLLM_DP_EAGER_PAD_TOKENS": lambda: int(os.getenv("VLLM_DP_EAGER_PAD_TOKENS", "0")),
     # With VLLM_PREFILL_STEP_BUDGET_MS: fit the cost model's three coefficients
     # (the VLLM_PREFILL_COST_* values are then the starting point, and the fit
     # only keeps them valid) to the measured step periods while

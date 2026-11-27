@@ -2,21 +2,27 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.fault_tolerance import ft_tp_barrier_required
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
+from vllm.logger import init_logger
 from vllm.v1.worker.dp_utils import should_skip_dp_coordination
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +35,8 @@ class DPSyncState:
     """
 
     # Per-rank token counts, for the forward context. All entries hold the
-    # agreed padded count, unless `eager`, where nothing was padded.
+    # agreed padded count, unless `eager`, where each rank runs its own count
+    # (its graph-grid size when the step left a graph for its padding).
     num_tokens_across_dp: torch.Tensor
     # Agreed uniform decode length. None means the ranks disagreed, which is an
     # answer, not "unknown".
@@ -44,6 +51,92 @@ class DPSyncState:
     # Whether every rank's scheduler found that none of its requests can use this
     # step's drafts, so all ranks skip drafting together.
     skip_drafts: bool = False
+
+
+def eager_grid_tokens(
+    num_tokens_across_dp: torch.Tensor, bucket: Callable[[int], int | None]
+) -> torch.Tensor:
+    """Each rank's token count rounded up to its own graph-grid size.
+
+    An eager step that falls back from a padded graph keeps the kernel shapes
+    on the captured grid (shape-keyed plans, autotuners and Triton
+    specializations stay warm) without padding to the largest rank. A count
+    above the grid, or 0, is kept as is.
+    """
+    return torch.tensor(
+        [bucket(n) or n for n in num_tokens_across_dp.tolist()],
+        dtype=num_tokens_across_dp.dtype,
+    )
+
+
+def dp_padding_waste(
+    num_tokens_across_dp: torch.Tensor, bucket: Callable[[int], int | None]
+) -> int | None:
+    """Rows a shared graph pads over eager at grid sizes, summed over the DP
+    group: `dp_size * G - sum(grid size of each rank)`, where G is the grid
+    size of the largest rank. None when the largest rank is off the grid."""
+    graph_tokens = bucket(int(num_tokens_across_dp.max()))
+    if graph_tokens is None:
+        return None
+    eager = eager_grid_tokens(num_tokens_across_dp, bucket)
+    return graph_tokens * num_tokens_across_dp.numel() - int(eager.sum())
+
+
+class _EagerPaddingStats:
+    """Periodic log of the padding-driven eager steps."""
+
+    def __init__(self, interval_s: float = 60.0) -> None:
+        self.interval_s = interval_s
+        self._reset(time.monotonic())
+
+    def _reset(self, now: float) -> None:
+        self.since = now
+        self.steps = 0
+        self.eager_wastes: list[int] = []
+
+    def record(self, waste: int | None, eager: bool) -> None:
+        self.steps += 1
+        if eager:
+            assert waste is not None
+            self.eager_wastes.append(waste)
+        now = time.monotonic()
+        if now - self.since < self.interval_s:
+            return
+        if self.eager_wastes:
+            wastes = sorted(self.eager_wastes)
+            logger.info(
+                "DP padding: %d of %d PIECEWISE steps ran eager in the last "
+                "%.0f s (VLLM_DP_EAGER_PAD_TOKENS=%d); padded rows avoided "
+                "p50 %d, p90 %d, max %d.",
+                len(wastes),
+                self.steps,
+                now - self.since,
+                envs.VLLM_DP_EAGER_PAD_TOKENS,
+                wastes[len(wastes) // 2],
+                wastes[min(len(wastes) - 1, (9 * len(wastes)) // 10)],
+                wastes[-1],
+            )
+        self._reset(now)
+
+
+_eager_padding_stats = _EagerPaddingStats()
+
+
+def _should_run_padding_eager(
+    cudagraph_manager: CudaGraphManager | None, num_tokens_across_dp: torch.Tensor
+) -> bool:
+    """Whether the group's PIECEWISE step pads at least
+    `VLLM_DP_EAGER_PAD_TOKENS` rows. Reads only the all-reduced counts and the
+    shared graph grid, so every rank decides alike."""
+    threshold = envs.VLLM_DP_EAGER_PAD_TOKENS
+    if threshold <= 0 or cudagraph_manager is None:
+        return False
+    waste = dp_padding_waste(
+        num_tokens_across_dp, cudagraph_manager.piecewise_token_bucket
+    )
+    eager = waste is not None and waste >= threshold
+    _eager_padding_stats.record(waste, eager)
+    return eager
 
 
 def sync_cudagraph_and_dp_padding(
@@ -204,6 +297,29 @@ def sync_cudagraph_and_dp_padding(
         "where synced_cg_mode must be NONE across all DP ranks"
     )
     synced_num_tokens = int(num_tokens_across_dp.max())
+
+    if synced_cg_mode == CUDAGraphMode.PIECEWISE and _should_run_padding_eager(
+        cudagraph_manager, num_tokens_across_dp
+    ):
+        eager_across_dp = eager_grid_tokens(
+            num_tokens_across_dp_full, cudagraph_manager.piecewise_token_bucket
+        )
+        return (
+            BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=int(eager_across_dp[dp_rank]),
+                num_reqs=num_reqs,
+                num_active_loras=desired_batch_desc.num_active_loras,
+            ),
+            DPSyncState(
+                num_tokens_across_dp=eager_across_dp,
+                uniform_token_count=synced_uniform_token_count,
+                max_query_len=synced_max_query_len,
+                eager=True,
+                num_reqs=int(num_reqs_across_dp.max()),
+                skip_drafts=skip_drafts,
+            ),
+        )
 
     # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
     # so we don't perform request padding for PIECEWISE graphs.
