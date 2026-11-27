@@ -13,12 +13,11 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
 )
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
-from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
-    swizzle_mxfp8_scale,
+from vllm.model_executor.layers.fused_moe.utils import (
+    moe_kernel_quantize_input,
+    restore_dispatched_scale_layout,
 )
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 from vllm.v1.worker.ubatching import (
     dbo_enabled,
     dbo_switch_to_compute_sync,
@@ -68,23 +67,13 @@ def _quantize_and_setup_dispatch(
 def _unwrap_scale_and_prepare_for_moe(
     scales: list[torch.Tensor] | None,
     quant_config: FusedMoEQuantConfig,
-    hidden_size: int,
 ) -> torch.Tensor:
     assert scales is not None and len(scales) == 1
-    a1q_scale = scales[0]
     # Apply swizzling after a2a if the MoE kernel needs it.
-    if quant_config.quant_dtype == "nvfp4" and quant_config.is_scale_swizzled:
-        assert a1q_scale is not None
-        if a1q_scale.element_size() == 1:
-            a1q_scale = a1q_scale.view(torch.uint8)
-        a1q_scale = nvfp4_block_scale_interleave(a1q_scale)
-    elif quant_config.quant_dtype == "mxfp8" and quant_config.is_scale_swizzled:
-        # The a2a carries row-major [tokens, K/32] scales so each row moves
-        # with its token; CUTLASS consumes F8_128x4 and expects it padded.
-        a1q_scale = swizzle_mxfp8_scale(
-            a1q_scale.view(torch.uint8), M=a1q_scale.size(0), K=hidden_size
-        )
-
+    a1q_scale = restore_dispatched_scale_layout(
+        scales[0], quant_config.quant_dtype, quant_config.is_scale_swizzled
+    )
+    assert a1q_scale is not None
     return a1q_scale
 
 
@@ -248,7 +237,7 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 lora_ctx.local_token_lora_mapping = dispatched_lora_mapping
             if scales is not None:
                 a1q_scale = _unwrap_scale_and_prepare_for_moe(
-                    gathered_extras, quant_config, a1q.size(-1)
+                    gathered_extras, quant_config
                 )
             else:
                 a1q_scale = a1q_scale_orig
@@ -354,9 +343,7 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
         else:
             assert len(res) == 3
             a1q, router_logits, scales = res
-            a1q_scale = _unwrap_scale_and_prepare_for_moe(
-                scales, quant_config, a1q.size(-1)
-            )
+            a1q_scale = _unwrap_scale_and_prepare_for_moe(scales, quant_config)
 
         return a1q, a1q_scale, router_logits
 
@@ -388,9 +375,7 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
             return a1q, a1q_scale_orig, topk_weights, topk_ids
         assert len(res) == 4
         a1q, topk_weights, topk_ids, gathered_scales = res
-        a1q_scale = _unwrap_scale_and_prepare_for_moe(
-            gathered_scales, quant_config, a1q.size(-1)
-        )
+        a1q_scale = _unwrap_scale_and_prepare_for_moe(gathered_scales, quant_config)
         return a1q, a1q_scale, topk_weights, topk_ids
 
     def finalize(
