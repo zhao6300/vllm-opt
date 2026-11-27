@@ -33,6 +33,13 @@ Then query the endpoint to get the latest metrics from the server:
 
 The following metrics are exposed:
 
+!!! note
+    Deployment details are hidden by default. `vllm:cache_config_info` and
+    connector-specific KV metrics (for example
+    `vllm:lmcache_mp_lookup_duration_seconds`) are only registered when
+    `VLLM_EXPOSE_DEPLOYMENT_INFO=1` is set. See
+    [Deployment Information Exposure](security.md#deployment-information-exposure).
+
 ## General Metrics
 
 --8<-- "gen:metrics-general"

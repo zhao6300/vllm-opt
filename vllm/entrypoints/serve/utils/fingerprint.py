@@ -5,13 +5,17 @@ server.
 
 Four modes, configured via `--fingerprint-mode`:
 
-* `full` (default): `vllm-<version>[-<parallelism>]-<hash8>` — encodes
+* `full`: `vllm-<version>[-<parallelism>]-<hash8>` — encodes
   server version, any non-trivial parallelism degree (tp/pp/dp/ep), and an
   8-char prefix of `hash_config(vllm_config)` (covers model identity,
   quant config, speculative, attention backend, etc.).
 * `hash`: `vllm-<version>-<hash8>` — parallelism stripped.
 * `custom`: user-provided literal via `--fingerprint-value`.
 * `none`: the field is omitted (serialized as `null`).
+
+`VLLM_EXPOSE_DEPLOYMENT_INFO` is authoritative: when it is unset, the field
+is omitted regardless of the mode. `--fingerprint-mode` only applies when
+deployment information is exposed.
 
 `get_system_fingerprint` is only called at serving-class init (a handful
 of times per server); each subclass caches the returned string on
@@ -22,9 +26,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import vllm.envs as envs
+
 FingerprintMode = Literal["full", "hash", "custom", "none"]
 
-_DEFAULT_MODE: FingerprintMode = "full"
+_DEFAULT_MODE: FingerprintMode = "full" if envs.VLLM_EXPOSE_DEPLOYMENT_INFO else "none"
 _CUSTOM_VALUE: str | None = None
 
 
@@ -50,6 +56,8 @@ def build_system_fingerprint(
     mode: FingerprintMode = "full",
     custom_value: str | None = None,
 ) -> str | None:
+    if not envs.VLLM_EXPOSE_DEPLOYMENT_INFO:
+        return None
     if mode == "none":
         return None
     if mode == "custom":

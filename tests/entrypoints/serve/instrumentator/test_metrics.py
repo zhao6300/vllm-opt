@@ -58,7 +58,11 @@ def server(model_key, default_server_args, request):
         default_server_args.append(request.param)
 
     model_name = MODELS[model_key]
-    with RemoteOpenAIServer(model_name, default_server_args) as remote_server:
+    with RemoteOpenAIServer(
+        model_name,
+        default_server_args,
+        env_dict={"VLLM_EXPOSE_DEPLOYMENT_INFO": "1"},
+    ) as remote_server:
         yield remote_server
 
 

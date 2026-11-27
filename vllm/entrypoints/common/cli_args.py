@@ -223,15 +223,20 @@ class BaseFrontendArgs:
     Has no effect on `vllm launch render` or `vllm serve --tokens-only` which
     always register their required endpoints regardless of this flag.
     """
-    fingerprint_mode: Literal["full", "hash", "custom", "none"] = "full"
+    fingerprint_mode: Literal["full", "hash", "custom", "none"] = (
+        "full" if envs.VLLM_EXPOSE_DEPLOYMENT_INFO else "none"
+    )
     """Controls the `system_fingerprint` field on responses.
 
-    - `full` (default): `vllm-<version>[-<parallelism>]-<hash8>`. Encodes
-      server version, non-trivial parallelism degrees (tp/pp/dp/ep), and an
-      8-char config hash.
+    - `full`: `vllm-<version>[-<parallelism>]-<hash8>`. Encodes server
+      version, non-trivial parallelism degrees (tp/pp/dp/ep), and an 8-char
+      config hash.
     - `hash`: `vllm-<version>-<hash8>`. Parallelism stripped.
     - `custom`: emits the literal string from `--fingerprint-value`.
     - `none`: the field is omitted (serialized as `null`).
+
+    `VLLM_EXPOSE_DEPLOYMENT_INFO` is authoritative: when it is unset, the
+    field is omitted regardless of this flag.
     """
     fingerprint_value: str | None = None
     """Literal fingerprint string used when `--fingerprint-mode=custom`."""

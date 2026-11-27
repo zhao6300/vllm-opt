@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from prometheus_client import REGISTRY, Counter, Gauge, Histogram
 
+import vllm.envs as envs
 from tests.v1.kv_connector.unit.test_mooncake_connector import (
     FakeMooncakeWrapper,
     _make_test_kv_cache_config,
@@ -394,8 +395,11 @@ def exported_series():
     yield
 
 
-def test_kv_connector_prom_wires_the_mooncake_metrics():
+def test_kv_connector_prom_wires_the_mooncake_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """The production entry point resolves the connector and builds its metrics."""
+    monkeypatch.setattr(envs, "VLLM_EXPOSE_DEPLOYMENT_INFO", True)
     prom = KVConnectorProm(
         vllm_config=SimpleNamespace(
             kv_transfer_config=KVTransferConfig(
@@ -407,6 +411,24 @@ def test_kv_connector_prom_wires_the_mooncake_metrics():
     )
 
     assert isinstance(prom.prom_metrics, MooncakePromMetrics)
+
+
+def test_kv_connector_prom_hidden_without_exposure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Connector metrics are not registered unless deployment info is exposed."""
+    monkeypatch.setattr(envs, "VLLM_EXPOSE_DEPLOYMENT_INFO", False)
+    prom = KVConnectorProm(
+        vllm_config=SimpleNamespace(
+            kv_transfer_config=KVTransferConfig(
+                kv_connector="MooncakeConnector", kv_role="kv_producer"
+            )
+        ),
+        labelnames=["model_name", "engine"],
+        per_engine_labelvalues={0: [TEST_MODEL, "0"]},
+    )
+
+    assert prom.prom_metrics is None
 
 
 @pytest.mark.usefixtures("exported_series")

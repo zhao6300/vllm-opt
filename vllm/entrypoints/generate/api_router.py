@@ -91,7 +91,11 @@ async def init_generate_state(
     # Applied before any serving class is constructed so that each one picks
     # up the chosen mode on its first cache miss.
     set_default_fingerprint_mode(
-        getattr(args, "fingerprint_mode", "full"),
+        getattr(
+            args,
+            "fingerprint_mode",
+            "full" if envs.VLLM_EXPOSE_DEPLOYMENT_INFO else "none",
+        ),
         getattr(args, "fingerprint_value", None),
     )
 

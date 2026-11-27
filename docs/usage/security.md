@@ -260,14 +260,14 @@ The following endpoints **do not require authentication** even when `--api-key` 
 
 **Utility endpoints:**
 
-- `/metrics` - Prometheus metrics, including model, throughput, queue, and KV-cache statistics
+- `/metrics` - Prometheus metrics, including model, throughput, queue, and KV-cache statistics. Deployment details (`vllm:cache_config_info` and connector-specific metrics such as `vllm:lmcache_mp_lookup_duration_seconds`) are omitted unless `VLLM_EXPOSE_DEPLOYMENT_INFO=1`
 - `/kv_event_sources` - KV-event publisher configuration for each data-parallel rank, which may reveal internal transport endpoints (when KV events are configured)
 - `/tokenize` - Tokenize text (not gated by `--enable-scale-out`)
 - `/detokenize` - Detokenize tokens
 - `/health` - Health check
 - `/health_generate` - Generation readiness check (runs a GPU probe on idle engines)
 - `/ping` - SageMaker health check
-- `/version` - Version information
+- `/version` - Version information. Returns HTTP 403 unless `VLLM_EXPOSE_DEPLOYMENT_INFO=1`
 - `/load` - Server load metrics
 
 **Tokenizer information endpoint (only when `--enable-tokenizer-info-endpoint` is set):**
@@ -280,7 +280,7 @@ This endpoint is **only available when the `--enable-tokenizer-info-endpoint` fl
 
 These endpoints are **only available when the environment variable `VLLM_SERVER_DEV_MODE` is set to `1`**. They are intended for development and debugging purposes and should never be enabled in production:
 
-- `/server_info` - Get detailed server configuration
+- `/server_info` - Get detailed server configuration (also requires `VLLM_EXPOSE_DEPLOYMENT_INFO=1`)
 - `/reset_prefix_cache` - Reset prefix cache (can disrupt service)
 - `/reset_mm_cache` - Reset multimodal cache (can disrupt service)
 - `/reset_encoder_cache` - Reset encoder cache (can disrupt service)
@@ -297,6 +297,17 @@ These endpoints are only available when profiling is enabled and should only be 
 - `/stop_profile` - Stop PyTorch profiler
 
 **Note:** The `/invocations` endpoint is particularly concerning as it provides unauthenticated access to the same inference capabilities as the protected `/v1` endpoints.
+
+### Deployment Information Exposure
+
+Even with `--api-key`, unauthenticated clients can reach `/metrics` and other utility endpoints. To keep a deployment from being fingerprinted, vLLM withholds the following details unless `VLLM_EXPOSE_DEPLOYMENT_INFO=1` is set:
+
+- `/version` returns HTTP 403 instead of the exact version and commit.
+- `system_fingerprint` is omitted from responses regardless of `--fingerprint-mode`.
+- `vllm:cache_config_info` and connector-specific KV metrics (for example `vllm:lmcache_mp_lookup_duration_seconds`) are not registered on `/metrics`.
+- `/server_info` is not registered, even when `VLLM_SERVER_DEV_MODE=1`.
+
+Set `VLLM_EXPOSE_DEPLOYMENT_INFO=1` only on trusted networks, or when a monitoring system needs these details.
 
 ### Security Implications
 

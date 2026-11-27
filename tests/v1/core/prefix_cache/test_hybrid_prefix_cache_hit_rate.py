@@ -102,7 +102,11 @@ def server(request):
             "--speculative-config",
             json.dumps({"method": "mtp", "num_speculative_tokens": 1}),
         ]
-    with RemoteOpenAIServer(MODEL, args) as remote_server:
+    with RemoteOpenAIServer(
+        MODEL,
+        args,
+        env_dict={"VLLM_EXPOSE_DEPLOYMENT_INFO": "1"},
+    ) as remote_server:
         yield remote_server
 
 

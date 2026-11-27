@@ -294,7 +294,7 @@ def _serve(deployment: Deployment, mode: Mode) -> Generator[list[RemoteOpenAISer
         stack.callback(RemoteOpenAIServer.shutdown_many, servers)
         next_gpu = 0
         for instance in deployment.instances:
-            env = {}
+            env = {"VLLM_EXPOSE_DEPLOYMENT_INFO": "1"}
             if deployment.offload:
                 # Enables /reset_prefix_cache.
                 env["VLLM_SERVER_DEV_MODE"] = "1"

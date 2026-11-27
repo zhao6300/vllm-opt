@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import vllm.envs as envs
 from vllm.config.utils import hash_factors
 from vllm.entrypoints.serve.utils import fingerprint as fp
 
@@ -27,7 +28,8 @@ def _cfg(tp=1, pp=1, dp=1, ep=False):
 
 
 @pytest.fixture(autouse=True)
-def _reset():
+def _reset(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(envs, "VLLM_EXPOSE_DEPLOYMENT_INFO", True)
     fp.set_default_fingerprint_mode("full")
     yield
     fp.set_default_fingerprint_mode("full")
@@ -81,3 +83,14 @@ def test_hash_failure_does_not_raise():
     assert full_fp is not None and full_fp.endswith("-nohash")
     hash_fp = fp.build_system_fingerprint(cfg, "hash")
     assert hash_fp is not None and hash_fp.endswith("-nohash")
+
+
+def test_exposure_switch_overrides_mode(monkeypatch: pytest.MonkeyPatch):
+    """Deployment info stays hidden even when a mode is requested."""
+    monkeypatch.setattr(envs, "VLLM_EXPOSE_DEPLOYMENT_INFO", False)
+    cfg = _cfg(tp=8, ep=True)
+
+    assert fp.build_system_fingerprint(cfg, "full") is None
+    assert fp.build_system_fingerprint(cfg, "hash") is None
+    assert fp.build_system_fingerprint(cfg, "custom", "deploy-42") is None
+    assert fp.get_system_fingerprint(cfg) is None

@@ -4,6 +4,7 @@
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.logger import init_logger
@@ -52,6 +53,11 @@ async def get_server_load_metrics(request: Request):
 
 @router.get("/version")
 async def show_version():
+    if not envs.VLLM_EXPOSE_DEPLOYMENT_INFO:
+        return JSONResponse(
+            content={"error": "Deployment information is not exposed"},
+            status_code=403,
+        )
     ver = {"version": VLLM_VERSION}
     return JSONResponse(content=ver)
 

@@ -70,7 +70,11 @@ def server(server_args):
         *server_args,
     ]
 
-    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
+    with RemoteOpenAIServer(
+        MODEL_NAME,
+        args,
+        env_dict={"VLLM_EXPOSE_DEPLOYMENT_INFO": "1"},
+    ) as remote_server:
         yield remote_server
 
 
@@ -78,6 +82,26 @@ def server(server_args):
 async def client(server):
     async with server.get_async_client() as async_client:
         yield async_client
+
+
+@pytest.fixture(scope="module")
+def hidden_server():
+    args = [
+        "--dtype",
+        "bfloat16",
+        "--max-model-len",
+        "8192",
+        "--enforce-eager",
+        "--max-num-seqs",
+        "128",
+    ]
+
+    with RemoteOpenAIServer(
+        MODEL_NAME,
+        args,
+        env_dict={"VLLM_EXPOSE_DEPLOYMENT_INFO": "0"},
+    ) as remote_server:
+        yield remote_server
 
 
 @pytest.mark.asyncio
@@ -89,6 +113,28 @@ async def test_show_version(server: RemoteOpenAIServer):
     assert payload["version"] == VLLM_VERSION
     if envs.VLLM_USE_RUST_FRONTEND:
         assert payload["rust_frontend_version"] == VLLM_VERSION
+
+
+@pytest.mark.asyncio
+async def test_deployment_info_hidden_without_exposure(
+    hidden_server: RemoteOpenAIServer,
+):
+    response = requests.get(hidden_server.url_for("version"))
+    assert response.status_code == HTTPStatus.FORBIDDEN
+    assert VLLM_VERSION not in response.text
+
+    metrics = requests.get(hidden_server.url_for("metrics")).text
+    assert "vllm:cache_config_info" not in metrics
+
+    async with hidden_server.get_async_client() as client:
+        completion = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=1,
+            temperature=0.0,
+        )
+
+    assert completion.system_fingerprint is None
 
 
 @pytest.mark.asyncio

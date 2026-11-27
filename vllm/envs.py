@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_USE_RUST_BENCH: bool = False
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
+    VLLM_EXPOSE_DEPLOYMENT_INFO: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1906,6 +1907,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`, and default `--enable-scale-out` to on
     "VLLM_SERVER_DEV_MODE": lambda: bool(int(os.getenv("VLLM_SERVER_DEV_MODE", "0"))),
+    # If set, expose deployment details through the API: the exact version and
+    # commit, parallelism in `system_fingerprint`, `vllm:cache_config_info`,
+    # KV connector metrics, and `/server_info`. Disabled by default so that
+    # clients cannot fingerprint the deployment.
+    "VLLM_EXPOSE_DEPLOYMENT_INFO": lambda: bool(
+        int(os.getenv("VLLM_EXPOSE_DEPLOYMENT_INFO", "0"))
+    ),
     # Controls the maximum number of requests to handle in a
     # single asyncio task when processing per-token outputs in the
     # V1 AsyncLLM interface. It is applicable when handling a high
@@ -2920,6 +2928,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CONFIG_ROOT",
         "LD_LIBRARY_PATH",
         "VLLM_SERVER_DEV_MODE",
+        "VLLM_EXPOSE_DEPLOYMENT_INFO",
         "VLLM_DP_MASTER_IP",
         "VLLM_DP_MASTER_PORT",
         "VLLM_NIXL_SIDE_CHANNEL_HOST",

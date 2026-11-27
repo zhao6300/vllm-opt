@@ -536,6 +536,7 @@ def _server(
         # vLLM scans upward from VLLM_PORT for the server internal sockets.
         "VLLM_PORT": str(_open_port_block(32)),
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "VLLM_EXPOSE_DEPLOYMENT_INFO": "1",
         "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
         "VLLM_CACHE_ROOT": str(_CACHE_ROOT / role),
         # Only this directory, so the source tree cannot shadow installed vllm.

@@ -5,6 +5,7 @@ from typing import Any, TypeAlias, TypeVar
 
 from prometheus_client import Counter, Gauge, Histogram
 
+import vllm.envs as envs
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.logger import init_logger
@@ -156,6 +157,8 @@ class KVConnectorProm:
         per_engine_labelvalues: dict[int, list[object]],
     ):
         self.prom_metrics: KVConnectorPromMetrics | None = None
+        if not envs.VLLM_EXPOSE_DEPLOYMENT_INFO:
+            return
         kv_transfer_config = vllm_config.kv_transfer_config
         if kv_transfer_config and kv_transfer_config.kv_connector:
             connector_cls = KVConnectorFactory.get_connector_class(kv_transfer_config)

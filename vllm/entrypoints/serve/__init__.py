@@ -3,6 +3,7 @@
 
 from fastapi import FastAPI
 
+from vllm import envs
 from vllm.logger import init_logger
 
 from .exception_handling.error_response import create_error_response
@@ -54,11 +55,12 @@ def register_vllm_dev_api_routers(app: FastAPI):
 
     attach_rpc_router(app)
 
-    from .dev.server_info.api_router import (
-        attach_router as attach_server_info_router,
-    )
+    if envs.VLLM_EXPOSE_DEPLOYMENT_INFO:
+        from .dev.server_info.api_router import (
+            attach_router as attach_server_info_router,
+        )
 
-    attach_server_info_router(app)
+        attach_server_info_router(app)
 
     from .dev.sleep.api_router import attach_router as attach_sleep_router
 

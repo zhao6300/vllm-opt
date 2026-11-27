@@ -1366,7 +1366,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
     def log_engine_initialized(self):
-        self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        if envs.VLLM_EXPOSE_DEPLOYMENT_INFO:
+            self.log_metrics_info("cache_config", self.vllm_config.cache_config)
 
 
 class StatLoggerManager:
