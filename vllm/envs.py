@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_PREFILL_TARGET_UPDATE_MS: float = 200.0
     VLLM_PREFILL_TARGET_DECODE_MS: float = 0.0
     VLLM_PREFILL_TPOT_TARGET_MS: float = 0.0
+    VLLM_PREFILL_FILL_MIN_TOKENS: int = 0
     VLLM_DP_EAGER_PAD_TOKENS: int = 0
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_PP_NUM_MICROBATCHES: int = 0
@@ -1447,6 +1448,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # VLLM_PREFILL_TARGET_DECODE_MS for chunk sizing. With speculative decoding
     # the per-token TPOT is this interval over the tokens a step accepts.
     # 0 (default) keeps the token target.
+    # With VLLM_PREFILL_FILL_TARGET: the fewest prefill tokens a step's chunk
+    # may be cut to. The token target never drops below it (it then moves
+    # between this and its ceiling, the largest captured prefill graph or
+    # --max-num-batched-tokens), and neither the decodes of a step, the
+    # attention cost of a long context, nor the TPOT target cuts a chunk below
+    # it. 0 (default) keeps the floors of VLLM_PREFILL_MIN_CHUNK_TOKENS (chunks)
+    # and twice that, at least 512 (the token target).
+    "VLLM_PREFILL_FILL_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_PREFILL_FILL_MIN_TOKENS", "0")
+    ),
     "VLLM_PREFILL_TPOT_TARGET_MS": lambda: float(
         os.getenv("VLLM_PREFILL_TPOT_TARGET_MS", "0")
     ),

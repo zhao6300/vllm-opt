@@ -106,6 +106,8 @@ logger = init_logger(__name__)
 class Scheduler(SchedulerInterface):
     # The shared prefill token target; None unless VLLM_PREFILL_FILL_TARGET.
     prefill_target: PrefillTarget | None = None
+    # Floor of a FILL_TARGET prefill chunk (VLLM_PREFILL_FILL_MIN_TOKENS).
+    prefill_fill_min_tokens: int = 0
     # The online fit of the prefill cost model; None unless VLLM_PREFILL_COST_FIT.
     cost_fit: StepCostFitter | None = None
     # When `get_pending_prefill_ms` last priced the backlog, and what it found.
@@ -454,6 +456,16 @@ class Scheduler(SchedulerInterface):
                 "VLLM_PREFILL_TPOT_TARGET_MS must be >= 0: "
                 f"{self.prefill_tpot_target_ms}"
             )
+        # Fewest prefill tokens a FILL_TARGET chunk is cut to (0: the cost
+        # model's own floor), so the chunks stay between it and the ceiling.
+        fill_min = (
+            envs.VLLM_PREFILL_FILL_MIN_TOKENS if envs.VLLM_PREFILL_FILL_TARGET else 0
+        )
+        if fill_min < 0:
+            raise ValueError(f"VLLM_PREFILL_FILL_MIN_TOKENS must be >= 0: {fill_min}")
+        self.prefill_fill_min_tokens = min(
+            fill_min, self.scheduler_config.max_num_batched_tokens
+        )
         # Optional time budget per step (VLLM_PREFILL_STEP_BUDGET_MS): caps the
         # prefill tokens a step carries by a cost model instead of by tokens.
         self.prefill_cost_model = PrefillCostModel.from_env(
@@ -495,9 +507,15 @@ class Scheduler(SchedulerInterface):
             self.prefill_target.start(envs.VLLM_PREFILL_TARGET_UPDATE_MS / 1000)
             logger.info(
                 "Prefill chunks fill each step to a shared token target "
-                "(now %d, at most %d) that follows a %s ms step period%s",
+                "(now %d, between %d and %d; chunks of at least %d) that "
+                "follows a %s ms step period%s",
                 self.prefill_target.tokens,
+                self.prefill_target.floor,
                 self.prefill_target.ceiling,
+                max(
+                    self.prefill_cost_model.min_chunk_tokens,
+                    self.prefill_fill_min_tokens,
+                ),
                 self.prefill_cost_model.budget_ms,
                 (
                     f", {envs.VLLM_PREFILL_TARGET_DECODE_MS:g} ms while steps "
@@ -895,27 +913,27 @@ class Scheduler(SchedulerInterface):
     ) -> int:
         """The prefill chunk a step with `decode_tokens` of decodes takes when it
         attends over `context`; the rule that sizes chunks and prices backlogs."""
+        floor = max(model.min_chunk_tokens, self.prefill_fill_min_tokens)
         if self.prefill_tpot_target_ms:
             if not self._has_decoding_requests():
                 return self.scheduler_config.max_num_batched_tokens
-            return model.max_prefill_tokens(
+            chunk = model.max_prefill_tokens(
                 decode_tokens, context, align=self.block_size
             )
+            return max(chunk, floor)
         if self.prefill_target is None:
             return model.max_prefill_tokens(
                 decode_tokens, context, align=self.block_size
             )
         target = self.prefill_target
-        chunk = target.max_prefill_tokens(
-            decode_tokens, model.min_chunk_tokens, align=self.block_size
-        )
+        chunk = target.max_prefill_tokens(decode_tokens, floor, align=self.block_size)
         # The target shares the token-priced part of the step between the ranks;
         # the attention over this rank's context is its own.
         room_ms = model.budget_ms - model.fixed_ms - model.ms_per_token * target.tokens
         attention_cap = model.max_attention_tokens(
             room_ms, context, align=self.block_size
         )
-        return max(min(chunk, attention_cap), model.min_chunk_tokens)
+        return max(min(chunk, attention_cap), floor)
 
     def _eligible_decode_tokens(self) -> int:
         """Tokens the decoding requests that may run now add to a step."""

@@ -10445,6 +10445,69 @@ def test_tpot_target_is_shared_by_the_pp_decode_microbatches(monkeypatch):
     assert scheduler.prefill_cost_model.budget_ms == pytest.approx(1120 / stagger)
 
 
+def test_fill_min_tokens_floors_the_token_target_and_its_chunks(monkeypatch):
+    """The attention cost of a growing context shrinks the chunks (to 352 by
+    the fourth without a floor); VLLM_PREFILL_FILL_MIN_TOKENS keeps every chunk
+    but the prompt's last at it, and the token target never drops below it."""
+    _set_fill_target(monkeypatch, 512)
+    monkeypatch.setenv("VLLM_PREFILL_COST_MS_PER_TOKEN_CONTEXT", "0.001")
+    monkeypatch.setenv("VLLM_PREFILL_FILL_MIN_TOKENS", "448")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192, block_size=16, max_model_len=4096
+    )
+    try:
+        target = scheduler.prefill_target
+        assert target is not None and target.min_tokens == 448
+        (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+        scheduler.add_request(request)
+        chunks = _prefill_chunks(scheduler, request)
+        assert chunks[:4] == [512, 512, 464, 448]
+        assert min(chunks[:-1]) == 448
+        assert sum(chunks) == 3000
+
+        # Slow steps pull the target down, but not below the floor.
+        for _ in range(8):
+            target.ingest(10.0, target.tokens, target.tokens)
+        assert target.update() >= 448
+    finally:
+        scheduler.shutdown()
+
+
+def test_fill_min_tokens_floors_a_tpot_target_chunk(monkeypatch):
+    """Four decodes leave 96 tokens of the TPOT target's step; the floor
+    raises the chunk to it."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_MIN_TOKENS", "200")
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    decoding = create_requests(
+        num_requests=4,
+        num_tokens=8,
+        max_tokens=100,
+        req_ids=[f"d{i}" for i in range(4)],
+    )
+    for request in decoding:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _decode_one(scheduler, output, [f"d{i}" for i in range(4)])
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens["p0"] == 200
+
+
+def test_fill_min_tokens_needs_the_fill_target(monkeypatch):
+    """Without VLLM_PREFILL_FILL_TARGET the step-budget chunks keep their own
+    floor: 1120 ms at 10 ms per token is 112 tokens."""
+    _set_prefill_budget(monkeypatch, 1120, 10)
+    monkeypatch.delenv("VLLM_PREFILL_FILL_TARGET", raising=False)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_MIN_TOKENS", "1024")
+    scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    assert scheduler.schedule().num_scheduled_tokens["p0"] == 112
+
+
 def test_tpot_target_keeps_to_the_tighter_of_the_group_and_local_caps(
     monkeypatch,
 ):

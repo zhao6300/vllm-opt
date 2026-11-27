@@ -161,10 +161,14 @@ class PrefillTarget:
 
         Returns:
             A target starting at `VLLM_PREFILL_TARGET_INIT_TOKENS`, or a quarter
-            of `max_tokens` when that is 0.
+            of `max_tokens` when that is 0, and kept at least
+            `VLLM_PREFILL_FILL_MIN_TOKENS` when that is set.
 
         """
-        min_tokens = min(max(2 * envs.VLLM_PREFILL_MIN_CHUNK_TOKENS, 512), max_tokens)
+        min_tokens = envs.VLLM_PREFILL_FILL_MIN_TOKENS or max(
+            2 * envs.VLLM_PREFILL_MIN_CHUNK_TOKENS, 512
+        )
+        min_tokens = min(min_tokens, max_tokens)
         initial = envs.VLLM_PREFILL_TARGET_INIT_TOKENS or max_tokens // 4
         return cls(
             target_step_ms,
@@ -180,6 +184,11 @@ class PrefillTarget:
     def tokens(self) -> int:
         """The current target; a single read, safe from any thread."""
         return self._target
+
+    @property
+    def floor(self) -> int:
+        """Smallest target the grid allows."""
+        return self.grid[0] if self.grid else self.min_tokens
 
     @property
     def ceiling(self) -> int:
