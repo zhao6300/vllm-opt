@@ -147,7 +147,11 @@ class PrefillCostModel:
         return max(chunk, self.min_chunk_tokens)
 
     def max_prefill_tokens(
-        self, decode_tokens: int, context: int, align: int = 1
+        self,
+        decode_tokens: int,
+        context: int,
+        align: int = 1,
+        budget_ms: float | None = None,
     ) -> int:
         """Largest prefill chunk whose step fits the budget.
 
@@ -155,12 +159,15 @@ class PrefillCostModel:
             decode_tokens: Decode tokens the step already carries.
             context: Context the prefill chunk attends over.
             align: Round a chunk longer than this down to a multiple of it.
+            budget_ms: Step time to fit instead of `budget_ms`.
 
         Returns:
             The chunk length, at least `min_chunk_tokens`.
 
         """
-        room_ms = self.budget_ms - self.fixed_ms - self.ms_per_token * decode_tokens
+        if budget_ms is None:
+            budget_ms = self.budget_ms
+        room_ms = budget_ms - self.fixed_ms - self.ms_per_token * decode_tokens
         if room_ms <= 0:
             return self.min_chunk_tokens
         # Solve ms_per_token_context / 2 * q^2 + (ms_per_token +

@@ -1462,8 +1462,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # between this and its ceiling, the largest captured prefill graph or
     # --max-num-batched-tokens), and neither the decodes of a step, the
     # attention cost of a long context, nor the TPOT target cuts a chunk below
-    # it. 0 (default) keeps the floors of VLLM_PREFILL_MIN_CHUNK_TOKENS (chunks)
-    # and twice that, at least 512 (the token target).
+    # it, except that under a TPOT target the floor never makes a step's
+    # modelled time longer than the whole target. 0 (default) keeps the floors
+    # of VLLM_PREFILL_MIN_CHUNK_TOKENS (chunks) and twice that, at least 512
+    # (the token target).
     "VLLM_PREFILL_FILL_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_PREFILL_FILL_MIN_TOKENS", "0")
     ),

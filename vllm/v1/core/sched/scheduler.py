@@ -920,7 +920,18 @@ class Scheduler(SchedulerInterface):
             chunk = model.max_prefill_tokens(
                 decode_tokens, context, align=self.block_size
             )
-            return max(chunk, floor)
+            if chunk >= floor:
+                return chunk
+            # The floor may stretch a step past its share of the TPOT target,
+            # but not past the whole target: a floor step over a long context
+            # would hold every decode for seconds.
+            ceiling = model.max_prefill_tokens(
+                decode_tokens,
+                context,
+                align=self.block_size,
+                budget_ms=self.prefill_tpot_target_ms,
+            )
+            return max(chunk, min(floor, ceiling))
         if self.prefill_target is None:
             return model.max_prefill_tokens(
                 decode_tokens, context, align=self.block_size

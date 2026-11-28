@@ -10473,9 +10473,9 @@ def test_fill_min_tokens_floors_the_token_target_and_its_chunks(monkeypatch):
         scheduler.shutdown()
 
 
-def test_fill_min_tokens_floors_a_tpot_target_chunk(monkeypatch):
-    """Four decodes leave 96 tokens of the TPOT target's step; the floor
-    raises the chunk to it."""
+def test_fill_min_tokens_does_not_stretch_a_step_past_the_tpot_target(monkeypatch):
+    """Four decodes leave 96 tokens of the 1120 ms TPOT target; a 200-token
+    floor would make the step 2040 ms, so the chunk stays at 96."""
     _set_tpot_target(monkeypatch, 1120, 10)
     monkeypatch.setenv("VLLM_PREFILL_FILL_MIN_TOKENS", "200")
     scheduler = create_scheduler(max_num_batched_tokens=8192, block_size=16)
@@ -10492,7 +10492,41 @@ def test_fill_min_tokens_floors_a_tpot_target_chunk(monkeypatch):
     (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
     scheduler.add_request(request)
 
-    assert scheduler.schedule().num_scheduled_tokens["p0"] == 200
+    assert scheduler.schedule().num_scheduled_tokens["p0"] == 96
+
+
+def test_fill_min_tokens_floors_a_pp_tpot_chunk_up_to_the_whole_target(
+    monkeypatch,
+):
+    """With two decode microbatches a step's share of the 1120 ms target is
+    560 ms, 48 aligned tokens. The 200-token floor raises the chunk, but only
+    as far as the whole target allows: 112 tokens, or 96 in the step that also
+    carries the four decodes."""
+    _set_tpot_target(monkeypatch, 1120, 10)
+    monkeypatch.setenv("VLLM_PREFILL_FILL_MIN_TOKENS", "200")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=8192,
+        block_size=16,
+        async_scheduling=True,
+        pipeline_parallel_size=2,
+    )
+    assert scheduler.decode_stagger == 2
+    decoding = create_requests(
+        num_requests=4,
+        num_tokens=8,
+        max_tokens=100,
+        req_ids=[f"d{i}" for i in range(4)],
+    )
+    for request in decoding:
+        scheduler.add_request(request)
+    output = scheduler.schedule()
+    _decode_one(scheduler, output, [f"d{i}" for i in range(4)])
+    (request,) = create_requests(num_requests=1, num_tokens=3000, req_ids=["p0"])
+    scheduler.add_request(request)
+
+    steps = [dict(scheduler.schedule().num_scheduled_tokens) for _ in range(3)]
+    assert [step["p0"] for step in steps] == [112, 96, 112]
+    assert all(steps[1][f"d{i}"] == 1 for i in range(4))
 
 
 def test_fill_min_tokens_needs_the_fill_target(monkeypatch):
