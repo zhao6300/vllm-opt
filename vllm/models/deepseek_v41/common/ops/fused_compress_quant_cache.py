@@ -525,6 +525,11 @@ def rope_quant_insert(
     assert num_tokens <= min(latent.shape[0], positions.numel())
     if num_tokens == 0:
         return
+    # PIECEWISE and padded eager steps pad `latent` and `positions` to the
+    # graph bucket, but a compressed layer's slot mapping covers only the
+    # step's real tokens. The FlashInfer writers need one latent row per slot.
+    latent = latent[:num_tokens]
+    positions = positions[:num_tokens]
     launch_kwargs = {"launch_pdl": False} if current_platform.is_cuda() else {}
     if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == 288:
         roped_latent = torch.empty_like(latent)
