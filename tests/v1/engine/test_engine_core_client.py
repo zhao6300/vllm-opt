@@ -225,6 +225,7 @@ def _make_dplb_client(
     client.engine_inflight = Counter()
     client.token_aware_lb = token_aware
     client.lb_prefill_tokens_per_request = prefill_tokens_per_request
+    client.lb_max_pending_requests = 4.0
     client.lb_step_budget_ms = 0.0
     client.req_pending_prefill = {}
     client.lb_snapshot_seq = 0
@@ -485,6 +486,27 @@ def test_dplb_token_aware_caps_the_pending_prefill_weight():
         client.get_core_engine_for_request(make_request(SamplingParams()))
         == client.core_engines[0]
     )
+
+
+def test_dplb_token_aware_max_pending_requests_is_configurable():
+    """The pending cap is a knob: raising it lets a long backlog weigh more,
+    and 0 removes it. With 1000 tokens per request, engine 0 runs one request
+    with a 100-request backlog and engine 1 runs ten requests."""
+
+    def choose(cap: float):
+        client = _make_dplb_client(
+            num_engines=2, token_aware=True, prefill_tokens_per_request=1000
+        )
+        client.lb_max_pending_requests = cap
+        client.lb_engines = [[0, 1, 0.0, 100_000], [0, 10, 0.0, 0]]
+        return client.get_core_engine_for_request(make_request(SamplingParams()))
+
+    # Capped at four: 1 + 4 < 10, engine 0 wins.
+    assert choose(4.0) == bytes([0, 0])
+    # Capped at sixteen: 1 + 16 > 10, engine 1 wins.
+    assert choose(16.0) == bytes([1, 0])
+    # Uncapped: 1 + 100 > 10, engine 1 wins.
+    assert choose(0.0) == bytes([1, 0])
 
 
 def test_dplb_token_aware_uses_the_engine_reported_remainder():

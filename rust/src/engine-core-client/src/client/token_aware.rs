@@ -17,10 +17,11 @@ use tracing::warn;
 /// of that budget (`VLLM_PREFILL_STEP_BUDGET_MS`): a request that still has to
 /// attend over a long context costs what it costs, not what it counts.
 /// Without a budget, `VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST` tokens weigh as
-/// one request. The weight is capped at this many requests: an engine already
-/// prefilling several prompts' worth of tokens is simply busy, and scaling the
-/// score with its whole backlog keeps it unroutable for the length of that
-/// prefill, so every other engine piles up instead.
+/// one request. The weight is capped at this many requests by default: an
+/// engine already prefilling several prompts' worth of tokens is simply busy,
+/// and scaling the score with its whole backlog keeps it unroutable for the
+/// length of that prefill, so every other engine piles up instead.
+/// `VLLM_DP_LB_MAX_PENDING_REQUESTS` overrides the cap; 0 removes it.
 const MAX_PENDING_REQUESTS: f64 = 4.0;
 
 /// A request this client dispatched floors its engine's pending prefill until
@@ -49,6 +50,8 @@ pub(crate) struct TokenAwareRouting {
     /// Modelled cost of one prefill token, used to price a dispatch before its
     /// engine reports its own.
     default_ms_per_token: f64,
+    /// Most requests one engine's pending prefill may weigh; 0 removes the cap.
+    max_pending_requests: f64,
 }
 
 impl TokenAwareRouting {
@@ -88,6 +91,11 @@ impl TokenAwareRouting {
                 .max(1.0),
             step_budget_ms: budget_ms.max(0.0),
             default_ms_per_token: number("VLLM_PREFILL_COST_MS_PER_TOKEN", 0.0),
+            max_pending_requests: number(
+                "VLLM_DP_LB_MAX_PENDING_REQUESTS",
+                MAX_PENDING_REQUESTS,
+            )
+            .max(0.0),
         })
     }
 
@@ -99,7 +107,11 @@ impl TokenAwareRouting {
         } else {
             tokens as f64 / self.prefill_tokens_per_request
         };
-        load.min(MAX_PENDING_REQUESTS)
+        if self.max_pending_requests > 0.0 {
+            load.min(self.max_pending_requests)
+        } else {
+            load
+        }
     }
 
     /// Modelled time of a dispatch of `tokens` prompt tokens to an engine
@@ -165,6 +177,27 @@ mod tests {
                 // An engine that prices nothing falls back to tokens.
                 timed.pending_load(1024, 0.0),
                 timed.pending_load(0, 10_000.0),
+            ]
+        ));
+    }
+
+    #[test]
+    fn max_pending_requests_is_configurable_and_zero_removes_the_cap() {
+        let capped = routing(&[
+            ("VLLM_DP_LB_TOKEN_AWARE", "1"),
+            ("VLLM_DP_LB_MAX_PENDING_REQUESTS", "16"),
+        ])
+        .unwrap();
+        let uncapped = routing(&[
+            ("VLLM_DP_LB_TOKEN_AWARE", "1"),
+            ("VLLM_DP_LB_MAX_PENDING_REQUESTS", "0"),
+        ])
+        .unwrap();
+        expect_test::expect!["[16.0, 48.828125]"].assert_eq(&format!(
+            "{:?}",
+            [
+                capped.pending_load(100_000, 0.0),
+                uncapped.pending_load(100_000, 0.0),
             ]
         ));
     }

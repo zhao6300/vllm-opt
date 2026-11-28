@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     VLLM_DP_LB_TOKEN_AWARE: bool = False
     VLLM_DP_LB_SHARED_LOAD: bool = False
     VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST: int = 2048
+    VLLM_DP_LB_MAX_PENDING_REQUESTS: float = 4.0
     VLLM_PREFILL_STEP_BUDGET_MS: float = 0.0
     VLLM_PREFILL_COST_FIXED_MS: float = 0.0
     VLLM_PREFILL_COST_MS_PER_TOKEN: float = 0.0
@@ -1367,11 +1368,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DP_LB_SHARED_LOAD", "0"))
     ),
     # With VLLM_DP_LB_TOKEN_AWARE: how many pending prefill tokens weigh as much
-    # as one waiting/running request in an engine's score. One engine's pending
-    # prefill counts for at most four requests, so a single long prompt cannot
-    # make it unroutable for the length of that prefill.
+    # as one waiting/running request in an engine's score.
     "VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST": lambda: int(
         os.getenv("VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST", "2048")
+    ),
+    # With VLLM_DP_LB_TOKEN_AWARE: the most requests one engine's pending
+    # prefill may weigh, so a single long prompt cannot make that engine
+    # unroutable for the length of its prefill. The default bounds it at four
+    # requests. Raise it when long prompts are rare and the other ranks have
+    # spare capacity: with 2048 tokens per request, four requests saturate at
+    # 8K tokens, so every longer prompt scores alike and the router cannot tell
+    # a 16K prompt from a 128K one. 0 removes the cap.
+    "VLLM_DP_LB_MAX_PENDING_REQUESTS": lambda: float(
+        os.getenv("VLLM_DP_LB_MAX_PENDING_REQUESTS", "4")
     ),
     # Time budget in milliseconds of one scheduler step. When positive, the
     # scheduler caps the prefill tokens a step carries so the modelled step time

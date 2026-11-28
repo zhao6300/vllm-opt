@@ -97,6 +97,7 @@ EngineIdentity = bytes
 # every other engine piles up instead (measured in simulation: uncapped, a
 # staggered 32 x 16K run skews 10/8/7/7 and takes 25% longer than routing
 # without the term; capped, it stays 8/8/8/8 at the uncapped-off time).
+# `VLLM_DP_LB_MAX_PENDING_REQUESTS` overrides the cap; 0 removes it.
 _DP_LB_MAX_PENDING_REQUESTS = 4.0
 # A request this client dispatched floors its engine's pending prefill until this
 # many load snapshots have arrived after it. The first snapshot after a dispatch
@@ -1830,6 +1831,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
     """Asyncio-compatible client for multi-proc, multi-engine (data parallel)
     EngineCore. Load-balances between multiple engine processes."""
 
+    # Default cap for token-aware routing; __init__ overrides it from
+    # VLLM_DP_LB_MAX_PENDING_REQUESTS. A non-positive value removes the cap.
+    lb_max_pending_requests: float = _DP_LB_MAX_PENDING_REQUESTS
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1856,6 +1861,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.lb_prefill_tokens_per_request = max(
             envs.VLLM_DP_LB_PREFILL_TOKENS_PER_REQUEST, 1
         )
+        self.lb_max_pending_requests = envs.VLLM_DP_LB_MAX_PENDING_REQUESTS
         # The engine prices its backlog in ms when a prefill step time budget
         # is configured; the budget turns that into a number of steps.
         # A TPOT target takes the budget's place in the engines' chunk sizing.
@@ -1967,7 +1973,7 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                     # already taken out; this client's own recent dispatches
                     # floor it until the next snapshot. Scale this client's
                     # share by the clients, like the in-flight count, and count
-                    # at most `_DP_LB_MAX_PENDING_REQUESTS` of them.
+                    # at most `lb_max_pending_requests` of them.
                     engine = self.core_engines[idx]
                     pending_prefill_tokens = max(
                         pending_prefill_tokens,
@@ -1983,7 +1989,10 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
                         pending_load = (
                             pending_prefill_tokens / self.lb_prefill_tokens_per_request
                         )
-                    score += min(scale * pending_load, _DP_LB_MAX_PENDING_REQUESTS)
+                    pending_load *= scale
+                    if self.lb_max_pending_requests > 0:
+                        pending_load = min(pending_load, self.lb_max_pending_requests)
+                    score += pending_load
                 if waiting:
                     # Waiting requests are penalized in proportion to KV cache
                     # pressure: a queue on a KV-bound engine drains slowly, so
