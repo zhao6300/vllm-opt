@@ -814,6 +814,7 @@ def test_rust_frontend_receives_resolved_logging_config(
             [],
             {
                 "VLLM_SERVER_DEV_MODE": "1",
+                "VLLM_EXPOSE_DEPLOYMENT_INFO": "1",
                 "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                 "VLLM_HTTP_MAX_REQUEST_BODY_SIZE": "0",
                 "VLLM_LOG_STATS_INTERVAL": "inf",
@@ -823,6 +824,7 @@ def test_rust_frontend_receives_resolved_logging_config(
             },
             {
                 "server_dev_mode": True,
+                "expose_deployment_info": True,
                 "allow_runtime_lora_updating": True,
                 "http_max_request_body_size": 0,
                 "log_stats_interval": sys.float_info.max,
@@ -836,6 +838,7 @@ def test_rust_frontend_receives_resolved_logging_config(
             [],
             {
                 "VLLM_SERVER_DEV_MODE": "0",
+                "VLLM_EXPOSE_DEPLOYMENT_INFO": "0",
                 "VLLM_ENABLE_COHERE_API": "0",
                 "VLLM_ENABLE_RESPONSES_API_STORE": "0",
                 "VLLM_MAX_TOKENIZE_TOKENS": " ",

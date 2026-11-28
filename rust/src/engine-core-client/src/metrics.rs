@@ -55,6 +55,8 @@ impl IterationMetricHandles {
 /// frontend client.
 pub(crate) struct SchedulerStatsRecorder {
     engines: BTreeMap<u32, SchedulerStatsHandles>,
+    /// Export the KV connector metrics (`VLLM_EXPOSE_DEPLOYMENT_INFO`).
+    expose_deployment_info: bool,
 }
 
 impl SchedulerStatsRecorder {
@@ -63,8 +65,13 @@ impl SchedulerStatsRecorder {
         metrics: &SchedulerMetrics,
         model_name: &str,
         engines: &[ConnectedEngine],
+        expose_deployment_info: bool,
     ) -> Self {
-        Self::record_cache_config_info(metrics, engines);
+        // Like Python, which then neither creates the cache config gauge nor
+        // the KV connector metrics.
+        if expose_deployment_info {
+            Self::record_cache_config_info(metrics, engines);
+        }
         let engines = engines
             .iter()
             .filter_map(|engine| {
@@ -73,7 +80,10 @@ impl SchedulerStatsRecorder {
             })
             .collect();
 
-        let recorder = Self { engines };
+        let recorder = Self {
+            engines,
+            expose_deployment_info,
+        };
         // Engines start awake, as Python sets when it creates the stat logger.
         recorder.record_sleep_state(EngineSleepState::Awake);
         recorder
@@ -145,7 +155,9 @@ impl SchedulerStatsRecorder {
 
         handles.kv_cache_residency.record(&stats.kv_cache_eviction_events);
 
-        if let Some(kv_connector_stats) = &stats.kv_connector_stats {
+        if self.expose_deployment_info
+            && let Some(kv_connector_stats) = &stats.kv_connector_stats
+        {
             handles.kv_connector.record(kv_connector_stats);
         }
     }

@@ -94,6 +94,8 @@ async fn not_supported(method: Method, path: MatchedPath) -> (StatusCode, Json<E
 struct RouteGates {
     /// `VLLM_SERVER_DEV_MODE`: development-only routes.
     dev_mode: bool,
+    /// `VLLM_EXPOSE_DEPLOYMENT_INFO`: the development route `/server_info`.
+    deployment_info: bool,
     /// `VLLM_ALLOW_RUNTIME_LORA_UPDATING`: LoRA load and unload routes.
     runtime_lora_updating: bool,
     /// `--enable-scale-out`: scale-out routes, which answer 403 when disabled.
@@ -104,6 +106,7 @@ impl RouteGates {
     fn resolve(state: &AppState) -> Self {
         Self {
             dev_mode: state.api_server_options.server_dev_mode,
+            deployment_info: state.api_server_options.expose_deployment_info,
             runtime_lora_updating: state.api_server_options.allow_runtime_lora_updating,
             scale_out: state.api_server_options.enable_scale_out,
         }
@@ -265,8 +268,10 @@ fn build_router_with_gates(state: Arc<AppState>, mut gates: RouteGates) -> Route
             .route("/pause", post(pause::pause))
             .route("/resume", post(pause::resume))
             .route("/is_paused", get(pause::is_paused))
-            .route("/server_info", get(server_info::server_info))
-            .route("/get_world_size", get(world_size::get_world_size))
+            .route("/get_world_size", get(world_size::get_world_size));
+        if gates.deployment_info {
+            router = router.route("/server_info", get(server_info::server_info));
+        }
     }
 
     if has_engine_core {

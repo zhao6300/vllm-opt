@@ -771,6 +771,21 @@ pub struct SharedRuntimeArgs {
     #[serde(default)]
     pub server_dev_mode: bool,
 
+    /// Expose deployment details: the versions on `/version`,
+    /// `system_fingerprint`, `/server_info`, `vllm:cache_config_info` and the
+    /// KV connector metrics. Like Python, it is set only through
+    /// `VLLM_EXPOSE_DEPLOYMENT_INFO`, which must be an integer.
+    #[arg(
+        long,
+        hide = true,
+        env = "VLLM_EXPOSE_DEPLOYMENT_INFO",
+        action = ArgAction::Set,
+        value_parser = parse_int_flag,
+        default_value = "0"
+    )]
+    #[serde(default)]
+    pub expose_deployment_info: bool,
+
     /// Register the routes that load and unload LoRA adapters at runtime. Like
     /// Python, it is set only through `VLLM_ALLOW_RUNTIME_LORA_UPDATING`.
     #[arg(
@@ -1257,6 +1272,7 @@ impl SharedRuntimeArgs {
                 || self.enable_scale_out.unwrap_or(self.server_dev_mode),
             skip_model_name_validation: self.skip_model_name_validation,
             server_dev_mode: self.server_dev_mode,
+            expose_deployment_info: self.expose_deployment_info,
             allow_runtime_lora_updating: self.allow_runtime_lora_updating,
             sse_keep_alive_interval: (self.sse_keep_alive_interval > 0)
                 .then(|| Duration::from_secs(self.sse_keep_alive_interval)),

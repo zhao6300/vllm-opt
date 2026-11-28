@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
         model_name: args.model.clone(),
         client_index: CLIENT_INDEX,
         engine_stats_enabled: true,
+        expose_deployment_info: false,
     })
     .await
     .context("failed to connect to external vLLM engine")?;

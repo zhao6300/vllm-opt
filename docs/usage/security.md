@@ -307,6 +307,8 @@ Even with `--api-key`, unauthenticated clients can reach `/metrics` and other ut
 - `vllm:cache_config_info` and connector-specific KV metrics (for example `vllm:lmcache_mp_lookup_duration_seconds`) are not registered on `/metrics`.
 - `/server_info` is not registered, even when `VLLM_SERVER_DEV_MODE=1`.
 
+The Rust frontend (`VLLM_USE_RUST_FRONTEND=1`) withholds the same details, including the `rust_frontend_version` its `/version` adds. Its `/metrics` still lists the names of the withheld metric families, with no series. Its gRPC `GetServerInfo` (served only with `--grpc-port`), which reports the parallelism and KV cache capacity to routers, is not gated.
+
 Set `VLLM_EXPOSE_DEPLOYMENT_INFO=1` only on trusted networks, or when a monitoring system needs these details.
 
 ### Security Implications

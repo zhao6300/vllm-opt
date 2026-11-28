@@ -328,6 +328,7 @@ fn serve_args_forward_python_flags_with_separator() {
                         http_max_request_body_size: None,
                         skip_model_name_validation: false,
                         server_dev_mode: false,
+                        expose_deployment_info: false,
                         allow_runtime_lora_updating: false,
                         max_n_sequences: None,
                         decisions_read_strategy: None,
@@ -1224,6 +1225,7 @@ fn serve_args_forward_env_only_settings_to_frontend_config() {
 
     let config = parse(&[]);
     assert!(!config.server.api_server_options.server_dev_mode);
+    assert!(!config.server.api_server_options.expose_deployment_info);
     assert!(!config.server.api_server_options.allow_runtime_lora_updating);
     assert_eq!(config.server.api_server_options.max_n_sequences, 16384);
     assert!(!config.server.keep_alive_on_engine_death);
@@ -1242,8 +1244,9 @@ fn serve_args_forward_env_only_settings_to_frontend_config() {
     // `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION`,
     // `VLLM_KEEP_ALIVE_ON_ENGINE_DEATH`,
     // `VLLM_HTTP_MAX_REQUEST_BODY_SIZE`, `VLLM_SKIP_MODEL_NAME_VALIDATION`,
-    // `VLLM_SERVER_DEV_MODE`, `VLLM_ALLOW_RUNTIME_LORA_UPDATING`, and
-    // `VLLM_MAX_N_SEQUENCES`, which bind these hidden flags.
+    // `VLLM_SERVER_DEV_MODE`, `VLLM_EXPOSE_DEPLOYMENT_INFO`,
+    // `VLLM_ALLOW_RUNTIME_LORA_UPDATING`, and `VLLM_MAX_N_SEQUENCES`, which
+    // bind these hidden flags.
     let config = parse(&[
         "--log-stats-interval",
         "2.5",
@@ -1257,12 +1260,15 @@ fn serve_args_forward_env_only_settings_to_frontend_config() {
         "1",
         "--server-dev-mode",
         " 1",
+        "--expose-deployment-info",
+        "1",
         "--allow-runtime-lora-updating",
         " True ",
         "--max-n-sequences",
         " 8 ",
     ]);
     assert!(config.server.api_server_options.server_dev_mode);
+    assert!(config.server.api_server_options.expose_deployment_info);
     assert!(config.server.api_server_options.allow_runtime_lora_updating);
     assert_eq!(config.server.api_server_options.max_n_sequences, 8);
     assert!(config.server.keep_alive_on_engine_death);
@@ -1318,6 +1324,7 @@ fn args_json_reads_env_only_settings() {
     assert!(!args.keep_alive_on_engine_death);
     assert!(!args.api_server_options().skip_model_name_validation);
     assert!(!args.api_server_options().server_dev_mode);
+    assert!(!args.api_server_options().expose_deployment_info);
     assert!(!args.api_server_options().allow_runtime_lora_updating);
     assert_eq!(args.api_server_options().max_n_sequences, 16384);
     assert_eq!(
@@ -1329,6 +1336,7 @@ fn args_json_reads_env_only_settings() {
         r#","log_stats_interval":0.5,"disable_request_id_randomization":true,
         "keep_alive_on_engine_death":true,"http_max_request_body_size":1048576,
         "skip_model_name_validation":true,"server_dev_mode":true,
+        "expose_deployment_info":true,
         "allow_runtime_lora_updating":true,"max_n_sequences":8"#,
     )
     .unwrap();
@@ -1337,6 +1345,7 @@ fn args_json_reads_env_only_settings() {
     assert!(args.keep_alive_on_engine_death);
     assert!(args.api_server_options().skip_model_name_validation);
     assert!(args.api_server_options().server_dev_mode);
+    assert!(args.api_server_options().expose_deployment_info);
     assert!(args.api_server_options().allow_runtime_lora_updating);
     assert_eq!(args.api_server_options().max_n_sequences, 8);
     assert_eq!(
@@ -2522,6 +2531,7 @@ fn frontend_args_accept_json() {
                         http_max_request_body_size: None,
                         skip_model_name_validation: false,
                         server_dev_mode: false,
+                        expose_deployment_info: false,
                         allow_runtime_lora_updating: false,
                         max_n_sequences: None,
                         decisions_read_strategy: None,
@@ -3690,6 +3700,7 @@ fn serve_args_accept_handshake_aliases() {
                         http_max_request_body_size: None,
                         skip_model_name_validation: false,
                         server_dev_mode: false,
+                        expose_deployment_info: false,
                         allow_runtime_lora_updating: false,
                         max_n_sequences: None,
                         decisions_read_strategy: None,
@@ -3979,6 +3990,7 @@ fn serve_frontend_config_uses_dp_address_as_advertised_host() {
                     enable_scale_out: false,
                     skip_model_name_validation: false,
                     server_dev_mode: false,
+                    expose_deployment_info: false,
                     allow_runtime_lora_updating: false,
                     sse_keep_alive_interval: None,
                     request_body_limit_bytes: Some(
@@ -4133,6 +4145,7 @@ fn serve_frontend_config_keeps_tcp_transport_for_non_local_only_topology() {
                     enable_scale_out: false,
                     skip_model_name_validation: false,
                     server_dev_mode: false,
+                    expose_deployment_info: false,
                     allow_runtime_lora_updating: false,
                     sse_keep_alive_interval: None,
                     request_body_limit_bytes: Some(
@@ -4393,6 +4406,7 @@ fn frontend_config_uses_external_coordinator_when_coordinator_address_is_present
                     enable_scale_out: false,
                     skip_model_name_validation: false,
                     server_dev_mode: false,
+                    expose_deployment_info: false,
                     allow_runtime_lora_updating: false,
                     sse_keep_alive_interval: None,
                     request_body_limit_bytes: Some(

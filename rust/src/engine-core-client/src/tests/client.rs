@@ -338,6 +338,7 @@ fn handshake_test_config(
         model_name: model_name.to_string(),
         client_index,
         engine_stats_enabled: true,
+        expose_deployment_info: true,
     }
 }
 
@@ -369,6 +370,7 @@ fn bootstrapped_test_config(
         model_name: "test-model".to_string(),
         client_index,
         engine_stats_enabled: true,
+        expose_deployment_info: true,
     }
 }
 
@@ -422,6 +424,7 @@ fn client_config_validates_bootstrapped_dp_range() {
         model_name: "test-model".to_string(),
         client_index: 0,
         engine_stats_enabled: true,
+        expose_deployment_info: true,
     };
     config.validate().expect("frontend may own a subset of global DP ranks");
 
@@ -3592,6 +3595,59 @@ async fn cache_config_info_exports_each_engine_cache_config() {
     client.shutdown().await.unwrap();
 }
 
+/// Without `VLLM_EXPOSE_DEPLOYMENT_INFO`, neither the cache config nor the
+/// KV connector metrics are exported, like Python.
+#[test]
+fn deployment_metrics_follow_expose_deployment_info() {
+    let engines = [ConnectedEngine {
+        engine_id: EngineId::from_engine_index(0),
+        ready_response: EngineCoreReadyResponse {
+            cache_config_info: Some(BTreeMap::from([(
+                "block_size".to_string(),
+                "16".to_string(),
+            )])),
+            ..default_ready_response()
+        },
+    }];
+    let stats = SchedulerStats {
+        kv_connector_stats: Some(KvConnectorStats::Nixl(crate::protocol::stats::NixlStats {
+            num_failed_transfers: vec![1],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let series = [false, true].map(|expose_deployment_info| {
+        let metrics = vllm_metrics::Metrics::new();
+        let recorder = SchedulerStatsRecorder::new(
+            &metrics.scheduler,
+            "test-model",
+            &engines,
+            expose_deployment_info,
+        );
+        recorder.record(0, &stats);
+        let rendered = metrics.render().unwrap();
+        let mut series = (rendered.lines())
+            .filter(|line| {
+                ["vllm:cache_config_info", "vllm:nixl_num_failed_transfers"].iter().any(|name| {
+                    line.starts_with(name) || line.starts_with(&format!("# TYPE {name}"))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        series.insert_str(0, &format!("{expose_deployment_info}:\n"));
+        series
+    });
+    expect_test::expect![[r#"
+        false:
+        # TYPE vllm:cache_config_info gauge
+        # TYPE vllm:nixl_num_failed_transfers counter
+        true:
+        # TYPE vllm:cache_config_info gauge
+        vllm:cache_config_info{block_size="16",engine="0"} 1.0
+        # TYPE vllm:nixl_num_failed_transfers counter
+        vllm:nixl_num_failed_transfers_total{model_name="test-model",engine="0"} 1"#]].assert_eq(&series.join("\n"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collective_rpc_flattens_results_from_all_engines() {
     init_tracing();
@@ -4233,6 +4289,7 @@ fn python_msgpack_fixtures_match_rust_encoding_and_record_nixl_metrics() {
             engine_id: EngineId::from_engine_index(0),
             ready_response: crate::mock_engine::default_ready_response(),
         }],
+        true,
     );
     recorder.record(
         0,

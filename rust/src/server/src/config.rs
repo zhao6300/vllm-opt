@@ -97,6 +97,12 @@ pub struct ApiServerOptions {
     pub skip_model_name_validation: bool,
     /// When `true`, register the development routes (`VLLM_SERVER_DEV_MODE`).
     pub server_dev_mode: bool,
+    /// When `false`, withhold deployment details from clients
+    /// (`VLLM_EXPOSE_DEPLOYMENT_INFO`): `/version` answers 403, responses
+    /// carry no `system_fingerprint` whatever `fingerprint_mode` says,
+    /// `/server_info` is not registered, and neither `vllm:cache_config_info`
+    /// nor the KV connector metrics are exported.
+    pub expose_deployment_info: bool,
     /// When `true`, register the LoRA load and unload routes
     /// (`VLLM_ALLOW_RUNTIME_LORA_UPDATING`).
     pub allow_runtime_lora_updating: bool,

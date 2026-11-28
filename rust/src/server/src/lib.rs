@@ -171,7 +171,10 @@ async fn build_state(config: &ServerConfig, llm: LlmSource) -> Result<Arc<AppSta
         }
         LlmSource::Provided(llm) => (llm, None),
     };
-    let system_fingerprint = config.fingerprint_mode.fingerprint(&llm.info().fingerprint);
+    let system_fingerprint = config.fingerprint_mode.fingerprint(
+        &llm.info().fingerprint,
+        config.api_server_options.expose_deployment_info,
+    );
     let text = TextLlm::from_boxed(llm, text_backend)
         .with_served_model_name(metrics_model_name)
         .with_max_logprobs(config.max_logprobs)
@@ -251,6 +254,7 @@ async fn connect_engine_core(
         model_name: metrics_model_name,
         client_index: 0,
         engine_stats_enabled: !engine_core.disable_log_stats,
+        expose_deployment_info: config.api_server_options.expose_deployment_info,
     })
     .await
     .context("failed to connect to engine core")?;

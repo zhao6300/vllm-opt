@@ -195,6 +195,10 @@ pub struct EngineCoreClientConfig {
     /// `SchedulerStats` nor request lifecycle events, so frontend metrics
     /// derived from them are not exported.
     pub engine_stats_enabled: bool,
+    /// Whether to export the metrics that reveal the deployment,
+    /// `vllm:cache_config_info` and the KV connector metrics
+    /// (`VLLM_EXPOSE_DEPLOYMENT_INFO`). Off by default, like Python.
+    pub expose_deployment_info: bool,
 }
 
 impl EngineCoreClientConfig {
@@ -216,6 +220,7 @@ impl EngineCoreClientConfig {
             model_name: String::new(),
             client_index: 0,
             engine_stats_enabled: true,
+            expose_deployment_info: false,
         }
     }
 
@@ -233,6 +238,12 @@ impl EngineCoreClientConfig {
     /// Override the client index stamped onto every outgoing request.
     pub fn with_client_index(mut self, client_index: u32) -> Self {
         self.client_index = client_index;
+        self
+    }
+
+    /// Set whether to export the metrics that reveal the deployment.
+    pub fn with_expose_deployment_info(mut self, expose_deployment_info: bool) -> Self {
+        self.expose_deployment_info = expose_deployment_info;
         self
     }
 
@@ -435,6 +446,7 @@ impl EngineCoreClient {
             config.model_name.clone(),
             config.client_index,
             config.engine_stats_enabled,
+            config.expose_deployment_info,
             &engines,
         ));
         let input_watch_task =

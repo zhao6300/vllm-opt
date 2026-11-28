@@ -147,6 +147,7 @@ mod tests {
             "test-model".to_string(),
             0,
             false,
+            false,
             &[ConnectedEngine {
                 engine_id: EngineId::from(b"engine-0"),
                 ready_response: default_ready_response(),

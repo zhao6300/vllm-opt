@@ -876,6 +876,7 @@ async fn test_app_with_dev_mode(dev_mode_enabled: bool) -> (axum::Router, MockEn
         )),
         RouteGates {
             dev_mode: dev_mode_enabled,
+            deployment_info: true,
             scale_out: true,
             ..RouteGates::default()
         },
@@ -1768,6 +1769,7 @@ async fn test_dev_mode_app_with_ready(
         ),
         RouteGates {
             dev_mode: true,
+            deployment_info: true,
             ..RouteGates::default()
         },
     );
@@ -1892,6 +1894,7 @@ where
             state,
             RouteGates {
                 dev_mode: true,
+                deployment_info: true,
                 runtime_lora_updating: true,
                 scale_out: true,
             },
@@ -3899,23 +3902,70 @@ async fn cors_explicit_headers_union_safelisted_headers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
-async fn version_returns_engine_vllm_version() {
-    let (mut app, _engine_task) = test_app().await;
-    let response = app
-        .call(Request::builder().uri("/version").body(Body::empty()).expect("build request"))
-        .await
-        .expect("call app");
+async fn version_is_exposed_only_with_deployment_info() {
+    let mut seen = Vec::new();
+    for expose_deployment_info in [false, true] {
+        let (chat, engine_task) = test_chat_with_engine_handle().await;
+        let app = build_router(Arc::new(
+            AppState::new(vec!["model".to_string()], chat).with_api_server_options(
+                ApiServerOptions {
+                    expose_deployment_info,
+                    ..Default::default()
+                },
+            ),
+        ));
+        let response = app
+            .oneshot(Request::builder().uri("/version").body(Body::empty()).expect("build request"))
+            .await
+            .expect("call app");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
+        let mut json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
+        if let Some(version) = json.get_mut("rust_frontend_version") {
+            assert_eq!(version, vllm_build_info::VERSION);
+            *version = json!("<rust_frontend_version>");
+        }
+        seen.push(format!("{expose_deployment_info}: {status} {json}"));
+        engine_task.abort_and_join().await;
+    }
+    expect_test::expect![[r#"
+        false: 403 Forbidden {"error":"Deployment information is not exposed"}
+        true: 200 OK {"version":"test-vllm-version","rust_frontend_version":"<rust_frontend_version>"}"#]].assert_eq(&seen.join("\n"));
+}
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.expect("read body");
-    let json: serde_json::Value = serde_json::from_slice(&body).expect("decode json");
-    assert_eq!(
-        json,
-        json!({
-            "version": "test-vllm-version",
-            "rust_frontend_version": vllm_build_info::VERSION,
-        })
-    );
+/// `/server_info` needs `VLLM_EXPOSE_DEPLOYMENT_INFO` on top of
+/// `VLLM_SERVER_DEV_MODE`, like Python.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn server_info_needs_deployment_info_in_dev_mode() {
+    let mut seen = Vec::new();
+    for expose_deployment_info in [false, true] {
+        let (chat, engine_task) = test_chat_with_engine_handle().await;
+        let app = build_router(Arc::new(
+            (AppState::new(vec!["model".to_string()], chat).with_engine_core_client())
+                .with_api_server_options(ApiServerOptions {
+                    server_dev_mode: true,
+                    expose_deployment_info,
+                    ..Default::default()
+                }),
+        ));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/server_info?config_format=yaml")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("call app");
+        seen.push(format!("{expose_deployment_info}: {}", response.status()));
+        engine_task.abort_and_join().await;
+    }
+    // A registered route rejects the query (400); an unregistered one is 404.
+    expect_test::expect![[r#"
+        false: 404 Not Found
+        true: 400 Bad Request"#]]
+    .assert_eq(&seen.join("\n"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

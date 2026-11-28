@@ -303,6 +303,7 @@ _RUST_FRONTEND_ENV_ARGS = {
     "http_max_request_body_size": "VLLM_HTTP_MAX_REQUEST_BODY_SIZE",
     "skip_model_name_validation": "VLLM_SKIP_MODEL_NAME_VALIDATION",
     "server_dev_mode": "VLLM_SERVER_DEV_MODE",
+    "expose_deployment_info": "VLLM_EXPOSE_DEPLOYMENT_INFO",
     "allow_runtime_lora_updating": "VLLM_ALLOW_RUNTIME_LORA_UPDATING",
     "max_n_sequences": "VLLM_MAX_N_SEQUENCES",
     "enable_cohere_api": "VLLM_ENABLE_COHERE_API",

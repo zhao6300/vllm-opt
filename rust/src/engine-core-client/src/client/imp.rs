@@ -74,10 +74,17 @@ impl ClientInner {
         model_name: String,
         client_index: u32,
         engine_stats_enabled: bool,
+        expose_deployment_info: bool,
         engines: &[ConnectedEngine],
     ) -> Self {
-        let scheduler_stats_recorder = engine_stats_enabled
-            .then(|| SchedulerStatsRecorder::new(&METRICS.scheduler, &model_name, engines));
+        let scheduler_stats_recorder = engine_stats_enabled.then(|| {
+            SchedulerStatsRecorder::new(
+                &METRICS.scheduler,
+                &model_name,
+                engines,
+                expose_deployment_info,
+            )
+        });
         let iteration_metrics = engines
             .iter()
             .filter_map(|engine| {
@@ -712,6 +719,7 @@ mod tests {
             "test-model".to_string(),
             0,
             true,
+            false,
             &[ConnectedEngine {
                 engine_id: EngineId::from(b"engine-0"),
                 ready_response: default_ready_response(),
@@ -737,6 +745,7 @@ mod tests {
                 send_runtime.handle().clone(),
                 "test-model".to_string(),
                 0,
+                false,
                 false,
                 &[ConnectedEngine {
                     engine_id: engine_id.clone(),

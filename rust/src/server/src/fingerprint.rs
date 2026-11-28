@@ -25,8 +25,16 @@ pub enum FingerprintMode {
 
 impl FingerprintMode {
     /// Build the fingerprint of the engine that `fingerprint` describes, like
-    /// Python's `build_system_fingerprint`.
-    pub(crate) fn fingerprint(&self, fingerprint: &LlmFingerprint) -> Option<String> {
+    /// Python's `build_system_fingerprint`. Withheld deployment info
+    /// (`VLLM_EXPOSE_DEPLOYMENT_INFO`) leaves none, whatever the mode.
+    pub(crate) fn fingerprint(
+        &self,
+        fingerprint: &LlmFingerprint,
+        expose_deployment_info: bool,
+    ) -> Option<String> {
+        if !expose_deployment_info {
+            return None;
+        }
         let hash8 = || {
             (fingerprint.config_hash.as_deref())
                 .map_or("nohash", |hash| hash.get(..8).unwrap_or(hash))
@@ -86,15 +94,19 @@ mod tests {
         ];
         let fingerprints = rows.map(|(mode, engine)| {
             let dp = engine.data_parallel_size;
-            format!("{mode:?} dp{dp}: {:?}", mode.fingerprint(&engine))
+            format!(
+                "{mode:?} dp{dp}: {:?}, withheld {:?}",
+                mode.fingerprint(&engine, true),
+                mode.fingerprint(&engine, false)
+            )
         });
         expect![[r#"
-            Full dp4: Some("vllm-0.33.0-tp2-dp4-ep-c84c7d4f")
-            Full dp1: Some("vllm-0.33.0-tp2-ep-c84c7d4f")
-            Full dp1: Some("vllm-0.33.0-tp2-ep-nohash")
-            Hash dp4: Some("vllm-0.33.0-c84c7d4f")
-            Custom("fp-1") dp4: Some("fp-1")
-            None dp4: None"#]]
+            Full dp4: Some("vllm-0.33.0-tp2-dp4-ep-c84c7d4f"), withheld None
+            Full dp1: Some("vllm-0.33.0-tp2-ep-c84c7d4f"), withheld None
+            Full dp1: Some("vllm-0.33.0-tp2-ep-nohash"), withheld None
+            Hash dp4: Some("vllm-0.33.0-c84c7d4f"), withheld None
+            Custom("fp-1") dp4: Some("fp-1"), withheld None
+            None dp4: None, withheld None"#]]
         .assert_eq(&fingerprints.join("\n"));
     }
 }
