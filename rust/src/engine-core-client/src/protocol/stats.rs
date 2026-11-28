@@ -66,6 +66,18 @@ pub struct SchedulerStats {
     pub step_counter: u64,
     /// Internal DP load-balancing wave number.
     pub current_wave: u64,
+    /// Modelled time, in milliseconds, the prefill this engine has not
+    /// finished takes to drain. Zero without a prefill step time budget.
+    #[serde(default)]
+    pub pending_prefill_ms: f64,
+    /// Modelled time of one prefill token at this engine's chunk size, to
+    /// price a request just routed before the engine reports it.
+    #[serde(default)]
+    pub prefill_ms_per_token: f64,
+    /// Prompt tokens this engine has not finished prefilling (the remainder
+    /// after prefix-cache and connector hits).
+    #[serde(default)]
+    pub pending_prefill_tokens: u64,
     /// KV-cache usage. `1.0` means 100% usage.
     pub kv_cache_usage: f64,
     /// Local prefix cache statistics.
@@ -121,5 +133,42 @@ mod tests {
         let wire = rmp_serde::to_vec_named(&payload).unwrap();
         let stats: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
         assert_eq!(stats.num_kv_fetch_reqs_by_stage.counts(), [3, 1, 0]);
+    }
+
+    #[test]
+    fn scheduler_stats_pending_prefill_defaults_and_decodes() {
+        let mut payload = serde_json::json!({
+            "num_running_reqs": 1, "num_waiting_reqs": 2,
+            "step_counter": 0, "current_wave": 0, "kv_cache_usage": 0.5,
+            "prefix_cache_stats": {
+                "reset": false, "requests": 0, "queries": 0, "hits": 0,
+                "preempted_requests": 0, "preempted_queries": 0, "preempted_hits": 0
+            },
+            "kv_cache_eviction_events": []
+        });
+        let wire = rmp_serde::to_vec_named(&payload).unwrap();
+        let stats: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(
+            (
+                stats.pending_prefill_tokens,
+                stats.pending_prefill_ms,
+                stats.prefill_ms_per_token
+            ),
+            (0, 0.0, 0.0)
+        );
+
+        payload["pending_prefill_tokens"] = serde_json::json!(16384);
+        payload["pending_prefill_ms"] = serde_json::json!(1400.0);
+        payload["prefill_ms_per_token"] = serde_json::json!(0.085);
+        let wire = rmp_serde::to_vec_named(&payload).unwrap();
+        let stats: SchedulerStats = rmp_serde::from_slice(&wire).unwrap();
+        assert_eq!(
+            (
+                stats.pending_prefill_tokens,
+                stats.pending_prefill_ms,
+                stats.prefill_ms_per_token
+            ),
+            (16384, 1400.0, 0.085)
+        );
     }
 }

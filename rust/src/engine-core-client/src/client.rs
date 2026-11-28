@@ -33,6 +33,7 @@ mod output_channel;
 mod readiness;
 mod state;
 mod stream;
+mod token_aware;
 
 pub use state::RequestObserver;
 pub use stream::{EngineCoreOutputStream, EngineCoreStreamDelivery, EngineCoreStreamOutput};
@@ -790,12 +791,15 @@ impl EngineCoreClient {
         let stream_interval = (req.sampling_params.as_ref())
             .and_then(|params| params.stream_interval)
             .unwrap_or(NonZeroU32::MIN);
+        let num_prompt_tokens =
+            (req.prompt_token_ids.as_ref()).map(|ids| ids.shape.iter().product::<usize>());
         let (engine_id, rx) = self.inner.register_request(
             request_id.clone(),
             lora_name,
             data_parallel_rank,
             stream_interval,
             observer,
+            num_prompt_tokens,
         )?;
 
         // Construct the output stream first before actually sending the request to the engine.

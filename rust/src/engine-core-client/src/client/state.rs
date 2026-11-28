@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tokio::sync::oneshot;
 use tracing::trace;
@@ -12,6 +13,7 @@ use crate::EngineId;
 use crate::client::output_channel::output_channel;
 pub(crate) use crate::client::output_channel::{OutputReceiver, OutputSender};
 use crate::client::stream::EngineCoreStreamOutput;
+use crate::client::token_aware::{FLOOR_SNAPSHOTS, SNAPSHOT_INTERVAL, TokenAwareRouting};
 use crate::error::{Error, Result};
 use crate::protocol::output::{EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput};
 use crate::protocol::stats::SchedulerStats;
@@ -41,6 +43,36 @@ struct TrackedRequest {
     lora: Option<LoraRequestState>,
     admission_stats_generation: Option<u64>,
     observer: Option<Box<dyn RequestObserver>>,
+    /// This request's share of its engine's dispatch floor, until its first
+    /// output or until its engine's snapshots have had time to count it.
+    dispatched_prefill: Option<DispatchedPrefill>,
+}
+
+/// Unfinished prefill, in prompt tokens and modelled milliseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct PrefillLoad {
+    tokens: u64,
+    ms: f64,
+}
+
+impl PrefillLoad {
+    fn add(&mut self, other: Self) {
+        self.tokens += other.tokens;
+        self.ms += other.ms;
+    }
+
+    fn sub(&mut self, other: Self) {
+        self.tokens = self.tokens.saturating_sub(other.tokens);
+        self.ms = (self.ms - other.ms).max(0.0);
+    }
+}
+
+/// One dispatch counted in its engine's floor.
+#[derive(Debug, Clone, Copy)]
+struct DispatchedPrefill {
+    load: PrefillLoad,
+    /// The engine's snapshot count when the request was dispatched.
+    snapshot: u64,
 }
 
 /// Frontend-side view of one LoRA request's scheduling phase.
@@ -90,6 +122,20 @@ struct EngineRoutingState {
     admitted_since_stats: usize,
     /// Identifies admissions made after the latest scheduler snapshot.
     stats_generation: u64,
+    /// Unfinished prefill in the engine's latest scheduler snapshot, with
+    /// prefix-cache and connector hits already taken out.
+    reported_prefill: PrefillLoad,
+    /// This frontend's own dispatches that no snapshot can have counted yet.
+    /// Floors `reported_prefill` for the snapshot or two before one does,
+    /// which is when a burst of mixed-size prompts is routed.
+    dispatched_prefill: PrefillLoad,
+    /// The engine's last nonzero modelled time of one prefill token.
+    prefill_ms_per_token: f64,
+    /// Scheduler snapshots received from this engine, at most one per
+    /// [`SNAPSHOT_INTERVAL`].
+    snapshots: u64,
+    /// When the last snapshot counted in `snapshots` arrived.
+    last_snapshot_at: Option<Instant>,
 }
 
 impl EngineRoutingState {
@@ -104,6 +150,18 @@ impl EngineRoutingState {
         };
 
         self.inflight.max(stats.running + stats.waiting + self.admitted_since_stats)
+    }
+
+    /// The routing score plus the engine's unfinished prefill, priced in
+    /// requests by `routing`. Unfinished prefill occupies the engine's steps
+    /// for as long as it takes, however few requests that is.
+    ///
+    // TODO: the Python frontend also adds `waiting * 6 * max(0, kv_cache_usage
+    // - 0.5)` to every score; the Rust frontend has never ported that term.
+    fn token_aware_score(&self, routing: &TokenAwareRouting) -> f64 {
+        let tokens = self.reported_prefill.tokens.max(self.dispatched_prefill.tokens);
+        let ms = self.reported_prefill.ms.max(self.dispatched_prefill.ms);
+        self.routing_score() as f64 + routing.pending_load(tokens, ms)
     }
 
     /// Record one request admitted to this engine.
@@ -149,10 +207,22 @@ pub struct RequestRegistry {
     requests: HashMap<String, TrackedRequest>,
     active_lora_requests: usize,
     routing_per_engine: BTreeMap<EngineId, EngineRoutingState>,
+    /// Token-aware routing (`VLLM_DP_LB_TOKEN_AWARE`); `None` routes by
+    /// request counts alone.
+    token_aware: Option<TokenAwareRouting>,
 }
 
 impl RequestRegistry {
+    /// A registry that routes by request counts alone.
+    #[cfg(test)]
     pub fn new(engines: &[ConnectedEngine]) -> Self {
+        Self::with_token_aware(engines, None)
+    }
+
+    pub fn with_token_aware(
+        engines: &[ConnectedEngine],
+        token_aware: Option<TokenAwareRouting>,
+    ) -> Self {
         Self {
             closed: false,
             requests: HashMap::default(),
@@ -161,6 +231,7 @@ impl RequestRegistry {
                 .iter()
                 .map(|engine| (engine.engine_id.clone(), EngineRoutingState::default()))
                 .collect(),
+            token_aware,
         }
     }
 
@@ -207,10 +278,49 @@ impl RequestRegistry {
                 lora,
                 admission_stats_generation,
                 observer: None,
+                dispatched_prefill: None,
             },
         );
 
         Ok((engine_id, rx))
+    }
+
+    /// Count a request just registered in its engine's dispatch floor, priced
+    /// as that engine prices its own backlog. A no-op without token-aware
+    /// routing.
+    pub fn record_dispatched_prefill(&mut self, request_id: &str, num_prompt_tokens: usize) {
+        let Some(routing) = self.token_aware else {
+            return;
+        };
+        let tracked = (self.requests.get_mut(request_id)).expect("the request was just registered");
+        let state = self
+            .routing_per_engine
+            .get_mut(&tracked.engine_id)
+            .expect("request registry must track all known engines");
+        let tokens = num_prompt_tokens as u64;
+        let load = PrefillLoad {
+            tokens,
+            ms: routing.dispatch_ms(tokens, state.prefill_ms_per_token),
+        };
+        state.dispatched_prefill.add(load);
+        tracked.dispatched_prefill = Some(DispatchedPrefill {
+            load,
+            snapshot: state.snapshots,
+        });
+    }
+
+    /// Drop a request's dispatch from its engine's floor, if it is counted.
+    fn release_dispatched_prefill(&mut self, request_id: &str) {
+        let Some(tracked) = self.requests.get_mut(request_id) else {
+            return;
+        };
+        if let Some(dispatched) = tracked.dispatched_prefill.take() {
+            self.routing_per_engine
+                .get_mut(&tracked.engine_id)
+                .expect("request registry must track all known engines")
+                .dispatched_prefill
+                .sub(dispatched.load);
+        }
     }
 
     /// Attach an observer to a request just registered. It sees the request's
@@ -235,10 +345,14 @@ impl RequestRegistry {
                 });
         }
 
-        Ok(self
-            .routing_per_engine
-            .iter()
-            .min_by_key(|(_, state)| state.routing_score())
+        let chosen = match &self.token_aware {
+            // Ties keep the first engine, as with the request-count score.
+            Some(routing) => self.routing_per_engine.iter().min_by(|(_, a), (_, b)| {
+                a.token_aware_score(routing).total_cmp(&b.token_aware_score(routing))
+            }),
+            None => (self.routing_per_engine.iter()).min_by_key(|(_, state)| state.routing_score()),
+        };
+        Ok(chosen
             .map(|(engine_id, _)| engine_id.clone())
             .expect("request registry must contain at least one engine"))
     }
@@ -271,6 +385,8 @@ impl RequestRegistry {
         output: EngineCoreStreamOutput,
     ) -> Option<EngineCoreStreamOutput> {
         self.apply_lora_events(&output.output);
+        // The first output of a request means its prefill is done.
+        self.release_dispatched_prefill(output.request_id.as_str());
         if let Some(observer) = (self.requests.get_mut(output.request_id.as_str()))
             .and_then(|tracked| tracked.observer.as_mut())
         {
@@ -348,16 +464,92 @@ impl RequestRegistry {
     }
 
     /// Apply one scheduler stats update for the given engine to the local
-    /// routing state. Returns `false` if the engine is unknown to the
-    /// client.
-    pub fn apply_scheduler_stats(&mut self, engine_index: u32, stats: &SchedulerStats) -> bool {
-        self.apply_scheduler_counts(
+    /// routing state, received at `now`. Returns `false` if the engine is
+    /// unknown to the client.
+    pub fn apply_scheduler_stats(
+        &mut self,
+        engine_index: u32,
+        stats: &SchedulerStats,
+        now: Instant,
+    ) -> bool {
+        let known = self.apply_scheduler_counts(
             engine_index,
             EngineLoadSnapshot {
                 waiting: stats.num_waiting_reqs as usize,
                 running: stats.num_running_reqs as usize,
             },
-        )
+        );
+        if known && self.token_aware.is_some() {
+            let index =
+                u16::try_from(engine_index).expect("apply_scheduler_counts checked the index");
+            self.apply_prefill_load(
+                EngineId::from_engine_index(index),
+                PrefillLoad {
+                    tokens: stats.pending_prefill_tokens,
+                    ms: stats.pending_prefill_ms,
+                },
+                stats.prefill_ms_per_token,
+                now,
+            );
+        }
+        known
+    }
+
+    /// Apply one engine's load snapshot from the coordinator path, which the
+    /// engine sends whenever its request counts or unfinished prefill change,
+    /// whether or not it records stats. Only token-aware routing reads it:
+    /// routing by request counts alone keeps to the stats on the output path,
+    /// as it always has.
+    pub fn apply_load_snapshot(&mut self, engine_index: u32, stats: &SchedulerStats, now: Instant) {
+        if self.token_aware.is_some() {
+            self.apply_scheduler_stats(engine_index, stats, now);
+        }
+    }
+
+    /// Install an engine's reported unfinished prefill and drop from its floor
+    /// every dispatch that this snapshot cannot have missed.
+    fn apply_prefill_load(
+        &mut self,
+        engine_id: EngineId,
+        reported: PrefillLoad,
+        ms_per_token: f64,
+        now: Instant,
+    ) {
+        let state = self
+            .routing_per_engine
+            .get_mut(&engine_id)
+            .expect("apply_scheduler_counts checked the engine");
+        state.reported_prefill = reported;
+        // Only the coordinator's load snapshots carry the price; the stats on
+        // the output path leave it 0.
+        if ms_per_token > 0.0 {
+            state.prefill_ms_per_token = ms_per_token;
+        }
+        if (state.last_snapshot_at)
+            .is_some_and(|last| now.saturating_duration_since(last) < SNAPSHOT_INTERVAL)
+        {
+            return;
+        }
+        state.last_snapshot_at = Some(now);
+        state.snapshots += 1;
+        if state.dispatched_prefill == PrefillLoad::default() {
+            return;
+        }
+        // A dispatch is counted by every snapshot after the one in flight when
+        // it was sent; after `FLOOR_SNAPSHOTS` of them it no longer needs a floor.
+        let snapshots = state.snapshots;
+        let seen: Vec<String> = (self.requests.iter())
+            .filter(|(_, tracked)| {
+                tracked.engine_id == engine_id
+                    && tracked
+                        .dispatched_prefill
+                        .is_some_and(|d| d.snapshot + FLOOR_SNAPSHOTS <= snapshots)
+            })
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in seen {
+            self.release_dispatched_prefill(&request_id);
+        }
     }
 
     /// Mark the registry as closed, detach and return all tracked senders.
@@ -407,6 +599,9 @@ impl RequestRegistry {
     /// it exists.
     #[must_use]
     pub fn remove(&mut self, request_id: &str) -> Option<(OutputSender, EngineId)> {
+        // A request that finishes without an output (an abort) also stops
+        // being pending.
+        self.release_dispatched_prefill(request_id);
         let tracked = self.requests.remove(request_id)?;
         if tracked.lora.is_some() {
             self.active_lora_requests -= 1;
@@ -1392,5 +1587,121 @@ mod tests {
         registry.unregister_many([call_id, 42, 9999]);
 
         assert!(!registry.contains(call_id));
+    }
+
+    mod token_aware {
+        use std::num::NonZeroU32;
+        use std::time::{Duration, Instant};
+
+        use super::connected_engine;
+        use crate::EngineId;
+        use crate::client::state::RequestRegistry;
+        use crate::client::token_aware::TokenAwareRouting;
+        use crate::protocol::output::EngineCoreOutput;
+        use crate::protocol::stats::SchedulerStats;
+
+        /// Token-aware routing that weighs 2048 pending prefill tokens as
+        /// one request.
+        fn routing() -> Option<TokenAwareRouting> {
+            TokenAwareRouting::from_vars(|name| {
+                (name == "VLLM_DP_LB_TOKEN_AWARE").then(|| "1".to_string())
+            })
+        }
+
+        fn registry(engines: u16, routing: Option<TokenAwareRouting>) -> RequestRegistry {
+            let engines: Vec<_> = (0..engines)
+                .map(|index| connected_engine(EngineId::from_engine_index(index)))
+                .collect();
+            RequestRegistry::with_token_aware(&engines, routing)
+        }
+
+        /// Register a request with `tokens` prompt tokens and return its
+        /// engine's index.
+        fn dispatch(registry: &mut RequestRegistry, request_id: &str, tokens: usize) -> u32 {
+            let (engine_id, _) =
+                registry.register(request_id.to_string(), None, None, NonZeroU32::MIN).unwrap();
+            registry.record_dispatched_prefill(request_id, tokens);
+            engine_id.engine_index().unwrap()
+        }
+
+        fn stats(running: u64, pending_prefill_tokens: u64) -> SchedulerStats {
+            SchedulerStats {
+                num_running_reqs: running,
+                pending_prefill_tokens,
+                ..Default::default()
+            }
+        }
+
+        fn floor_tokens(registry: &RequestRegistry, engine: u16) -> u64 {
+            registry.routing_per_engine[&EngineId::from_engine_index(engine)]
+                .dispatched_prefill
+                .tokens
+        }
+
+        #[test]
+        fn routes_away_from_the_engine_with_more_unfinished_prefill() {
+            let now = Instant::now();
+            let chosen = [routing(), None].map(|routing| {
+                let mut registry = registry(2, routing);
+                registry.apply_scheduler_stats(0, &stats(1, 8192), now);
+                registry.apply_scheduler_stats(1, &stats(1, 0), now);
+                dispatch(&mut registry, "req", 10)
+            });
+            // Routing by request counts alone ties and keeps the first engine.
+            expect_test::expect!["[1, 0]"].assert_eq(&format!("{chosen:?}"));
+        }
+
+        #[test]
+        fn dispatch_floor_spreads_a_burst_before_stats_arrive() {
+            let chosen = [routing(), None].map(|routing| {
+                let mut registry = registry(2, routing);
+                [("long", 8192), ("short-1", 10), ("short-2", 10)]
+                    .map(|(request_id, tokens)| dispatch(&mut registry, request_id, tokens))
+            });
+            expect_test::expect!["[[0, 1, 1], [0, 1, 0]]"].assert_eq(&format!("{chosen:?}"));
+        }
+
+        #[test]
+        fn dispatch_floor_lasts_until_its_prefill_is_seen() {
+            let mut registry = registry(1, routing());
+            let mut floors = Vec::new();
+            for (request_id, tokens) in [("first-output", 1000), ("aborted", 2000), ("seen", 4000)]
+            {
+                dispatch(&mut registry, request_id, tokens);
+            }
+            floors.push(floor_tokens(&registry, 0));
+
+            let first_output = EngineCoreOutput {
+                request_id: "first-output".to_string(),
+                ..Default::default()
+            };
+            assert!(registry.send_output(super::stream_output(first_output)).is_none());
+            floors.push(floor_tokens(&registry, 0));
+
+            drop(registry.remove("aborted"));
+            floors.push(floor_tokens(&registry, 0));
+
+            // The second snapshot drops the floor; one sooner than the
+            // interval after the first does not count.
+            let start = Instant::now();
+            for elapsed_ms in [0, 50, 100] {
+                let now = start + Duration::from_millis(elapsed_ms);
+                registry.apply_scheduler_stats(0, &stats(2, 3000), now);
+                floors.push(floor_tokens(&registry, 0));
+            }
+            expect_test::expect!["[7000, 6000, 4000, 4000, 4000, 0]"]
+                .assert_eq(&format!("{floors:?}"));
+        }
+
+        #[test]
+        fn load_snapshots_apply_only_to_token_aware_routing() {
+            let now = Instant::now();
+            let seen = [routing(), None].map(|routing| {
+                let mut registry = registry(1, routing);
+                registry.apply_load_snapshot(0, &stats(3, 0), now);
+                registry.routing_per_engine[&EngineId::from_engine_index(0)].routing_score()
+            });
+            expect_test::expect!["[3, 0]"].assert_eq(&format!("{seen:?}"));
+        }
     }
 }

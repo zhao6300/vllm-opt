@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
@@ -23,6 +23,7 @@ use crate::client::state::{
     UtilityRegistry,
 };
 use crate::client::stream::{EngineCoreOutputStream, EngineCoreStreamOutput};
+use crate::client::token_aware::TokenAwareRouting;
 use crate::client::{AbortCause, AbortRequest};
 use crate::error::{client_closed, dispatcher_closed, unexpected_dispatcher_output};
 use crate::metrics::{EngineSleepState, IterationMetricHandles, SchedulerStatsRecorder};
@@ -99,7 +100,10 @@ impl ClientInner {
             max_loras,
             scheduler_stats_recorder,
             iteration_metrics,
-            request_reg: Mutex::new(RequestRegistry::new(engines)),
+            request_reg: Mutex::new(RequestRegistry::with_token_aware(
+                engines,
+                TokenAwareRouting::from_env(),
+            )),
             utility_reg: Mutex::new(UtilityRegistry::default()),
             health_error: ArcSwapOption::empty(),
             health_tx: watch::Sender::new(true),
@@ -127,6 +131,8 @@ impl ClientInner {
     /// When `data_parallel_rank` is provided, the request is routed to that
     /// specific engine rank, bypassing load balancing. `lora_name` is the
     /// request's LoRA adapter, tracked for `vllm:lora_requests_info`.
+    /// `num_prompt_tokens` counts in token-aware routing until the engine
+    /// reports the request's prefill itself.
     pub fn register_request(
         &self,
         request_id: String,
@@ -134,6 +140,7 @@ impl ClientInner {
         data_parallel_rank: Option<u32>,
         stream_interval: NonZeroU32,
         observer: Option<Box<dyn RequestObserver>>,
+        num_prompt_tokens: Option<usize>,
     ) -> Result<(EngineId, OutputReceiver)> {
         let mut registry = self.request_reg.lock();
         if registry.is_closed() {
@@ -147,6 +154,9 @@ impl ClientInner {
         )?;
         if let Some(observer) = observer {
             registry.observe(&request_id, observer);
+        }
+        if let Some(num_prompt_tokens) = num_prompt_tokens {
+            registry.record_dispatched_prefill(&request_id, num_prompt_tokens);
         }
         Ok(registered)
     }
@@ -229,7 +239,15 @@ impl ClientInner {
     /// routing state. Returns `false` if the engine is unknown to the
     /// client.
     pub fn apply_scheduler_stats(&self, engine_index: u32, stats: &SchedulerStats) -> bool {
-        self.request_reg.lock().apply_scheduler_stats(engine_index, stats)
+        self.request_reg
+            .lock()
+            .apply_scheduler_stats(engine_index, stats, Instant::now())
+    }
+
+    /// Apply one engine's load snapshot from the coordinator path. See
+    /// [`RequestRegistry::apply_load_snapshot`].
+    pub fn apply_load_snapshot(&self, engine_index: u32, stats: &SchedulerStats) {
+        self.request_reg.lock().apply_load_snapshot(engine_index, stats, Instant::now());
     }
 
     /// Snapshot the adapter names of tracked LoRA requests as

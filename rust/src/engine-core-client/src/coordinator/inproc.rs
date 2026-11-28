@@ -147,14 +147,20 @@ impl InProcCoordinatorRunner {
 
     /// Apply one engine-originated control output to the coordinator state
     /// machine.
-    async fn handle_outputs(&mut self, outputs: EngineCoreOutputs) -> Result<()> {
+    async fn handle_outputs(
+        &mut self,
+        outputs: EngineCoreOutputs,
+        inner: &ClientInner,
+    ) -> Result<()> {
         match outputs {
             EngineCoreOutputs::RequestBatch(batch)
                 if batch.outputs.is_empty() && batch.finished_requests.is_none() =>
             {
-                // Stats-only output for coordinator.
-                // Ignore since the Rust coordinator doesn't track stats for
-                // routing decisions.
+                // Stats-only output for coordinator: the engine's load
+                // snapshot, which token-aware routing reads.
+                if let Some(stats) = batch.scheduler_stats.as_ref() {
+                    inner.apply_load_snapshot(batch.engine_index, stats);
+                }
             }
             EngineCoreOutputs::DpControl(DpControlOutput {
                 engine_index,
@@ -268,7 +274,7 @@ impl InProcCoordinatorRunner {
                             warn!("coordinator output channel closed, shutting down coordinator runner");
                             return Ok(());
                         };
-                        self.handle_outputs(outputs?).await?;
+                        self.handle_outputs(outputs?, &inner).await?;
                     }
                 }
             }
