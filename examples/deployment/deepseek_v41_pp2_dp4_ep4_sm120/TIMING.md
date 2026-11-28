@@ -2324,6 +2324,121 @@ decode envelope 分配并在启动时校验，prefill 计划不占 scratch，索
 `test_storage_offset_scratch_refuses_to_grow`，加上更新后的两个
 workspace-growth 用例；完整 SM120 API 套件 **51 passed**。
 
+### 5.17 DP padding 的 eager fallback：模拟与盈亏平衡（2026-11-27）
+
+**问题。** DP 的图步要求所有 rank 用同一个 G（最大 rank 的网格档）。一个 rank
+在 8k prefill、另外三个在 decode 时，`dp*G = 32768` 行里只有 ~8.3k 行是真的，
+其余 ~24.5k 行是 padding；每层 MoE 的 dispatch all-gather 与 combine
+reduce-scatter 都要把这些行搬一遍（§8.1；6 行/rank 时 54–135 µs/层是延迟主导，
+行数大了转成带宽项）。另一条路是这一步不 replay 图、改成 eager 逐层 launch，
+代价是 §5.7 的固定开销。两者相权取决于 pad 掉多少行。
+
+**规则与实现。** `VLLM_DP_EAGER_PAD_TOKENS=T`（默认 0，关；`e4fcbde5f7`）。
+判据只用 DP all-reduce 已同步的每 rank token 数和共享的 PIECEWISE 网格：
+
+```text
+waste = dp_size * bucket(max_i r_i) - sum_i bucket(r_i)
+waste >= T  ->  整组这一步跑 eager
+```
+
+每个 rank 用同一组数算，结论必然一致。eager 步里每个 rank 只 pad 到**自己**
+的网格档（`eager_grid_tokens`），kernel 形状仍在捕获网格上，shape-keyed plan、
+autotune、Triton 特化都保持 warm。判据只挂在 `synced_cg_mode == PIECEWISE`
+上：FULL decode 图不跳过，DBO 步在更早的分支返回。每 60 s 一行日志报告
+fallback 次数与省下的 padding 行数（p50/p90/max）。
+
+**成本模型与常数。** `delta = c_row * waste - P`，`delta > 0` 时 eager 更快。
+
+- `c_row = 9.1 µs/行/步`：`nccl_bench.py`，4 rank、1024 行/rank 的等长
+  dispatch+combine，AG 933.7 µs + RS 933.6 µs 每层 × 20 层 / 4096 行，
+  44.9 GB/s。这是在线上服务同时占着这几张卡时取的 min，是**上界**。
+- `P ≈ 40–45 ms/步`：§5.7 的三条佐证（1 token 走 prefill 形态 68 ms/级 vs
+  走 decode 形态 26 ms/级 → 42 ms/级；8k eager 965 vs 920 ms ≈ +5%）。PP 两级
+  并行，取 max 不是相加，所以是 ~40 ms/步而不是 2 × 42。
+- 盈亏平衡 `P / c_row` ≈ **4.4k–5k 行**（c=9、P=40–45）。
+
+复现脚本都在 [`dp_padding_sim/`](dp_padding_sim/README.md)，下面四节各对应一支。
+
+**逻辑验证（`sim_logic.py`，5/5 PASS）。** 用真实的
+`sync_cudagraph_and_dp_padding`、假 manager（同样的「最小 ≥ n 的捕获档」规则）
+和 mock 的 DP group，每个 rank 各跑一次，确认四件事：图步把每个 rank pad 到
+同一个 G（8192；5000→5120 取档）；任一 rank 投 eager 就整组 eager 且用真实
+尺寸；所有 rank 的决策与 padded 值一致（不会有人进图、有人 eager 而卡死）；
+阈值判据从 all-reduced 张量算出来也一致。
+
+**盈亏平衡表（`scenarios.py`，c=9、P=40）。**
+
+| 场景 | G | waste 行 | 省 ms | 净 ms | eager |
+| --- | --- | --- | --- | --- | --- |
+| 8k prefill 在一个 rank | 8192 | 24486 | 220.4 | +180.4 | 是 |
+| 8k + 3×4k | 8192 | 12288 | 110.6 | +70.6 | 是 |
+| 4k prefill 在一个 rank | 4096 | 12198 | 109.8 | +69.8 | 是 |
+| 2k prefill 在一个 rank | 2048 | 6054 | 54.5 | +14.5 | 是 |
+| 1k prefill 在一个 rank | 1024 | 2982 | 26.8 | −13.2 | 否 |
+| 512 prefill 在一个 rank | 512 | 1446 | 13.0 | −27.0 | 否 |
+| decode 偏斜 64 vs 1 请求 | 384 | 1134 | 10.2 | −29.8 | 否 |
+| 均衡 8k | 8192 | 0 | 0 | −40.0 | 否 |
+
+（表里的 waste 用原始 token 数算，实现用每 rank 的网格档，差 ≤ 几行。）
+
+**工作负载模拟（`sim_workload.py`）。** DP4、Poisson 3 req/s、1k–4k prompt、
+~300 token 输出、least-loaded 准入、每请求 6 行 decode + prefill 到 8192，
+4 个 seed × 300 s（≈26k 步）。waste 的分布是 **p50 32、p90 3127、p99 10122、
+max 21607 行**：多数步是均衡的，浪费集中在少数 lopsided 步，所以规则只在
+~10% 的步上触发。c=9、P=40 的扫描（oracle = 每步都按真实 delta 决策，
+净 60294 ms）：
+
+| T | 触发率 | 净收益 ms | 后悔 ms | vs oracle |
+| --- | --- | --- | --- | --- |
+| 关 | 0% | 0 | 0 | 0% |
+| 1024 | 10.1% | 58350 | 1944 | 96.8% |
+| 2048 | 10.1% | 58469 | 1825 | 97.0% |
+| 3072 | 10.0% | 58826 | 1468 | 97.6% |
+| **4096** | 9.1% | **60232** | **62** | **99.9%** |
+| 5500 | 6.6% | 57091 | 0 | 94.7% |
+| 6667 | 4.9% | 50535 | 0 | 83.8% |
+| 8192 | 2.7% | 35605 | 0 | 59.1% |
+| 10240 | 1.0% | 17059 | 0 | 28.3% |
+| 12288 | 0.3% | 7482 | 0 | 12.4% |
+
+**结论。**
+
+1. **T=4096 是这个部署的起点**：在实测点（c=9、P=40）拿到 oracle 的 99.9%，
+   26k 步里只后悔 62 ms；P=20 / 60 时分别是 96.7% / 51.7%（P=60 应把 T 提到
+   5500，90.9%）。但 c_row 是争用下的上界：若真实边际只有 4 µs/行，T=4096 在
+   P=40 下会净亏（−28 s / 5 min），所以**启用前先在空闲 GPU 上重跑
+   `nccl_bench.py`**；拿不到空闲窗口就按 c=6–9 规划。
+2. **比例规则不要用**：`waste ≥ 50% / 70% * dp*G` 在实测点只有 23.9% / 60.2%
+   （c=9、P=40），因为它会在「G 小、但比例高」的 decode 步上触发，那时 P 比
+   省下的行值钱。`min ≤ 64 且 max ≥ 2048` 与绝对阈值相当（84.2%），没有额外
+   好处。
+3. **触发率不是阈值的函数，是 `(dp, chunk, 单边程度)` 的函数。** 9% 只是稳态
+   Poisson、DP4、1k–4k prompt、T=4096 这一个点。单边步的 waste 有闭式：一个
+   rank 装满 chunk C、其余 rank 只有 decode 时，`waste ≈ (dp-1) * C`。于是
+   DP2/C=2048 是 2048 行（低于 4.4k 盈亏平衡，不该触发），DP4/C=2048 是 6144
+   行（该触发），DP2/C=7104 是 7160 行（每步都触发）。现役日志 06:49 窗口的
+   **70%** 就是最后一行：waste p50 = p90 = max = 7160，形状固定为 7168-vs-8，
+   说明那一窗口的 prefill 全压在一个 rank 上。这是准入/路由的单边，不是阈值
+   偏低；调高 T 只会把它盖住。`sim_workload.py --trigger-table` 复现这张表：
+
+   | 场景 | dp | chunk | 触发率（T=5500） |
+   | --- | --- | --- | --- |
+   | 稳态 Poisson 1k–4k | 2 | 2048 | 0.0% |
+   | 稳态 Poisson 1k–4k | 4 | 2048 | 6.1% |
+   | 稳态 Poisson 1k–4k | 4 | 4608+ | 6.6% |
+   | 16k burst，均衡分到各 rank | 2 | 2048 | 0.0% |
+   | 16k burst，均衡分到各 rank | 2 | 7104 | 0.5% |
+   | 16k burst，均衡分到各 rank | 4 | 2048 | 26.4% |
+
+   均衡 burst 到不了 70%，因为两个 rank 同时有 prefill 时 waste 很小；70% 需要
+   "只有一个 rank 有 prefill" 这个额外条件。
+4. **未做：线上 A/B。** c_row 的 9.1 是争用下的上界，而 §5.5 的受控波次显示
+   ragged 的形状代价会被 overlap 吸收；padding 行是否同样被吸收，只有带重启的
+   A/B 能回答。所以默认仍是 0，A/B 放进 §9.3 的维护窗口。
+
+**测试。** `tests/v1/worker/test_gpu_dp_utils.py` **7 passed**（新增 5 个：
+waste 计数、四 rank 的 lopsided 步、阈值以下、阈值关闭、FULL decode 不动）。
+
 ## 6. 索引器微基准（不是瓶颈）
 
 单层耗时（µs），1 请求 × 6 行，背景有空闲 dummy 循环争用：
@@ -3130,6 +3245,11 @@ overlap。**这个窗口 2026-11-22 已经用掉**（§7）：prefill、decode�
   §5.8.1）。测试：
   `python -m pytest tests/v1/kv_connector/unit/test_lmcache_mp_sync_load.py -q`
   （本机是 `/opt/venv/bin/python`，16 passed）。**这几处同样要重启才生效。**
+- **`VLLM_DP_EAGER_PAD_TOKENS=4096`（A/B，等重启）**：lopsided 的 PIECEWISE
+  步改跑 eager，省掉每层 MoE 的 padding 行（§5.17）。看三件事：a) 日志里
+  fallback 触发率是否 ~9%；b) 一个 rank 8k prefill、其余 decode 的步是否净降
+  ~180 ms；c) 均衡步与 decode 的 ITL 不退化。启用前先在空闲 GPU 上量 c_row
+  （`dp_padding_sim/nccl_bench.py`），它决定阈值该不该再抬高。
 
 ### 9.4 调度与运维
 
